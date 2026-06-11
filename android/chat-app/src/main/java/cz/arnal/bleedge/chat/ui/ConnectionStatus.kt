@@ -163,12 +163,14 @@ private fun ConnectionStatusSheet(
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
                             Text(name, fontWeight = FontWeight.Medium, maxLines = 1)
-                            val rssi = if (p.rssi == RSSI_UNKNOWN) "n/a" else "${p.rssi} dBm"
-                            Text(
-                                "${if (p.incoming) "inbound" else "outbound"} · $rssi · ${p.txPhy}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                SignalDot(p.rssi, "rssi")
+                                Text(
+                                    "${if (p.incoming) "inbound" else "outbound"} · ${p.txPhy}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                 }

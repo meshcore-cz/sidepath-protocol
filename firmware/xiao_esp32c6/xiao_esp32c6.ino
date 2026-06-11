@@ -100,9 +100,40 @@ static uint32_t g_cmdDenied = 0;
 
 // ---- helpers ----------------------------------------------------------------
 
+// Parses a 64-char hex string into a 32-byte seed. Returns false unless it is exactly
+// 64 hex digits. Used for the optional build-time BLEEDGE_NODE_SEED_HEX override.
+static bool parseHexSeed(const char* hex, uint8_t out[32]) {
+  if (!hex) return false;
+  size_t len = strlen(hex);
+  if (len != 64) return false;
+  for (size_t i = 0; i < 32; i++) {
+    auto nib = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    int hi = nib(hex[i * 2]), lo = nib(hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
 // Loads the Ed25519 identity seed from NVS, or generates and persists a new one,
 // then derives the keypair. NodeID = pubkey[:8] (MeshCore-compatible identity).
+// A build-time -DBLEEDGE_NODE_SEED_HEX="<64 hex>" pins the identity (skips NVS) — handy
+// for flashing several boards with known node ids.
 static void loadOrCreateIdentity() {
+#ifdef BLEEDGE_NODE_SEED_HEX
+  if (parseHexSeed(BLEEDGE_NODE_SEED_HEX, g_seed)) {
+    Serial.println("[relay] using build-time identity seed (BLEEDGE_NODE_SEED_HEX)");
+    ed25519_create_keypair(g_pubKey, g_privKey, g_seed);
+    memcpy(g_nodeId, g_pubKey, mesh::NODE_ID_LEN);
+    return;
+  }
+  Serial.println("[relay] BLEEDGE_NODE_SEED_HEX invalid (need 64 hex chars) — using NVS seed");
+#endif
   Preferences prefs;
   prefs.begin("bleedge", false);
   size_t n = prefs.getBytesLength("seed");

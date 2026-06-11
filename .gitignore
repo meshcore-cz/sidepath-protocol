@@ -15,3 +15,4 @@
 .DS_Store
 screenshot*
 bin
+local-*

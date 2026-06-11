@@ -294,6 +294,8 @@ fun MessageDetailsSheet(
 ) {
     val floodRepeats by vm.floodRepeats.collectAsState()
     val repeatSamples = floodRepeats[msg.id].orEmpty()
+    val dmDeliveries by vm.dmDeliveries.collectAsState()
+    val delivery = dmDeliveries[msg.id]
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Message details", style = MaterialTheme.typography.titleMedium)
@@ -324,12 +326,25 @@ fun MessageDetailsSheet(
             if (!msg.incoming) {
                 DetailRow("Status", when (msg.status) {
                     MsgStatus.SENDING -> "Sending…"
-                    MsgStatus.SENT ->
-                        if (repeatSamples.isEmpty()) "Sent to mesh"
-                        else "Sent — heard ${repeatSamples.size} repeat${if (repeatSamples.size == 1) "" else "s"}"
-                    MsgStatus.DELIVERED -> "Delivered (ACK received)"
-                    else -> "Failed to send"
+                    MsgStatus.SENT -> buildString {
+                        append(if (delivery != null && !delivery.acked && !delivery.failed)
+                            "Sent — try ${delivery.attemptsSent} of ${delivery.maxTries}, awaiting ACK"
+                        else "Sent to mesh")
+                        if (repeatSamples.isNotEmpty())
+                            append(" · ${repeatSamples.size} repeat${if (repeatSamples.size == 1) "" else "s"} heard")
+                    }
+                    MsgStatus.DELIVERED ->
+                        if (delivery != null && delivery.attemptsSent > 1)
+                            "Delivered (ACK after ${delivery.attemptsSent} tries)"
+                        else "Delivered (ACK received)"
+                    else ->
+                        if (delivery != null) "Failed — no ACK after ${delivery.attemptsSent} tries"
+                        else "Failed to send"
                 })
+                // Retry detail for a DM that needed (or is making) more than one attempt.
+                if (delivery != null && delivery.maxTries > 1) {
+                    DetailRow("Delivery attempts", "${delivery.attemptsSent} of ${delivery.maxTries}")
+                }
             }
             val relays = relayCount(msg.routeHex)
             // Real intermediate relays only — drop the final hop (always this node); the
@@ -362,11 +377,14 @@ fun MessageDetailsSheet(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 repeatSamples.forEachIndexed { i, s ->
-                    val rssi = if (s.rssi == RSSI_UNKNOWN) "n/a" else "${s.rssi} dBm"
-                    Text(
-                        "${i + 1}. ${formatClock(s.timestampMs)}  ·  RSSI $rssi",
-                        fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-                    )
+                    val via = s.forwarderId?.let { vm.nameForHex(it.toHexString()) }
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "${i + 1}. ${formatClock(s.timestampMs)}${if (via != null) "  · via $via" else ""}",
+                            fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                        )
+                        SignalLabel(s.rssi, "rssi")
+                    }
                 }
             }
         }
@@ -378,5 +396,51 @@ private fun DetailRow(label: String, value: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, fontWeight = FontWeight.Medium)
+    }
+}
+
+// ---- Signal quality indicator -----------------------------------------------
+
+/**
+ * Maps a signal reading to a traffic-light colour. [metric] is "snr" (dB, higher is better) or
+ * anything else = RSSI (dBm, less-negative is better). A null / unknown value is grey.
+ */
+fun signalColor(value: Int?, metric: String): Color {
+    if (value == null || value == RSSI_UNKNOWN) return Color(0xFF9E9E9E) // grey — unknown
+    val q = if (metric == "snr") {
+        when { value >= 10 -> 4; value >= 5 -> 3; value >= 0 -> 2; value >= -5 -> 1; else -> 0 }
+    } else {
+        when { value >= -60 -> 4; value >= -70 -> 3; value >= -80 -> 2; value >= -90 -> 1; else -> 0 }
+    }
+    return when (q) {
+        4 -> Color(0xFF2E7D32) // strong — green
+        3 -> Color(0xFF7CB342) // good — light green
+        2 -> Color(0xFFF9A825) // fair — amber
+        1 -> Color(0xFFEF6C00) // weak — orange
+        else -> Color(0xFFC62828) // poor — red
+    }
+}
+
+/** A small colour-coded dot indicating signal quality, for use next to an RSSI/SNR number. */
+@Composable
+fun SignalDot(value: Int?, metric: String = "rssi", modifier: Modifier = Modifier) {
+    Box(modifier.size(8.dp).clip(CircleShape).background(signalColor(value, metric)))
+}
+
+/** A signal dot followed by its value, e.g. "● -63 dBm". [value] = RSSI_UNKNOWN renders "n/a". */
+@Composable
+fun SignalLabel(
+    value: Int?,
+    metric: String = "rssi",
+    style: androidx.compose.ui.text.TextStyle = MaterialTheme.typography.labelMedium,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        SignalDot(value, metric)
+        val unit = if (metric == "snr") "dB" else "dBm"
+        Text(
+            if (value == null || value == RSSI_UNKNOWN) "n/a" else "$value $unit",
+            style = style,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }

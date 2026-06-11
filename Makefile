@@ -42,8 +42,17 @@ test-go:
 build-macos:
 	go build -o bin/bleedge-macos ./cmd/bleedge-macos
 
-ESP32_ADMIN_PUBKEY ?= 6453f60892fe16b9a9de110bd021085ef7dc3d9eabc343db9edc1a9446885127
-ESP32_BUILD_PROPERTIES := --build-property 'compiler.cpp.extra_flags=-DBLEEDGE_ADMIN_PUBKEY="$(ESP32_ADMIN_PUBKEY)"'
+ESP32_ADMIN_PUBKEY ?=
+# Optional fixed identity for a built ESP32 node: a 64-hex-char (32-byte) Ed25519 seed.
+# Empty (default) = the node generates and persists its own seed in NVS on first boot.
+# Override to pin an identity, e.g.:  make build-esp32 ESP32_NODE_SEED=000102...1f
+# (dummy placeholder for now — supply a real 64-hex seed when you need a fixed node id.)
+ESP32_NODE_SEED ?=
+ESP32_EXTRA_FLAGS := -DBLEEDGE_ADMIN_PUBKEY="$(ESP32_ADMIN_PUBKEY)"
+ifneq ($(strip $(ESP32_NODE_SEED)),)
+ESP32_EXTRA_FLAGS += -DBLEEDGE_NODE_SEED_HEX="$(ESP32_NODE_SEED)"
+endif
+ESP32_BUILD_PROPERTIES := --build-property 'compiler.cpp.extra_flags=$(ESP32_EXTRA_FLAGS)'
 
 # Run the macOS node as a bot driven by a Bun script, e.g.:
 #   make bot SCRIPT=bots/time-bot.ts

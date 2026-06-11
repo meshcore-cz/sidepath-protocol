@@ -268,12 +268,14 @@ private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            val rssi = if (peer.rssi == RSSI_UNKNOWN) "n/a" else "${peer.rssi} dBm"
-            Text(
-                "${if (peer.incoming) "inbound" else "outbound"} · $rssi · ${peer.txPhy} · ${peer.caps}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                SignalDot(peer.rssi, "rssi")
+                Text(
+                    "${if (peer.incoming) "inbound" else "outbound"} · ${peer.txPhy} · ${peer.caps}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

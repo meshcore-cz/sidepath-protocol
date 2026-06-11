@@ -302,6 +302,16 @@ fun ConversationScreen(
                 listState.animateScrollToItem(messages.size)
             }
         }
+        // When the peer starts typing, the "…" bubble is appended below the last message; scroll it
+        // into view — but only if the user was already at the bottom (don't interrupt reading up).
+        LaunchedEffect(peerTyping) {
+            if (peerTyping && !searching) {
+                val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+                if (lastVisible >= messages.size) {
+                    listState.animateScrollToItem(messages.size + 1)
+                }
+            }
+        }
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize().padding(padding),

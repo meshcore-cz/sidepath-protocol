@@ -1,6 +1,7 @@
 package cz.arnal.bleedge.chat
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -47,6 +48,7 @@ class ChatActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleDeepLink(intent)
         setContent {
             val themeMode by viewModel.themeMode.collectAsState()
             val dark = when (themeMode) {
@@ -73,6 +75,19 @@ class ChatActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // singleTop: a meshcore:// link tapped while we're already running arrives here.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    /** Routes a `meshcore://` VIEW intent (contact/channel share link) into the view model. */
+    private fun handleDeepLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme == "meshcore") viewModel.handleSharedUri(data.toString())
     }
 
     private fun allPermissionsGranted(): Boolean =

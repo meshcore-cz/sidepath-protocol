@@ -286,11 +286,7 @@ private fun HopRow(index: Int, node: NodeID, sample: Byte?, metric: String, vm: 
             Text(hex.take(16), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (sample != null) {
-            Text(
-                "${sample.toInt()} ${if (metric == "snr") "dB" else "dBm"}",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            SignalLabel(sample.toInt(), metric)
         }
     }
 }

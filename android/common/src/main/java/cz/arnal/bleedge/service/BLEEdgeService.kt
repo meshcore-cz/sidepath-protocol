@@ -129,6 +129,19 @@ data class RxPacket(
 data class RepeatSample(
     val timestampMs: Long,
     val rssi: Int,  // RSSI of the link the repeat arrived on, or RSSI_UNKNOWN (inbound peers)
+    val forwarderId: NodeID? = null, // the node that forwarded this echo to us (last trace hop / source)
+)
+
+/**
+ * Delivery progress for one outgoing DM, keyed by its original packet-id hex. Tracks how many
+ * times it was sent, whether an ACK came back, and whether all tries were exhausted — surfaced in
+ * the message's status/details and used to mark unacked DMs as failed.
+ */
+data class DmDelivery(
+    val attemptsSent: Int,
+    val maxTries: Int,
+    val acked: Boolean = false,
+    val failed: Boolean = false,
 )
 
 enum class LogTag { SYS, SCAN, PEER, SERVER, GATT, PHY, ROUTER, MSG }
@@ -246,6 +259,12 @@ class BLEEdgeService : Service() {
     @Volatile private var dmMaxTries: Int = 3
     private val pendingDms = ConcurrentHashMap<String, PendingDm>()   // key = original id hex
     private val attemptToOriginal = ConcurrentHashMap<String, String>() // attempt id hex -> original id hex
+    private val _dmDeliveries = MutableStateFlow<Map<String, DmDelivery>>(emptyMap())
+    val dmDeliveries: StateFlow<Map<String, DmDelivery>> = _dmDeliveries.asStateFlow()
+
+    private fun updateDelivery(idHex: String, f: (DmDelivery) -> DmDelivery) {
+        _dmDeliveries.update { m -> m[idHex]?.let { m + (idHex to f(it)) } ?: m }
+    }
 
     private class PendingDm(
         val originalIdHex: String,
@@ -547,7 +566,9 @@ class BLEEdgeService : Service() {
         val idHex = pkt.id.toHexString()
         if (originatedFloodIds.containsKey(idHex)) {
             val rssi = peers[device.address.replace(":", "")]?.rssi ?: RSSI_UNKNOWN
-            val sample = RepeatSample(System.currentTimeMillis(), rssi)
+            // The node that forwarded this echo to us = the last trace hop (or the source).
+            val forwarder = pkt.trace.lastOrNull() ?: pkt.source.takeIf { !it.isBroadcast() }
+            val sample = RepeatSample(System.currentTimeMillis(), rssi, forwarder)
             _floodRepeats.update { m -> m + (idHex to ((m[idHex] ?: emptyList()) + sample)) }
         }
 
@@ -857,6 +878,10 @@ class BLEEdgeService : Service() {
         val pending = PendingDm(origHex, payload, payloadType, dest, ttl, attemptsSent = 1)
         pendingDms[origHex] = pending
         attemptToOriginal[origHex] = origHex
+        _dmDeliveries.update { m ->
+            (m + (origHex to DmDelivery(attemptsSent = 1, maxTries = dmMaxTries)))
+                .entries.toList().takeLast(300).associate { it.key to it.value }
+        }
         scheduleDmRetry(pending)
         return firstId
     }
@@ -870,11 +895,13 @@ class BLEEdgeService : Service() {
                 log("DM ${p.originalIdHex.take(8)} unacked after ${p.attemptsSent} tries — giving up", LogTag.MSG)
                 pendingDms.remove(p.originalIdHex)
                 attemptToOriginal.entries.removeAll { it.value == p.originalIdHex }
+                updateDelivery(p.originalIdHex) { it.copy(failed = true) }
                 return@launch
             }
             val newId = sendData(p.payload, p.payloadType, p.dest, p.ttl)
             p.attemptsSent += 1
             attemptToOriginal[newId.toHexString()] = p.originalIdHex
+            updateDelivery(p.originalIdHex) { it.copy(attemptsSent = p.attemptsSent) }
             log("DM ${p.originalIdHex.take(8)} retry ${p.attemptsSent}/$dmMaxTries as ${newId.toHexString().take(8)}", LogTag.MSG)
             scheduleDmRetry(p)
         }
@@ -886,6 +913,7 @@ class BLEEdgeService : Service() {
         val origHex = attemptToOriginal[ackedRaw.toHexString()] ?: return ackedRaw
         pendingDms.remove(origHex)?.job?.cancel()
         attemptToOriginal.entries.removeAll { it.value == origHex }
+        updateDelivery(origHex) { it.copy(acked = true) }
         return origHex.hexToByteArray()
     }
 

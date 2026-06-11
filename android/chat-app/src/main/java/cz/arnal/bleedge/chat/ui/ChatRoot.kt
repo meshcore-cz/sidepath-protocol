@@ -21,6 +21,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,6 +53,16 @@ fun ChatRoot(vm: ChatViewModel) {
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var showRxLog by rememberSaveable { mutableStateOf(false) }
     var tab by rememberSaveable { mutableStateOf(0) }
+
+    // A meshcore:// deep link (contact/channel) asks us to open its conversation.
+    val pendingOpen by vm.pendingOpenPeer.collectAsState()
+    LaunchedEffect(pendingOpen) {
+        pendingOpen?.let {
+            openProfile = null; openTrace = null
+            openPeer = it
+            vm.consumePendingOpen()
+        }
+    }
 
     // The top-most destination, recomputed from the navigation flags. Trace sits above a
     // profile, which sits above a conversation, which sits above the tabs — so backing out
@@ -93,7 +104,11 @@ fun ChatRoot(vm: ChatViewModel) {
                 onBack = { openPeer = null },
                 onOpenProfile = { openProfile = it },
             )
-            Dest.Settings -> SettingsScreen(vm, onBack = { showSettings = false })
+            Dest.Settings -> SettingsScreen(
+                vm,
+                onBack = { showSettings = false },
+                onOpenProfile = { showSettings = false; openProfile = it },
+            )
             Dest.RxLog -> RxLogScreen(vm, onBack = { showRxLog = false })
             Dest.Tabs -> TabsScaffold(
                 vm,

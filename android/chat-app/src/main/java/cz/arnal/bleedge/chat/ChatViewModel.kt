@@ -255,6 +255,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _service.flatMapLatest { it?.floodRepeats ?: flowOf(emptyMap()) }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
+    /** Per-DM delivery progress (attempts, acked, failed), keyed by the message's packet-id hex. */
+    val dmDeliveries: StateFlow<Map<String, cz.arnal.bleedge.service.DmDelivery>> =
+        _service.flatMapLatest { it?.dmDeliveries ?: flowOf(emptyMap()) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
     /** Starts/stops the mesh radio (advertise + scan + GATT). Surfaced on the Network page. */
     fun startMesh() { _service.value?.startBLE() }
     fun stopMesh() { _service.value?.stopBLE() }
@@ -497,6 +502,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 list.forEach { handleIncoming(it) }
             }
         }
+        // When a DM exhausts all retries with no ACK, mark it failed (errored) in the chat.
+        viewModelScope.launch {
+            service.dmDeliveries.collect { map ->
+                map.forEach { (idHex, d) ->
+                    if (d.failed && !d.acked && processed.add("fail:$idHex")) {
+                        dao.updateDelivery(idHex, MsgStatus.FAILED, "")
+                    }
+                }
+            }
+        }
     }
 
     private suspend fun handleIncoming(msg: ReceivedMessage) {
@@ -610,6 +625,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     channelKind = ch?.kind ?: "",
                     channelHash = ch?.hashByte ?: 0,
                     pskHex = psk,
+                )
+            } else if (peerHex == nodeId.value.toHexString()) {
+                // Our own profile (opened from the avatar): use our local identity/settings.
+                ProfileInfo(
+                    peerHex = peerHex,
+                    isChannel = false,
+                    name = myName.value.ifBlank { shortHex(peerHex) },
+                    nodeHex = peerHex,
+                    pubKeyHex = myPubKeyHex.value,
+                    isContact = false,
+                    online = true,
+                    description = _description.value,
+                    platform = _service.value?.defaultPlatform() ?: "",
                 )
             } else {
                 val byNode = c.associateBy { it.nodeHex }
@@ -755,6 +783,33 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun leaveChannel(pskHex: String) {
         viewModelScope.launch { dao.deleteChannel(pskHex) }
+    }
+
+    // ---- MeshCore deep links (meshcore://… opened from a QR / link) ----------
+
+    /** A conversation/channel the UI should open in response to a deep link, or null. */
+    private val _pendingOpenPeer = MutableStateFlow<String?>(null)
+    val pendingOpenPeer: StateFlow<String?> = _pendingOpenPeer.asStateFlow()
+
+    fun consumePendingOpen() { _pendingOpenPeer.value = null }
+
+    /**
+     * Handles a scanned/clicked `meshcore://` link: joins the channel or adds the contact, then
+     * asks the UI to open it. Returns true if the URI was a recognised MeshCore link.
+     */
+    fun handleSharedUri(uri: String): Boolean {
+        MeshCoreUri.parseChannel(uri)?.let { ch ->
+            joinSecretChannel(ch.name, ch.secretHex)
+            _pendingOpenPeer.value = channelPeerId(ch.secretHex.lowercase())
+            return true
+        }
+        MeshCoreUri.parseContact(uri)?.let { c ->
+            val nodeHex = c.publicKeyHex.take(16)
+            viewModelScope.launch { dao.upsertContact(Contact(nodeHex, c.publicKeyHex, c.name)) }
+            _pendingOpenPeer.value = nodeHex
+            return true
+        }
+        return false
     }
 
     private fun joinChannelPsk(psk: ByteArray, name: String, kind: String) {
