@@ -50,6 +50,7 @@ run({
 | `api.reply(m, text)` | reply in kind — post on the originating channel if `m.channel`, else an encrypted DM to the sender |
 | `api.dm(to, text)` | encrypted DM to a node id (only nodes that have DMed us — we need their key) |
 | `api.broadcast(text, channel?)` | post on a channel (MeshCore GRP_TXT); omit `channel` for the bot's primary (first joined) channel |
+| `api.typing(to)` | send a "typing…" hint to a node before a slow reply (direct messages only) |
 | `api.stats()` | `Promise<{peers, neighbors, topology, node, name}>` of live mesh state |
 | `api.log(text)` | diagnostic to the node's stderr (never the chat) |
 

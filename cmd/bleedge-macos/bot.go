@@ -215,6 +215,15 @@ func (b *bot) readLoop(r io.Reader) {
 			if err := b.node.SendToChannel(ch.Secret, c.Text); err != nil {
 				b.logf(fmt.Sprintf("bot broadcast: %v", err))
 			}
+		case "typing":
+			id, err := core.ParseNodeID(c.To)
+			if err != nil {
+				b.logf(fmt.Sprintf("bot typing: bad 'to' %q: %v", c.To, err))
+				continue
+			}
+			if err := b.node.SendTyping(id); err != nil {
+				b.logf(fmt.Sprintf("bot typing send: %v", err))
+			}
 		case "query":
 			if c.What == "stats" {
 				b.send(map[string]any{

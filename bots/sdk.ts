@@ -45,6 +45,11 @@ export interface Api {
   dm(to: string, text: string): void;
   /** Post a message on a channel. Omit `channel` to use the bot's primary (first joined) channel. */
   broadcast(text: string, channel?: string): void;
+  /**
+   * Send a "typing…" hint to a node before a slow reply, so the sender sees activity. Direct
+   * messages only (channels don't show typing). Pass `m.from` from the message you're answering.
+   */
+  typing(to: string): void;
   /** Diagnostic log (goes to the node's stderr, never the chat). */
   log(text: string): void;
   /** Ask the node for live mesh statistics. */
@@ -73,6 +78,9 @@ export function run(handlers: Handlers): void {
     },
     broadcast(text, channel) {
       send({ type: "broadcast", text, ...(channel ? { channel } : {}) });
+    },
+    typing(to) {
+      send({ type: "typing", to });
     },
     log(text) {
       send({ type: "log", text });

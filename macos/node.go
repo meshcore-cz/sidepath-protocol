@@ -770,6 +770,12 @@ func (n *Node) SendText(dst core.NodeID, text string, ttl uint8) error {
 	return n.sendData(dst, core.PayloadTypeTextTest, []byte(text), ttl)
 }
 
+// SendTyping sends an ephemeral "I'm typing" hint to dst (empty TYPING payload,
+// never ACKed). Best-effort — used to show activity while preparing a reply.
+func (n *Node) SendTyping(dst core.NodeID) error {
+	return n.sendData(dst, core.PayloadTypeTyping, nil, 4)
+}
+
 // SendChatTo sends an end-to-end encrypted direct message to dst, encrypted to
 // recipientPub (the recipient's 32-byte Ed25519 public key). For replies the
 // public key is the one carried in the inbound envelope (core.ChatEnvelopeSenderPub).
