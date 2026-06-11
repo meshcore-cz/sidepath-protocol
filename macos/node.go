@@ -31,9 +31,10 @@ var (
 
 // Node is a macOS BLEEdge node.
 type Node struct {
-	nodeID    core.NodeID
-	identity  *core.Identity
-	caps      core.Capabilities
+	nodeID      core.NodeID
+	identity    *core.Identity
+	description string
+	caps        core.Capabilities
 	router    *core.Router
 	reassem   *core.Reassembler
 	allowlist map[core.NodeID]bool
@@ -54,6 +55,7 @@ type Node struct {
 // Config holds startup parameters.
 type Config struct {
 	Identity         *core.Identity
+	Description      string // node label for ANNOUNCE/NODE_INFO; empty = platform default
 	Caps             core.Capabilities
 	Allowlist        []core.NodeID
 	Verbose          bool
@@ -65,12 +67,19 @@ type Config struct {
 
 // New creates a Node. Call Run to start it.
 func New(cfg Config) *Node {
+	description := cfg.Description
+	if description == "" {
+		description = core.PlatformDescription()
+	}
+	router := core.NewRouterForIdentity(cfg.Identity)
+	router.Description = description
 	n := &Node{
-		nodeID:    cfg.Identity.NodeID(),
-		identity:  cfg.Identity,
-		caps:      cfg.Caps,
-		router:    core.NewRouterForIdentity(cfg.Identity),
-		reassem:   core.NewReassembler(),
+		nodeID:      cfg.Identity.NodeID(),
+		identity:    cfg.Identity,
+		description: description,
+		caps:        cfg.Caps,
+		router:      router,
+		reassem:     core.NewReassembler(),
 		allowlist: make(map[core.NodeID]bool),
 		verbose:   cfg.Verbose,
 		peers:     make(map[string]*MacPeerLink),
@@ -248,11 +257,18 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 
 	// Read NODE_INFO
 	var peerID core.NodeID
+	var peerDesc string
 	if nodeInfoChar != nil {
 		data, err := cln.ReadCharacteristic(nodeInfoChar)
 		if err == nil && len(data) >= 34 {
 			peerID = core.NodeIDFromPubKey(data[1:33])
-			n.logf("peer node_id=%s", peerID)
+			if len(data) >= 35 {
+				descLen := int(data[34])
+				if 35+descLen <= len(data) {
+					peerDesc = string(data[35 : 35+descLen])
+				}
+			}
+			n.logf("peer node_id=%s desc=%q", peerID, peerDesc)
 		}
 	}
 
@@ -313,11 +329,12 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 	}
 
 	n.router.Neighbors.Upsert(core.Neighbor{
-		ID:        peerID,
-		Direction: core.DirectionOutgoing,
-		RSSI:      adv.RSSI(),
-		TxPHY:     core.PHY1M,
-		RxPHY:     core.PHY1M,
+		ID:          peerID,
+		Direction:   core.DirectionOutgoing,
+		RSSI:        adv.RSSI(),
+		TxPHY:       core.PHY1M,
+		RxPHY:       core.PHY1M,
+		Description: peerDesc,
 	})
 
 	// Subscribe to PACKET_OUT
@@ -520,12 +537,18 @@ func (n *Node) announceLoop(ctx context.Context) {
 	}
 }
 
-// buildNodeInfo encodes [version(1), pubkey(32), caps(1)] = 34 bytes.
+// buildNodeInfo encodes version(1)+pubkey(32)+caps(1)+descLen(1)+desc(descLen).
 func (n *Node) buildNodeInfo() []byte {
-	data := make([]byte, 34)
+	desc := []byte(n.description)
+	if len(desc) > 255 {
+		desc = desc[:255]
+	}
+	data := make([]byte, 34+1+len(desc))
 	data[0] = core.ProtocolVersion
 	copy(data[1:33], n.identity.Pub)
 	data[33] = byte(n.caps)
+	data[34] = byte(len(desc))
+	copy(data[35:], desc)
 	return data
 }
 
@@ -600,6 +623,11 @@ func (n *Node) ConnectedPeers() []core.NodeID {
 // NodeID returns this node's ID.
 func (n *Node) NodeID() core.NodeID {
 	return n.nodeID
+}
+
+// DescriptionFor resolves a peer's diagnostic label (neighbor or topology).
+func (n *Node) DescriptionFor(id core.NodeID) string {
+	return n.router.DescriptionFor(id)
 }
 
 // LoadOrCreateIdentity loads the Ed25519 identity seed from ~/.bleedge/seed or

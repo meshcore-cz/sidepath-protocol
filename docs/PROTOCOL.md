@@ -62,11 +62,12 @@ A node identity is an **Ed25519 keypair** (RFC 8032), MeshCore-compatible:
 - The server **notifies** on `PACKET_OUT` to push a GATT frame to the client.
 - Both directions carry the same [frame format](#3-gatt-frame-format).
 
-**`NODE_INFO`** is a 34-byte read value identifying the peer without parsing an
-ANNOUNCE. The reader derives `NodeID = pubkey[:8]`:
+**`NODE_INFO`** identifies the peer without parsing an ANNOUNCE. The reader
+derives `NodeID = pubkey[:8]`. It is `34 + 1 + descLen` bytes; `desc` is a UTF-8
+diagnostic label (≤255 bytes, defaults to the peer's platform/OS):
 
 ```
-version(1) | pubkey(32) | caps(1)
+version(1) | pubkey(32) | caps(1) | descLen(1) | desc(descLen)
 ```
 
 ### 2.2 Advertising & discovery
@@ -182,7 +183,7 @@ cross-language compactness. Field order is irrelevant; keys are authoritative.
 | 8 | `route_cursor` | uint8 | index into `route` (source-route) |
 | 9 | `route` | array of 8-byte | ordered next-hops (source-route) |
 | 10 | `trace` | array of 8-byte | hops visited so far (appended per hop) |
-| 11 | `payload_type` | uint8 | 1=TEXT_TEST, 2=MESHCORE_RAW |
+| 11 | `payload_type` | uint8 | 1=TEXT_TEST, 2=MESHCORE_RAW, 3=CHAT_PLAIN, 4=CHAT_ENCRYPTED |
 | 12 | `payload` | bytes | opaque |
 | 13 | `seq` | uint32 | ANNOUNCE sequence; omitted when 0 |
 
@@ -201,6 +202,13 @@ When `type == 2`, `payload` (key 12) is itself a CBOR map:
 | 5 | `timestamp` | int64 (unix seconds) |
 | 6 | `public_key` | 32 bytes (Ed25519) |
 | 7 | `signature` | 64 bytes (Ed25519) |
+| 8 | `description` | text string (diagnostic; **not** signed) |
+
+`description` is a free-form, human-readable label that defaults to the node's
+platform/OS (`linux/arm64`, `darwin/arm64`, `Android 14 (Pixel 7)`, `esp32-c6`).
+It is **not** covered by the signature and must never be used for routing or
+trust decisions — it is informational only. Encoded as a CBOR **text** string
+(major type 3), so it decodes to a native string on every platform.
 
 **Signed message.** `signature` is an Ed25519 signature, by the node's identity
 key, over a **fixed explicit byte layout** (not the CBOR — CBOR is not byte-stable
@@ -237,6 +245,31 @@ Conventional role sets:
 - Linux: `receiver | gateway | coded-phy`
 
 `String()` renders flags pipe-joined (`sender|relay|...`) or `none`.
+
+### 4.3 Chat payloads (Android chat-app)
+
+The Android chat-app rides on top of the transport using two `payload_type`s; the
+mesh treats both as opaque `payload` and routes them like any other DATA packet
+(Go/firmware nodes still relay them without interpreting).
+
+- **`CHAT_PLAIN` (3)** — broadcast "channel" message. `payload` is UTF-8 text,
+  `destination = 0` (broadcast), FLOOD. Not encrypted.
+- **`CHAT_ENCRYPTED` (4)** — direct message, end-to-end encrypted to the
+  recipient's identity key. `payload` is a CBOR map:
+
+  | Key | Field | Type |
+  | --- | --- | --- |
+  | 1 | `sender_pub` | 32 bytes (sender's Ed25519 public key) |
+  | 2 | `iv` | 12 bytes (AES-GCM nonce) |
+  | 3 | `ciphertext` | bytes (AES-256-GCM, 16-byte tag appended) |
+
+  Key agreement: both identity keys are mapped from Ed25519 to X25519 (the
+  libsodium `crypto_sign_ed25519_*_to_curve25519` transform), then a
+  static↔static X25519 ECDH shared secret is run through HKDF-SHA256
+  (`info = "bleedge-chat-v1"`) to a 32-byte AES key. Because the secret is
+  symmetric, the recipient re-derives the key from `sender_pub` (carried in the
+  envelope) and its own private key. The sender's public key is learned from the
+  recipient's signed ANNOUNCE (key 6).
 
 ---
 
@@ -287,6 +320,10 @@ ACKs are generated automatically for **unicast DATA** that is delivered locally:
 - The originator records the ACK's own `id` in its dedup cache so a flood echo of
   its own ACK is dropped rather than re-flooded. The same applies to *any* packet
   a node originates (`MarkOriginated`).
+- The ACK `payload` (key 12) carries the 16-byte `id` of the DATA packet being
+  acked, so an originator can match a delivery confirmation to a specific outgoing
+  message. (Additive; relays/nodes that don't track per-message delivery ignore it.
+  Implemented in the Android router; Go/firmware leave the ACK payload empty.)
 
 ### 5.5 Route selection
 
@@ -323,7 +360,9 @@ A new or modified implementation must:
 - [ ] Derive an Ed25519 identity from a persisted 32-byte seed; `NodeID =
       pubkey[:8]`; advertise the 8-byte NodeID under company ID `0xBEED`.
 - [ ] Expose the GATT service + 3 characteristics with the exact UUIDs above;
-      serve `NODE_INFO` as `version|pubkey(32)|caps` = 34 bytes.
+      serve `NODE_INFO` as `version|pubkey(32)|caps|descLen(1)|desc`.
+- [ ] Populate `description` (ANNOUNCE key 8, text; NODE_INFO tail) with the
+      platform/OS by default; never sign it or trust it for routing.
 - [ ] Encode/decode the 23-byte big-endian frame header; CRC-32/IEEE over the
       full packet; fragment at `MAX_FRAME_SIZE = 200` (177 data bytes/frame).
 - [ ] CBOR-encode packets with **integer** keys 1–13 exactly as in section 4;

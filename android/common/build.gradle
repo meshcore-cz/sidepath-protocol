@@ -1,0 +1,33 @@
+plugins {
+    id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'cz.arnal.bleedge'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 26
+        targetSdk 35
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation "androidx.core:core-ktx:1.13.1"
+    api "com.upokecenter:cbor:4.5.4"
+    api "androidx.datastore:datastore-preferences:1.1.1"
+    // Ed25519 (RFC 8032) for MeshCore-compatible identities + signed ANNOUNCE,
+    // and X25519 (RFC 7748) + HKDF for chat encryption. Low-level BouncyCastle
+    // (no JCE provider registration → no conflict with Android's bundled BC).
+    api "org.bouncycastle:bcprov-jdk18on:1.78.1"
+    testImplementation "junit:junit:4.13.2"
+}

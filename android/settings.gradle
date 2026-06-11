@@ -19,4 +19,6 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "BLEEdge"
-include ':app'
+include ':common'
+include ':debug-app'
+include ':chat-app'

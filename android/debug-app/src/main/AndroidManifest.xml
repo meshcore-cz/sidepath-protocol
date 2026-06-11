@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Permissions, features and the BLEEdgeService are declared in the :common library
+         manifest and merged in. -->
+    <application
+        android:name="cz.arnal.bleedge.BLEEdgeApp"
+        android:label="BLEEdge Debug"
+        android:theme="@style/Theme.BLEEdge">
+        <activity
+            android:name="cz.arnal.bleedge.ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

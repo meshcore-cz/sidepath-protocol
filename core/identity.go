@@ -4,7 +4,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"runtime"
 )
+
+// PlatformDescription is the default node description for Go nodes: the OS and
+// architecture, e.g. "linux/arm64" or "darwin/arm64".
+func PlatformDescription() string {
+	return runtime.GOOS + "/" + runtime.GOARCH
+}
 
 // SeedSize is the length of the Ed25519 identity seed in bytes (RFC 8032).
 const SeedSize = 32

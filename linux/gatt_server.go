@@ -33,11 +33,12 @@ const (
 // GattServer implements the BLEEdge GATT service over BlueZ D-Bus Application API.
 type GattServer struct {
 	conn     *dbus.Conn
-	adapter  *Adapter
-	nodeID   core.NodeID
-	pubKey   []byte // 32-byte Ed25519 public key advertised via NODE_INFO
-	caps     core.Capabilities
-	onFrame  func(frame []byte, sender dbus.Sender)
+	adapter     *Adapter
+	nodeID      core.NodeID
+	pubKey      []byte // 32-byte Ed25519 public key advertised via NODE_INFO
+	caps        core.Capabilities
+	description string
+	onFrame     func(frame []byte, sender dbus.Sender)
 
 	mu           sync.Mutex
 	notifyConns  map[dbus.Sender]bool // peers subscribed to PACKET_OUT notifications
@@ -46,13 +47,14 @@ type GattServer struct {
 // NewGattServer creates and registers the GATT server. pubKey is the node's
 // 32-byte Ed25519 public key; the NodeID is derived as pubKey[:8].
 func NewGattServer(adapter *Adapter, pubKey []byte, caps core.Capabilities,
-	onFrame func(frame []byte, sender dbus.Sender)) *GattServer {
+	description string, onFrame func(frame []byte, sender dbus.Sender)) *GattServer {
 	return &GattServer{
 		conn:        adapter.Conn(),
 		adapter:     adapter,
 		nodeID:      core.NodeIDFromPubKey(pubKey),
 		pubKey:      pubKey,
 		caps:        caps,
+		description: description,
 		onFrame:     onFrame,
 		notifyConns: make(map[dbus.Sender]bool),
 	}
@@ -120,13 +122,9 @@ func (g *GattServer) NotifyFrame(frame []byte) {
 	g.conn.Emit(charPacketOut, gattCharIF+".ValueUpdated", frame) //nolint:errcheck
 }
 
-// nodeInfoValue encodes [version(1), pubkey(32), caps(1)] = 34 bytes
+// nodeInfoValue encodes [version(1), pubkey(32), caps(1), descLen(1), desc(descLen)].
 func (g *GattServer) nodeInfoValue() []byte {
-	b := make([]byte, 34)
-	b[0] = core.ProtocolVersion
-	copy(b[1:33], g.pubKey)
-	b[33] = uint8(g.caps)
-	return b
+	return encodeNodeInfo(core.ProtocolVersion, g.pubKey, g.caps, g.description)
 }
 
 // serviceProps returns a D-Bus property map for the GattService1 interface.
@@ -199,13 +197,19 @@ func (c *packetOutCharacteristic) GetAll(iface string) (map[string]dbus.Variant,
 	}, nil
 }
 
-// encodeNodeInfo is a helper for encoding 34-byte node info.
-// version(1) + pubkey(32) + caps(1)
-func encodeNodeInfo(version uint8, pubKey []byte, caps core.Capabilities) []byte {
-	b := make([]byte, 34)
+// encodeNodeInfo encodes version(1) + pubkey(32) + caps(1) + descLen(1) + desc(descLen).
+// The description is UTF-8 and truncated to 255 bytes.
+func encodeNodeInfo(version uint8, pubKey []byte, caps core.Capabilities, description string) []byte {
+	desc := []byte(description)
+	if len(desc) > 255 {
+		desc = desc[:255]
+	}
+	b := make([]byte, 34+1+len(desc))
 	b[0] = version
 	copy(b[1:33], pubKey)
 	b[33] = uint8(caps)
+	b[34] = uint8(len(desc))
+	copy(b[35:], desc)
 	_ = binary.BigEndian // import kept for future use
 	return b
 }

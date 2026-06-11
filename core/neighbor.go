@@ -15,13 +15,14 @@ const (
 
 // Neighbor represents a directly connected peer.
 type Neighbor struct {
-	ID        NodeID
-	Direction ConnDirection
-	LastSeen  time.Time
-	RSSI      int
-	TxPHY     PHY
-	RxPHY     PHY
-	Caps      Capabilities
+	ID          NodeID
+	Direction   ConnDirection
+	LastSeen    time.Time
+	RSSI        int
+	TxPHY       PHY
+	RxPHY       PHY
+	Caps        Capabilities
+	Description string // diagnostic label from the peer's NODE_INFO (direct links only)
 }
 
 func (n Neighbor) String() string {

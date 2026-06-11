@@ -34,6 +34,17 @@ static const char* PACKETOUT_UUID = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004";
 
 static const uint8_t  PROTOCOL_VERSION = mesh::PROTOCOL_VERSION;  // 2: Ed25519 + signed ANNOUNCE
 static const uint8_t  RELAY_CAPS = mesh::CAP_SENDER | mesh::CAP_RECEIVER | mesh::CAP_RELAY;
+static const char*    NODE_DESCRIPTION = "esp32-c6";  // diagnostic label in ANNOUNCE/NODE_INFO
+
+// Onboard user LED — blinks once per ANNOUNCE (advert) as a heartbeat.
+// XIAO ESP32-C6: user LED is GPIO15 and active-LOW (drive LOW = on).
+static const int      LED_PIN = 15;
+static const bool     LED_ACTIVE_LOW = true;
+static const uint32_t LED_BLINK_MS = 60;
+
+static inline void ledSet(bool on) {
+  digitalWrite(LED_PIN, (LED_ACTIVE_LOW ? !on : on) ? HIGH : LOW);
+}
 // Conservative fragment size: a frame is FRAGMENT_MTU bytes, so each peer's ATT
 // MTU must be >= FRAGMENT_MTU + 3. 200 is safe for any peer negotiating >= 203.
 static const size_t   FRAGMENT_MTU = 200;
@@ -57,6 +68,7 @@ static std::map<uint16_t, std::array<uint8_t, mesh::NODE_ID_LEN>> g_connNode;
 
 static uint32_t g_announceSeq = 0;
 static uint32_t g_lastAnnounceMs = 0;
+static uint32_t g_ledOffMs = 0;  // when to turn the heartbeat LED back off (0 = off)
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -176,7 +188,11 @@ static void sendAnnounce() {
 
   std::vector<uint8_t> pkt;
   mesh::buildAnnounce(g_nodeId, RELAY_CAPS, seq, ts, pid,
-                      neighbors.data(), nNeighbors, g_pubKey, sig, pkt);
+                      neighbors.data(), nNeighbors, g_pubKey, sig, NODE_DESCRIPTION, pkt);
+
+  // Heartbeat: blink the onboard LED once per advert (turned off in loop()).
+  ledSet(true);
+  g_ledOffMs = millis() + LED_BLINK_MS;
 
   // Mark our own packet so a flood echo isn't re-flooded back out.
   g_dedup.seenOrAdd(pid);
@@ -225,6 +241,8 @@ class PacketInCallbacks : public NimBLECharacteristicCallbacks {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  pinMode(LED_PIN, OUTPUT);
+  ledSet(false);
   loadOrCreateIdentity();
   Serial.printf("\nBLEEdge relay  node=%s  phy=1m\n", nodeIdHex().c_str());
 
@@ -237,13 +255,17 @@ void setup() {
 
   NimBLEService* svc = server->createService(SERVICE_UUID);
 
-  // NODE_INFO (read): version(1) + pubkey(32) + caps(1) = 34 bytes
-  uint8_t nodeInfo[34];
-  nodeInfo[0] = PROTOCOL_VERSION;
-  memcpy(nodeInfo + 1, g_pubKey, mesh::PUBKEY_LEN);
-  nodeInfo[33] = RELAY_CAPS;
+  // NODE_INFO (read): version(1) + pubkey(32) + caps(1) + descLen(1) + desc(descLen)
+  size_t descLen = strlen(NODE_DESCRIPTION);
+  if (descLen > 255) descLen = 255;
+  std::vector<uint8_t> nodeInfo;
+  nodeInfo.push_back(PROTOCOL_VERSION);
+  nodeInfo.insert(nodeInfo.end(), g_pubKey, g_pubKey + mesh::PUBKEY_LEN);
+  nodeInfo.push_back(RELAY_CAPS);
+  nodeInfo.push_back((uint8_t)descLen);
+  nodeInfo.insert(nodeInfo.end(), NODE_DESCRIPTION, NODE_DESCRIPTION + descLen);
   NimBLECharacteristic* ni = svc->createCharacteristic(NODEINFO_UUID, NIMBLE_PROPERTY::READ);
-  ni->setValue(nodeInfo, sizeof(nodeInfo));
+  ni->setValue(nodeInfo.data(), nodeInfo.size());
 
   // PACKET_IN (write / write-no-response)
   NimBLECharacteristic* pin =
@@ -283,6 +305,10 @@ void loop() {
   if (now - g_lastAnnounceMs >= ANNOUNCE_INTERVAL_MS) {
     g_lastAnnounceMs = now;
     sendAnnounce();
+  }
+  if (g_ledOffMs != 0 && now >= g_ledOffMs) {
+    ledSet(false);
+    g_ledOffMs = 0;
   }
   g_reassembler.reap();
   delay(50);

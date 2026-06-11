@@ -157,6 +157,7 @@ func main() {
 	check("nodeId == pubkey[:8]", payload.NodeID == goID.NodeID() && annPkt.Source == goID.NodeID())
 	check("announce caps/seq/neighbors", payload.Caps == caps && payload.Seq == 7 &&
 		len(payload.Neighbors) == 2 && payload.Neighbors[0] == n1 && payload.Neighbors[1] == n2)
+	check("announce description (text, unsigned)", payload.Description == "esp32-c6")
 	check("fw signature verifies in Go", core.VerifyAnnounce(payload.PublicKey, payload.Signature,
 		uint32(payload.Timestamp), payload.Caps, payload.Seq, payload.Neighbors))
 

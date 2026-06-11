@@ -35,9 +35,10 @@ type Action struct {
 
 // Router is the pure-Go mesh routing engine with no BLE dependencies.
 type Router struct {
-	LocalID   NodeID
-	Identity  *Identity // local signing identity; required to BuildAnnounce
-	dedup     *DedupCache
+	LocalID     NodeID
+	Identity    *Identity // local signing identity; required to BuildAnnounce
+	Description string    // diagnostic node label advertised in ANNOUNCE (unsigned)
+	dedup       *DedupCache
 	Neighbors *NeighborTable
 	Topology  *Topology
 	Allowlist map[NodeID]bool // if non-empty, only these peers are allowed
@@ -105,10 +106,11 @@ func (r *Router) handleAnnounce(pkt Packet, incomingPeer *NodeID) []Action {
 		return []Action{{Type: ActionDrop, Reason: string(DropBadSignature), Packet: pkt}}
 	}
 	r.Topology.Update(TopoNode{
-		ID:        ap.NodeID,
-		Caps:      ap.Caps,
-		Neighbors: ap.Neighbors,
-		Seq:       ap.Seq,
+		ID:          ap.NodeID,
+		Caps:        ap.Caps,
+		Neighbors:   ap.Neighbors,
+		Seq:         ap.Seq,
+		Description: ap.Description,
 	})
 	// Flood ANNOUNCE to the rest of the network
 	return r.handleFlood(pkt, incomingPeer)
@@ -244,9 +246,10 @@ func (r *Router) BuildAnnounce(caps Capabilities, seq uint32) (Packet, error) {
 		Caps:      caps,
 		Neighbors: neighbors,
 		Seq:       seq,
-		Timestamp: ts,
-		PublicKey: r.Identity.Pub,
-		Signature: sig,
+		Timestamp:   ts,
+		PublicKey:   r.Identity.Pub,
+		Signature:   sig,
+		Description: r.Description,
 	}
 	payload, err := ap.Encode()
 	if err != nil {
@@ -280,6 +283,19 @@ func (r *Router) SelectRoute(dst NodeID) ([]NodeID, bool) {
 	}
 	path := r.Topology.BFSPath(r.LocalID, dst)
 	return path, len(path) > 0
+}
+
+// DescriptionFor resolves a node's diagnostic label: the direct neighbor's
+// NODE_INFO description if known, else the description from its ANNOUNCE
+// (topology). Returns "" if unknown.
+func (r *Router) DescriptionFor(id NodeID) string {
+	if n, ok := r.Neighbors.Get(id); ok && n.Description != "" {
+		return n.Description
+	}
+	if tn, ok := r.Topology.GetNode(id); ok {
+		return tn.Description
+	}
+	return ""
 }
 
 // FloodJitter returns a random relay delay between 10ms and 100ms to reduce collision probability.

@@ -57,6 +57,10 @@ type AnnouncePayload struct {
 	Timestamp int64        `cbor:"5,keyasint"`
 	PublicKey []byte       `cbor:"6,keyasint"`
 	Signature []byte       `cbor:"7,keyasint"`
+	// Description is a free-form, human-readable node label (defaults to the
+	// platform/OS, e.g. "linux/arm64"). It is diagnostic only and is NOT covered
+	// by Signature — never use it for any routing or trust decision.
+	Description string `cbor:"8,keyasint,omitempty"`
 }
 
 func (a AnnouncePayload) Encode() ([]byte, error) { return cbor.Marshal(a) }

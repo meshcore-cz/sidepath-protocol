@@ -120,7 +120,7 @@ void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint8_t caps, uint32_t seq
                    int64_t unixSeconds, const uint8_t packetId[PACKET_ID_LEN],
                    const uint8_t* neighbors, size_t neighborCount,
                    const uint8_t pubKey[PUBKEY_LEN], const uint8_t signature[SIG_LEN],
-                   std::vector<uint8_t>& out);
+                   const char* description, std::vector<uint8_t>& out);
 
 // Splits packet bytes into GATT frames (matches core.FragmentPacket).
 void fragment(const uint8_t* pkt, size_t len, size_t mtu, const uint8_t packetId[PACKET_ID_LEN],

@@ -18,9 +18,10 @@ type GattClient struct {
 	adapter    *Adapter
 	devicePath dbus.ObjectPath
 
-	nodeID    core.NodeID // discovered from NODE_INFO (= pubKey[:8])
-	pubKey    []byte      // 32-byte Ed25519 public key from NODE_INFO
-	caps      core.Capabilities
+	nodeID      core.NodeID // discovered from NODE_INFO (= pubKey[:8])
+	pubKey      []byte      // 32-byte Ed25519 public key from NODE_INFO
+	description string      // diagnostic label from NODE_INFO
+	caps        core.Capabilities
 	txPHY     core.PHY
 	rxPHY     core.PHY
 	rssi      int16
@@ -175,7 +176,7 @@ func (c *GattClient) discoverChars(ctx context.Context) error {
 }
 
 // readNodeInfo reads and parses the NODE_INFO characteristic.
-// Format: version(1) + pubkey(32) + caps(1) = 34 bytes
+// Format: version(1) + pubkey(32) + caps(1) + descLen(1) + desc(descLen)
 func (c *GattClient) readNodeInfo(ctx context.Context) error {
 	if c.charNodeInfo == "" {
 		return fmt.Errorf("NODE_INFO characteristic not found")
@@ -192,7 +193,14 @@ func (c *GattClient) readNodeInfo(ctx context.Context) error {
 	c.pubKey = append([]byte(nil), data[1:33]...)
 	c.nodeID = core.NodeIDFromPubKey(c.pubKey)
 	c.caps = core.Capabilities(data[33])
-	log.Printf("[gatt-client] node_info: peer=%s caps=0x%02x", c.nodeID, c.caps)
+	c.description = ""
+	if len(data) >= 35 {
+		descLen := int(data[34])
+		if 35+descLen <= len(data) {
+			c.description = string(data[35 : 35+descLen])
+		}
+	}
+	log.Printf("[gatt-client] node_info: peer=%s caps=0x%02x desc=%q", c.nodeID, c.caps, c.description)
 	return nil
 }
 

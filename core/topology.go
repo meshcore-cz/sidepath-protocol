@@ -7,11 +7,12 @@ import (
 
 // TopoNode represents a mesh node as seen in the global topology.
 type TopoNode struct {
-	ID        NodeID
-	Caps      Capabilities
-	Neighbors []NodeID
-	Seq       uint32
-	LastSeen  time.Time
+	ID          NodeID
+	Caps        Capabilities
+	Neighbors   []NodeID
+	Seq         uint32
+	Description string // diagnostic label from the node's ANNOUNCE (key 8)
+	LastSeen    time.Time
 }
 
 // Topology maintains the global mesh graph learned via ANNOUNCE packets.

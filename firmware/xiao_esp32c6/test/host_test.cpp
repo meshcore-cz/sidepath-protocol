@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     uint8_t pid[mesh::PACKET_ID_LEN] = {0};
     std::vector<uint8_t> out;
     mesh::buildAnnounce(pub /* selfId = pubkey[:8] */, caps, seq, 1700000000, pid,
-                        neighbors.data(), nCount, pub, sig, out);
+                        neighbors.data(), nCount, pub, sig, "esp32-c6", out);
     printHex(out);
     return 0;
   }

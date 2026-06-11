@@ -25,6 +25,7 @@ func main() {
 	// Parse a minimal set of flags manually so we don't depend on flag pkg order
 	seedHex := ""
 	allowPeers := ""
+	description := ""
 	verbose := false
 	for i, arg := range os.Args[1:] {
 		switch {
@@ -34,6 +35,10 @@ func main() {
 			seedHex = strings.TrimPrefix(arg, "--seed-hex=")
 		case arg == "--seed-hex" && i+1 < len(os.Args[1:]):
 			seedHex = os.Args[i+2]
+		case strings.HasPrefix(arg, "--description="):
+			description = strings.TrimPrefix(arg, "--description=")
+		case arg == "--description" && i+1 < len(os.Args[1:]):
+			description = os.Args[i+2]
 		case strings.HasPrefix(arg, "--allow-peer="):
 			allowPeers = strings.TrimPrefix(arg, "--allow-peer=")
 		case arg == "--allow-peer" && i+1 < len(os.Args[1:]):
@@ -103,8 +108,9 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	defer cancel()
 
 	node := blenode.New(blenode.Config{
-		Identity:  identity,
-		Caps:      core.Capabilities(uint8(core.CapSender) | uint8(core.CapReceiver) | uint8(core.CapRelay)),
+		Identity:    identity,
+		Description: description,
+		Caps:        core.Capabilities(uint8(core.CapSender) | uint8(core.CapReceiver) | uint8(core.CapRelay)),
 		Allowlist: allowlist,
 		Verbose:   verbose,
 		LogFn:     logFn,
@@ -169,7 +175,7 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 				fmt.Println("  (no peers connected)")
 			} else {
 				for _, p := range peers {
-					fmt.Printf("  peer: %s\n", p)
+					fmt.Printf("  peer: %s  %s\n", p, descLabel(node.DescriptionFor(p)))
 				}
 			}
 
@@ -179,8 +185,8 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 				fmt.Println("  (no neighbors)")
 			} else {
 				for _, nb := range nbs {
-					fmt.Printf("  neighbor: %s  rssi=%d  tx=%s  rx=%s\n",
-						nb.ID, nb.RSSI, nb.TxPHY, nb.RxPHY)
+					fmt.Printf("  neighbor: %s  %s  rssi=%d  tx=%s  rx=%s\n",
+						nb.ID, descLabel(node.DescriptionFor(nb.ID)), nb.RSSI, nb.TxPHY, nb.RxPHY)
 				}
 			}
 
@@ -198,8 +204,8 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 						}
 						nbs[i] = s
 					}
-					fmt.Printf("  node: %s  caps=%s  last-announce=%s  neighbors=[%s]\n",
-						tn.ID, tn.Caps, relativeTime(tn.LastSeen), strings.Join(nbs, " "))
+					fmt.Printf("  node: %s  %s  caps=%s  last-announce=%s  neighbors=[%s]\n",
+						tn.ID, descLabel(tn.Description), tn.Caps, relativeTime(tn.LastSeen), strings.Join(nbs, " "))
 				}
 			}
 
@@ -222,6 +228,14 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "bleedge-macos: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// descLabel renders a node description as "[desc]", or "[?]" when unknown.
+func descLabel(desc string) string {
+	if desc == "" {
+		return "[?]"
+	}
+	return "[" + desc + "]"
 }
 
 // relativeTime formats a timestamp as a short "Ns ago" string.

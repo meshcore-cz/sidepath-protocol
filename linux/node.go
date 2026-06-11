@@ -16,10 +16,11 @@ import (
 
 // Node is the top-level Linux BLE node that coordinates all subsystems.
 type Node struct {
-	nodeID    core.NodeID
-	identity  *core.Identity
-	phyMode   core.PHYMode
-	caps      core.Capabilities
+	nodeID      core.NodeID
+	identity    *core.Identity
+	description string
+	phyMode     core.PHYMode
+	caps        core.Capabilities
 	router    *core.Router
 	reassembler *core.Reassembler
 
@@ -44,6 +45,7 @@ type NodeConfig struct {
 	Identity    *core.Identity // nil = load/generate from ~/.bleedge/seed
 	PHYMode     core.PHYMode
 	Allowlist   []core.NodeID
+	Description string // node label advertised in ANNOUNCE/NODE_INFO; empty = platform default
 	Verbose     bool
 	JSONLog     bool
 }
@@ -65,7 +67,13 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("adapter: %w", err)
 	}
 
+	description := cfg.Description
+	if description == "" {
+		description = core.PlatformDescription()
+	}
+
 	router := core.NewRouterForIdentity(identity)
+	router.Description = description
 	for _, id := range cfg.Allowlist {
 		router.Allowlist[id] = true
 	}
@@ -73,6 +81,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	n := &Node{
 		nodeID:      nodeID,
 		identity:    identity,
+		description: description,
 		phyMode:     cfg.PHYMode,
 		caps:        core.Capabilities(core.LinuxCapabilities),
 		router:      router,
@@ -83,7 +92,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		jsonLog:     cfg.JSONLog,
 	}
 
-	n.gattServer = NewGattServer(adapter, identity.Pub, n.caps, n.handleIncomingFrame)
+	n.gattServer = NewGattServer(adapter, identity.Pub, n.caps, description, n.handleIncomingFrame)
 	n.advertiser = NewAdvertiser(adapter, nodeID)
 	n.scanner = NewScanner(adapter)
 
@@ -441,11 +450,12 @@ func (n *Node) connectDevice(ctx context.Context, result ScanResult) {
 	n.mu.Unlock()
 
 	n.router.Neighbors.Upsert(core.Neighbor{
-		ID:       realID,
-		TxPHY:    link.TxPHY(),
-		RxPHY:    link.RxPHY(),
-		RSSI:     link.RSSI(),
-		Caps:     client.caps,
+		ID:          realID,
+		TxPHY:       link.TxPHY(),
+		RxPHY:       link.RxPHY(),
+		RSSI:        link.RSSI(),
+		Caps:        client.caps,
+		Description: client.description,
 	})
 }
 
