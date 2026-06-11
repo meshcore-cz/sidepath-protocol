@@ -65,6 +65,7 @@ fun ChannelsScreen(
     onOpenChannel: (String) -> Unit,
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenAbout: () -> Unit,
 ) {
     val channels by vm.channelConversations.collectAsState()
     val joined by vm.channels.collectAsState()
@@ -99,7 +100,7 @@ fun ChannelsScreen(
                             contentDescription = if (searching) "Close search" else "Search",
                         )
                     }
-                    OverflowMenu(onOpenSettings = onOpenSettings)
+                    OverflowMenu(onOpenSettings = onOpenSettings, onOpenAbout = onOpenAbout)
                 },
             )
         },

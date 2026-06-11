@@ -1,5 +1,6 @@
 package cz.arnal.bleedge.chat.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
@@ -40,6 +41,7 @@ private sealed class Dest(val depth: Int) {
     data object Tabs : Dest(0)
     data object Settings : Dest(1)
     data object RxLog : Dest(1)
+    data object About : Dest(2)
     data class Conversation(val peer: String) : Dest(1)
     data class Profile(val peer: String) : Dest(2)
     data class Trace(val peer: String) : Dest(3)
@@ -52,6 +54,7 @@ fun ChatRoot(vm: ChatViewModel) {
     var openTrace by rememberSaveable { mutableStateOf<String?>(null) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var showRxLog by rememberSaveable { mutableStateOf(false) }
+    var showAbout by rememberSaveable { mutableStateOf(false) }
     var tab by rememberSaveable { mutableStateOf(0) }
 
     // A meshcore:// deep link (contact/channel) asks us to open its conversation.
@@ -69,12 +72,29 @@ fun ChatRoot(vm: ChatViewModel) {
     // unwinds in that order.
     val top: Dest = when {
         openTrace != null -> Dest.Trace(openTrace!!)
+        showAbout -> Dest.About
         openProfile != null -> Dest.Profile(openProfile!!)
         openPeer != null -> Dest.Conversation(openPeer!!)
         showRxLog -> Dest.RxLog
         showSettings -> Dest.Settings
         else -> Dest.Tabs
     }
+
+    val popTop = {
+        when (top) {
+            is Dest.Trace -> {
+                vm.clearTrace()
+                openTrace = null
+            }
+            Dest.About -> showAbout = false
+            is Dest.Profile -> openProfile = null
+            is Dest.Conversation -> openPeer = null
+            Dest.RxLog -> showRxLog = false
+            Dest.Settings -> showSettings = false
+            Dest.Tabs -> Unit
+        }
+    }
+    BackHandler(enabled = top !is Dest.Tabs) { popTop() }
 
     val avatarStyle by vm.avatarStyle.collectAsState()
     CompositionLocalProvider(LocalAvatarStyle provides avatarStyle) {
@@ -92,24 +112,30 @@ fun ChatRoot(vm: ChatViewModel) {
         label = "nav",
     ) { dest ->
         when (dest) {
-            is Dest.Trace -> TraceScreen(vm, dest.peer, onBack = { openTrace = null })
+            is Dest.Trace -> TraceScreen(vm, dest.peer, onBack = popTop)
             is Dest.Profile -> ProfileScreen(
                 vm, dest.peer,
-                onBack = { openProfile = null },
+                onBack = popTop,
                 onOpenConversation = { openProfile = null; openPeer = it },
                 onTrace = { openTrace = it },
             )
             is Dest.Conversation -> ConversationScreen(
                 vm, dest.peer,
-                onBack = { openPeer = null },
+                onBack = popTop,
                 onOpenProfile = { openProfile = it },
             )
             Dest.Settings -> SettingsScreen(
                 vm,
-                onBack = { showSettings = false },
-                onOpenProfile = { showSettings = false; openProfile = it },
+                onBack = popTop,
+                onOpenProfile = { openProfile = it },
+                onOpenAbout = { showAbout = true },
             )
-            Dest.RxLog -> RxLogScreen(vm, onBack = { showRxLog = false })
+            Dest.RxLog -> RxLogScreen(
+                vm,
+                onBack = popTop,
+                onOpenProfile = { openProfile = it },
+            )
+            Dest.About -> AboutScreen(onBack = popTop)
             Dest.Tabs -> TabsScaffold(
                 vm,
                 tab = tab,
@@ -117,6 +143,7 @@ fun ChatRoot(vm: ChatViewModel) {
                 onOpenConversation = { openPeer = it },
                 onOpenProfile = { openProfile = it },
                 onOpenSettings = { showSettings = true },
+                onOpenAbout = { showAbout = true },
                 onOpenTrace = { openTrace = it },
                 onOpenRxLog = { showRxLog = true },
             )
@@ -133,6 +160,7 @@ private fun TabsScaffold(
     onOpenConversation: (String) -> Unit,
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenAbout: () -> Unit,
     onOpenTrace: (String) -> Unit,
     onOpenRxLog: () -> Unit,
 ) {
@@ -180,6 +208,7 @@ private fun TabsScaffold(
                     onOpenConversation = onOpenConversation,
                     onOpenProfile = onOpenProfile,
                     onOpenSettings = onOpenSettings,
+                    onOpenAbout = onOpenAbout,
                     onOpenTrace = onOpenTrace,
                     onOpenRxLog = onOpenRxLog,
                 )
@@ -188,6 +217,7 @@ private fun TabsScaffold(
                     onOpenChannel = onOpenConversation,
                     onOpenProfile = onOpenProfile,
                     onOpenSettings = onOpenSettings,
+                    onOpenAbout = onOpenAbout,
                 )
                 else -> NetworkScreen(
                     vm,

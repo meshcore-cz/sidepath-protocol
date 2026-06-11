@@ -692,16 +692,36 @@ class BLEEdgeService : Service() {
             else -> null
         }
         log("MSG delivered from=${deliveredPkt.source.toHexString()} type=${deliveredPkt.payloadType} len=${deliveredPkt.payload.size} hops=${deliveredPkt.trace.size} trace=${deliveredPkt.trace.map { it.toHexString().take(8) }}", LogTag.MSG)
-        appendMessage(
-            ReceivedMessage(
-                fromNodeId = deliveredPkt.source,
-                payload = deliveredPkt.payload,
-                payloadType = deliveredPkt.payloadType,
-                trace = deliveredPkt.trace,
-                text = text,
-                packetId = deliveredPkt.id,
-            )
+        val incoming = ReceivedMessage(
+            fromNodeId = deliveredPkt.source,
+            payload = deliveredPkt.payload,
+            payloadType = deliveredPkt.payloadType,
+            trace = deliveredPkt.trace,
+            text = text,
+            packetId = deliveredPkt.id,
         )
+        appendMessage(incoming)
+        maybeNotifyIncomingMessage(incoming)
+    }
+
+    private fun maybeNotifyIncomingMessage(msg: ReceivedMessage) {
+        val text = msg.text ?: return
+        when (msg.payloadType) {
+            PayloadType.CHAT_ENCRYPTED,
+            PayloadType.CHAT_PLAIN,
+            PayloadType.TEXT_TEST,
+            PayloadType.CHANNEL,
+            -> {
+                val sender = msg.fromNodeId.toHexString().take(8)
+                MessageNotifier.show(
+                    context = this,
+                    sender = "BLEEdge · $sender",
+                    text = text,
+                    notificationId = sender.hashCode(),
+                )
+            }
+            else -> Unit
+        }
     }
 
     private fun recordTraceMetric(pkt: Packet, incomingPeer: NodeID?): Packet {

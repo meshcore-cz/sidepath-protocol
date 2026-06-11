@@ -43,7 +43,16 @@ class ChatActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        if (results.values.all { it }) viewModel.onPermissionsGranted()
+        if (results.values.all { it }) {
+            viewModel.onPermissionsGranted()
+            requestNotificationPermissionIfNeeded()
+        }
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        // Notification permission is optional; BLEEdge can still receive mesh packets without it.
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -68,8 +77,12 @@ class ChatActivity : ComponentActivity() {
             MaterialTheme(colorScheme = colors) {
                 Surface {
                     LaunchedEffect(Unit) {
-                        if (allPermissionsGranted()) viewModel.onPermissionsGranted()
-                        else permissionLauncher.launch(requiredPermissions)
+                        if (allPermissionsGranted()) {
+                            viewModel.onPermissionsGranted()
+                            requestNotificationPermissionIfNeeded()
+                        } else {
+                            permissionLauncher.launch(requiredPermissions)
+                        }
                     }
                     ChatRoot(viewModel)
                 }
@@ -94,4 +107,16 @@ class ChatActivity : ComponentActivity() {
         requiredPermissions.all {
             ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 }

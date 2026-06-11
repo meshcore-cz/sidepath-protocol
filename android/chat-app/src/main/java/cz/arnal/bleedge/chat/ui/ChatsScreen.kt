@@ -18,11 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Create
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -56,6 +52,7 @@ fun ChatsScreen(
     onOpenConversation: (String) -> Unit,
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenAbout: () -> Unit,
     onOpenTrace: ((String) -> Unit)? = null,
     onOpenRxLog: (() -> Unit)? = null,
 ) {
@@ -65,7 +62,6 @@ fun ChatsScreen(
     val myPubKeyHex by vm.myPubKeyHex.collectAsState()
     var showPicker by remember { mutableStateOf(false) }
     var searching by remember { mutableStateOf(false) }
-    var menuOpen by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
 
     val visible = remember(conversations, query) {
@@ -105,19 +101,7 @@ fun ChatsScreen(
                             contentDescription = if (searching) "Close search" else "Search",
                         )
                     }
-                    IconButton(onClick = { menuOpen = true }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "More")
-                    }
-                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Settings") },
-                            leadingIcon = { Icon(Icons.Default.Settings, contentDescription = null) },
-                            onClick = {
-                                menuOpen = false
-                                onOpenSettings()
-                            },
-                        )
-                    }
+                    OverflowMenu(onOpenSettings = onOpenSettings, onOpenAbout = onOpenAbout)
                 },
             )
         },

@@ -18,6 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -54,7 +55,12 @@ import cz.arnal.bleedge.core.PHYMode
 
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenProfile: (String) -> Unit = {}) {
+fun SettingsScreen(
+    vm: ChatViewModel,
+    onBack: () -> Unit,
+    onOpenProfile: (String) -> Unit = {},
+    onOpenAbout: () -> Unit = {},
+) {
     val seedHex by vm.seedHex.collectAsState()
     val description by vm.description.collectAsState()
     val name by vm.name.collectAsState()
@@ -312,6 +318,35 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenProfile: (String
                             )
                         }
                     }
+                }
+            }
+
+            Card(
+                Modifier.fillMaxWidth().clickable(onClick = onOpenAbout),
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.Info,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.size(14.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("About BLEEdge Chat", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "App details, authors, and software licences.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Icon(
+                        Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }

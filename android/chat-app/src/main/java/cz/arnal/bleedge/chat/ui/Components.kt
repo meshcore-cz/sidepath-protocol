@@ -301,7 +301,11 @@ fun MessageDetailsSheet(
             Text("Message details", style = MaterialTheme.typography.titleMedium)
             // For a channel message, surface the sender and let it open their profile.
             if (isChannelPeer(msg.peerHex) && msg.senderHex.isNotBlank()) {
-                val senderLabel = msg.senderName.ifBlank { vm.nameForHex(msg.senderHex) }
+                val senderProfile by remember(msg.senderHex) { vm.profileFor(msg.senderHex) }.collectAsState()
+                val senderLabel = senderProfile.name.ifBlank {
+                    msg.senderName.ifBlank { vm.nameForHex(msg.senderHex) }
+                }
+                val senderIdenticonKey = senderProfile.pubKeyHex.ifBlank { null }
                 Row(
                     Modifier.fillMaxWidth()
                         .then(if (onOpenProfile != null) Modifier.clickable { onOpenProfile(msg.senderHex) } else Modifier),
@@ -310,7 +314,7 @@ fun MessageDetailsSheet(
                 ) {
                     Text("Sender", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(seed = msg.senderHex, label = senderLabel, size = 28)
+                        Avatar(seed = msg.senderHex, label = senderLabel, size = 28, identiconKey = senderIdenticonKey)
                         Spacer(Modifier.size(8.dp))
                         Text(
                             senderLabel,

@@ -2,6 +2,7 @@ package cz.arnal.bleedge.chat.ui
 
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.DropdownMenu
@@ -22,6 +23,7 @@ import androidx.compose.runtime.setValue
 @Composable
 fun OverflowMenu(
     onOpenSettings: () -> Unit,
+    onOpenAbout: (() -> Unit)? = null,
     extraItems: @Composable ColumnScope.(dismiss: () -> Unit) -> Unit = {},
 ) {
     var open by remember { mutableStateOf(false) }
@@ -35,5 +37,12 @@ fun OverflowMenu(
             leadingIcon = { Icon(Icons.Default.Settings, contentDescription = null) },
             onClick = { open = false; onOpenSettings() },
         )
+        if (onOpenAbout != null) {
+            DropdownMenuItem(
+                text = { Text("About") },
+                leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                onClick = { open = false; onOpenAbout() },
+            )
+        }
     }
 }

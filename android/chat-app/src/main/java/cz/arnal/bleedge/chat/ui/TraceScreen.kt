@@ -277,12 +277,15 @@ private fun TraceResultView(result: TraceResult, rttMs: Long?, vm: ChatViewModel
 @Composable
 private fun HopRow(index: Int, node: NodeID, sample: Byte?, metric: String, vm: ChatViewModel) {
     val hex = node.toHexString()
+    val profile by remember(hex) { vm.profileFor(hex) }.collectAsState()
+    val label = profile.name.ifBlank { vm.nameForHex(hex) }
+    val identiconKey = profile.pubKeyHex.ifBlank { null }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text("$index.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(28.dp))
-        Avatar(seed = hex, label = vm.nameForHex(hex), size = 28)
+        Avatar(seed = hex, label = label, size = 28, identiconKey = identiconKey)
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
-            Text(vm.nameForHex(hex), fontWeight = FontWeight.Medium, maxLines = 1)
+            Text(label, fontWeight = FontWeight.Medium, maxLines = 1)
             Text(hex.take(16), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (sample != null) {
