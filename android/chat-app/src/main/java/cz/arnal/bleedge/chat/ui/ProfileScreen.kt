@@ -86,7 +86,7 @@ fun ProfileScreen(
     ) { padding ->
         Column(
             Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
-                .padding(horizontal = 24.dp, vertical = 16.dp),
+                .padding(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 40.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             // Big centered avatar. Identicons are keyed on a contact's public key; channels
@@ -132,6 +132,18 @@ fun ProfileScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+            }
+
+            // The node's own free-form description is shown only here, between the hero and the
+            // actions (the deterministic name is the primary label everywhere else).
+            if (!profile.isChannel && profile.description.isNotBlank()) {
+                Spacer(Modifier.size(12.dp))
+                Text(
+                    profile.description,
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
             }
 
             Spacer(Modifier.size(20.dp))
@@ -257,6 +269,7 @@ private fun UserInfo(p: ProfileInfo) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
         InfoRow("Node ID", p.nodeHex)
         if (p.pubKeyHex.isNotBlank()) InfoRow("Public key", p.pubKeyHex)
+        if (p.platform.isNotBlank()) InfoRow("Platform", p.platform)
         InfoRow("Status", if (p.online) "Online (announcing)" else "Not currently visible")
         InfoRow("In contacts", if (p.isContact) "Yes" else "No")
     }

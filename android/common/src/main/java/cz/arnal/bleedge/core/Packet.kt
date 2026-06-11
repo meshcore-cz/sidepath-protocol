@@ -127,7 +127,9 @@ data class AnnouncePayload(
     val timestamp: Long,
     val publicKey: ByteArray = ByteArray(0), // 32 bytes (Ed25519), key 6
     val signature: ByteArray = ByteArray(0), // 64 bytes (Ed25519), key 7
-    val description: String = "",            // diagnostic label (text), key 8, NOT signed
+    val description: String = "",            // free-form bio (text), key 8, NOT signed
+    val name: String = "",                   // primary display label (text), key 9, NOT signed
+    val platform: String = "",               // OS/device string (text), key 10, NOT signed
 ) {
     fun encode(): ByteArray {
         val map = CBORObject.NewOrderedMap()
@@ -141,6 +143,8 @@ data class AnnouncePayload(
         map[CBORObject.FromObject(6)] = CBORObject.FromObject(publicKey)
         map[CBORObject.FromObject(7)] = CBORObject.FromObject(signature)
         map[CBORObject.FromObject(8)] = CBORObject.FromObject(description)
+        map[CBORObject.FromObject(9)] = CBORObject.FromObject(name)
+        map[CBORObject.FromObject(10)] = CBORObject.FromObject(platform)
         return map.EncodeToBytes()
     }
 
@@ -156,7 +160,9 @@ data class AnnouncePayload(
             val pub = map[CBORObject.FromObject(6)]?.takeIf { !it.isNull }?.GetByteString() ?: ByteArray(0)
             val sig = map[CBORObject.FromObject(7)]?.takeIf { !it.isNull }?.GetByteString() ?: ByteArray(0)
             val desc = map[CBORObject.FromObject(8)]?.takeIf { !it.isNull }?.AsString() ?: ""
-            return AnnouncePayload(nodeId, caps, neighbors, seq, timestamp, pub, sig, desc)
+            val name = map[CBORObject.FromObject(9)]?.takeIf { !it.isNull }?.AsString() ?: ""
+            val platform = map[CBORObject.FromObject(10)]?.takeIf { !it.isNull }?.AsString() ?: ""
+            return AnnouncePayload(nodeId, caps, neighbors, seq, timestamp, pub, sig, desc, name, platform)
         }
     }
 }

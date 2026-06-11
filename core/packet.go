@@ -65,10 +65,16 @@ type AnnouncePayload struct {
 	Timestamp int64        `cbor:"5,keyasint"`
 	PublicKey []byte       `cbor:"6,keyasint"`
 	Signature []byte       `cbor:"7,keyasint"`
-	// Description is a free-form, human-readable node label (defaults to the
-	// platform/OS, e.g. "linux/arm64"). It is diagnostic only and is NOT covered
-	// by Signature — never use it for any routing or trust decision.
+	// Description is a free-form, human-readable node bio (default empty). It is
+	// diagnostic only and is NOT covered by Signature — never use it for any
+	// routing or trust decision.
 	Description string `cbor:"8,keyasint,omitempty"`
+	// Name is the node's primary display label (default: deterministic from the
+	// public key, see DefaultNodeName; user-overridable). Unsigned — informational.
+	Name string `cbor:"9,keyasint,omitempty"`
+	// Platform is the node's OS/device string (e.g. "linux/arm64", "esp32-c6").
+	// Auto-set per platform, read-only. Unsigned — informational.
+	Platform string `cbor:"10,keyasint,omitempty"`
 }
 
 func (a AnnouncePayload) Encode() ([]byte, error) { return cbor.Marshal(a) }

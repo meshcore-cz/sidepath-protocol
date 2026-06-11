@@ -30,6 +30,8 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -52,6 +54,7 @@ import cz.arnal.bleedge.chat.ConnState
 import cz.arnal.bleedge.chat.data.ChannelKind
 import cz.arnal.bleedge.chat.data.Message
 import cz.arnal.bleedge.chat.data.MsgStatus
+import cz.arnal.bleedge.service.RSSI_UNKNOWN
 import cz.arnal.bleedge.chat.data.isChannelPeer
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -289,6 +292,8 @@ fun MessageDetailsSheet(
     onOpenProfile: ((String) -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
+    val floodRepeats by vm.floodRepeats.collectAsState()
+    val repeatSamples = floodRepeats[msg.id].orEmpty()
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Message details", style = MaterialTheme.typography.titleMedium)
@@ -319,7 +324,9 @@ fun MessageDetailsSheet(
             if (!msg.incoming) {
                 DetailRow("Status", when (msg.status) {
                     MsgStatus.SENDING -> "Sending…"
-                    MsgStatus.SENT -> "Sent to mesh"
+                    MsgStatus.SENT ->
+                        if (repeatSamples.isEmpty()) "Sent to mesh"
+                        else "Sent — heard ${repeatSamples.size} repeat${if (repeatSamples.size == 1) "" else "s"}"
                     MsgStatus.DELIVERED -> "Delivered (ACK received)"
                     else -> "Failed to send"
                 })
@@ -342,6 +349,22 @@ fun MessageDetailsSheet(
                 relayHops.forEachIndexed { i, hop ->
                     Text(
                         "${i + 1}. ${vm.nameForHex(hop)}  ·  ${hop.take(8)}",
+                        fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                    )
+                }
+            }
+            // Repeats of this flooded message we heard echoed back, with the RSSI of each reception.
+            if (repeatSamples.isNotEmpty()) {
+                DetailRow("Repeats heard", "${repeatSamples.size}")
+                Text(
+                    "Echoes",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                repeatSamples.forEachIndexed { i, s ->
+                    val rssi = if (s.rssi == RSSI_UNKNOWN) "n/a" else "${s.rssi} dBm"
+                    Text(
+                        "${i + 1}. ${formatClock(s.timestampMs)}  ·  RSSI $rssi",
                         fontFamily = FontFamily.Monospace, fontSize = 13.sp,
                     )
                 }

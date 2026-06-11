@@ -27,6 +27,9 @@ interface ChatDao {
     @Query("UPDATE messages SET read = 1 WHERE peerHex = :peer AND incoming = 1 AND read = 0")
     suspend fun markRead(peer: String)
 
+    @Query("DELETE FROM messages WHERE peerHex = :peer")
+    suspend fun deleteMessagesFor(peer: String)
+
     // ---- contacts ----
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertContact(contact: Contact)

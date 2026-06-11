@@ -10,6 +10,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
@@ -55,6 +56,11 @@ import java.security.SecureRandom
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "bleedge_chat_prefs")
 private val SEED_KEY = stringPreferencesKey("seed")
 private val DESC_KEY = stringPreferencesKey("description")
+private val NAME_KEY = stringPreferencesKey("name")
+private val DM_RETRY_DELAY_KEY = intPreferencesKey("dm_retry_delay_ms")
+private val DM_MAX_TRIES_KEY = intPreferencesKey("dm_max_tries")
+private const val DEFAULT_DM_RETRY_DELAY_MS = 3000
+private const val DEFAULT_DM_MAX_TRIES = 3
 private val PHY_MODE_KEY = stringPreferencesKey("phy_mode")
 private val AVATAR_STYLE_KEY = stringPreferencesKey("avatar_style")
 private val PUBLIC_SEEDED_KEY = booleanPreferencesKey("public_seeded")
@@ -113,6 +119,8 @@ data class ProfileInfo(
     val pubKeyHex: String = "",
     val isContact: Boolean = false,
     val online: Boolean = false, // present in the live topology (signed ANNOUNCE)
+    val description: String = "", // node's own free-form description, shown only on the profile
+    val platform: String = "",    // node's OS/device string, shown in profile node information
     val channelKind: String = "",
     val channelHash: Int = 0,
     val pskHex: String = "",
@@ -155,8 +163,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _seedHex = MutableStateFlow("")
     val seedHex: StateFlow<String> = _seedHex.asStateFlow()
 
+    /** This node's own 32-byte public key (hex), derived from the seed — for the self identicon. */
+    val myPubKeyHex: StateFlow<String> = _seedHex.map { hex ->
+        runCatching { Identity.fromSeed(hex.hexToBytes()).publicKey.toHex() }.getOrDefault("")
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
     private val _description = MutableStateFlow("")
     val description: StateFlow<String> = _description.asStateFlow()
+
+    /** The user's chosen name override (may be blank = use the deterministic default). */
+    private val _name = MutableStateFlow("")
+    val name: StateFlow<String> = _name.asStateFlow()
+
+    /** This node's effective display name: the override if set, else the deterministic default. */
+    val myName: StateFlow<String> = combine(_name, myPubKeyHex) { n, pub ->
+        n.ifBlank { nameFromPubKey(pub) }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
+    /** Direct-message delivery retry: wait this long for an ACK before re-sending. */
+    private val _dmRetryDelayMs = MutableStateFlow(DEFAULT_DM_RETRY_DELAY_MS)
+    val dmRetryDelayMs: StateFlow<Int> = _dmRetryDelayMs.asStateFlow()
+
+    /** Total DM send attempts (including the first) before giving up. */
+    private val _dmMaxTries = MutableStateFlow(DEFAULT_DM_MAX_TRIES)
+    val dmMaxTries: StateFlow<Int> = _dmMaxTries.asStateFlow()
 
     private val _avatarStyle = MutableStateFlow(AvatarStyle.IDENTICON)
     val avatarStyle: StateFlow<AvatarStyle> = _avatarStyle.asStateFlow()
@@ -201,10 +231,33 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         it?.stats ?: flowOf(MeshStats())
     }.stateIn(viewModelScope, SharingStarted.Eagerly, MeshStats())
 
-    /** Routing/SYS log entries, newest first — backs the Rx Log screen. */
+    /** Routing/SYS log entries, newest first — raw diagnostic text log. */
     val routingLog: StateFlow<List<LogEntry>> = _service.flatMapLatest {
         it?.routingLog ?: flowOf(emptyList())
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Decoded BLEEdge packets seen on the radio, newest first — backs the Rx Log screen. */
+    val rxPackets: StateFlow<List<cz.arnal.bleedge.service.RxPacket>> = _service.flatMapLatest {
+        it?.rxPackets ?: flowOf(emptyList())
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Wall-clock time of the most recent received packet, or null if none yet. */
+    val lastPacketAtMs: StateFlow<Long?> = rxPackets
+        .map { it.firstOrNull()?.timestampMs }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /**
+     * Repeats of our own flooded (broadcast/channel) messages heard back on the radio, keyed by the
+     * message's packet-id hex (= [cz.arnal.bleedge.chat.data.Message.id]). Each sample carries the
+     * receiving link's RSSI. Surfaced as an icon+count on the bubble and a list in message details.
+     */
+    val floodRepeats: StateFlow<Map<String, List<cz.arnal.bleedge.service.RepeatSample>>> =
+        _service.flatMapLatest { it?.floodRepeats ?: flowOf(emptyMap()) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    /** Starts/stops the mesh radio (advertise + scan + GATT). Surfaced on the Network page. */
+    fun startMesh() { _service.value?.startBLE() }
+    fun stopMesh() { _service.value?.stopBLE() }
 
     /** Overall connection health, surfaced as the status dot in the Chats header. */
     val connectionStatus: StateFlow<ConnState> =
@@ -330,14 +383,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             ctx.dataStore.edit { it[SEED_KEY] = gen }
         }
         val desc = pref[DESC_KEY] ?: ""
+        val nodeName = pref[NAME_KEY] ?: ""
+        val retryDelay = pref[DM_RETRY_DELAY_KEY] ?: DEFAULT_DM_RETRY_DELAY_MS
+        val maxTries = pref[DM_MAX_TRIES_KEY] ?: DEFAULT_DM_MAX_TRIES
         val phy = PHYMode.fromString(pref[PHY_MODE_KEY] ?: PHYMode.DEBUG_1M.value)
         _seedHex.value = seedHex
         _description.value = desc
+        _name.value = nodeName
+        _dmRetryDelayMs.value = retryDelay
+        _dmMaxTries.value = maxTries
         _avatarStyle.value = AvatarStyle.fromValue(pref[AVATAR_STYLE_KEY])
         _themeMode.value = ThemeMode.fromValue(pref[THEME_KEY])
 
         val identity = Identity.fromSeed(seedHex.hexToBytes())
-        service.initialize(identity, phy, emptySet(), desc)
+        service.initialize(identity, phy, emptySet(), desc, nodeName, retryDelay.toLong(), maxTries)
         ensurePublicChannel()
     }
 
@@ -385,18 +444,39 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Starts a source-routed trace to a node; results arrive via [trace]. */
-    fun startTrace(peerHex: String) {
+    /**
+     * Starts a source-routed trace to a node; results arrive via [trace]. With an empty [route] the
+     * router picks the path automatically; pass an explicit hop list (NOT including this node) to
+     * trace a route the user specified by hand or by picking nodes.
+     */
+    fun startTrace(peerHex: String, route: List<NodeID> = emptyList()) {
         val service = _service.value
         if (service == null) {
             _trace.value = TraceUi(peerHex, running = false, error = "Mesh service not ready yet.")
             return
         }
-        val tag = service.sendTrace(NodeID.fromHex(peerHex))
+        val tag = service.sendTrace(NodeID.fromHex(peerHex), route)
         _trace.value = if (tag == null) {
-            TraceUi(peerHex, running = false, error = "No route to this node yet — try again once it's in the network.")
+            TraceUi(peerHex, running = false, error = if (route.isEmpty())
+                "No route to this node yet — try again once it's in the network."
+            else
+                "Couldn't start that route — its first hop must be a directly connected peer.")
         } else {
             TraceUi(peerHex, running = true, tag = tag, startedAtMs = System.currentTimeMillis())
+        }
+    }
+
+    /**
+     * Parses a manual route string like "d503fdbcb61c654f,be0d40fda9b839b5,d503fdbcb61c654f" into
+     * NodeIDs. Accepts comma/space/newline separators; each token must be 16 hex chars (an 8-byte
+     * NodeID). Returns null if any token is malformed so the UI can show an error.
+     */
+    fun parseManualRoute(text: String): List<NodeID>? {
+        val tokens = text.split(',', ' ', '\n', '\t').map { it.trim() }.filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return null
+        return tokens.map { tok ->
+            if (tok.length != 16 || tok.any { it.digitToIntOrNull(16) == null }) return null
+            NodeID.fromHex(tok.lowercase())
         }
     }
 
@@ -541,6 +621,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     pubKeyHex = publicKeyHex(peerHex, byNode, t),
                     isContact = byNode[peerHex] != null,
                     online = t.any { it.nodeId.toHexString() == peerHex },
+                    description = nodeDescription(peerHex, byNode, t),
+                    platform = nodePlatform(peerHex, t),
                 )
             }
         }.stateIn(
@@ -631,15 +713,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (body.isEmpty()) return
         val service = _service.value ?: return
         viewModelScope.launch {
-            val myName = _description.value.ifBlank { "node ${nodeId.value.toHexString().take(8)}" }
-            val payload = ChannelCrypto.seal(pskHex.hexToBytes(), myName, body)
+            // The channel sender label is our display name (deterministic name or override),
+            // matching what everyone shows for us elsewhere — not the free-form description.
+            val myLabel = myName.value.ifBlank { shortHex(nodeId.value.toHexString()) }
+            val payload = ChannelCrypto.seal(pskHex.hexToBytes(), myLabel, body)
             val id = service.sendChannelMessage(payload)
             dao.insertMessage(
                 Message(
                     id = id.toHex(),
                     peerHex = channelPeerId(pskHex),
                     senderHex = nodeId.value.toHexString(),
-                    senderName = myName,
+                    senderName = myLabel,
                     incoming = false,
                     text = body,
                     timestampMs = System.currentTimeMillis(),
@@ -690,11 +774,41 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { dao.markRead(peerHex) }
     }
 
+    /** Deletes a direct conversation's message history (removes it from the chat list). */
+    fun deleteChat(peerHex: String) {
+        viewModelScope.launch { dao.deleteMessagesFor(peerHex) }
+    }
+
     fun setDescription(text: String) {
         viewModelScope.launch {
             getApplication<Application>().dataStore.edit { it[DESC_KEY] = text }
             _description.value = text
             _service.value?.setDescription(text)
+        }
+    }
+
+    /** Updates DM delivery retry settings (wait time per try and total tries). */
+    fun setDmRetry(retryDelayMs: Int, maxTries: Int) {
+        val delay = retryDelayMs.coerceAtLeast(500)
+        val tries = maxTries.coerceIn(1, 10)
+        viewModelScope.launch {
+            getApplication<Application>().dataStore.edit {
+                it[DM_RETRY_DELAY_KEY] = delay
+                it[DM_MAX_TRIES_KEY] = tries
+            }
+            _dmRetryDelayMs.value = delay
+            _dmMaxTries.value = tries
+            _service.value?.setDmRetry(delay.toLong(), tries)
+        }
+    }
+
+    /** Sets the user's display-name override (blank resets to the deterministic default). */
+    fun setName(text: String) {
+        val clean = text.trim()
+        viewModelScope.launch {
+            getApplication<Application>().dataStore.edit { it[NAME_KEY] = clean }
+            _name.value = clean
+            _service.value?.setName(clean)
         }
     }
 
@@ -746,16 +860,36 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun nameForHex(hex: String): String =
         displayName(hex, contacts.value.associateBy { it.nodeHex }, topology.value)
 
+    /** This node's own NodeID as hex — used to exclude self from route pickers. */
+    fun myNodeHex(): String = nodeId.value.toHexString()
+
     // ---- helpers -------------------------------------------------------------
 
+    /**
+     * The primary label for a node: a deterministic name derived from its public key (e.g.
+     * "barrel-two-return"), so the same identity reads the same everywhere. Falls back to a short
+     * id until the public key is known. Channels keep their joined name. The node's own free-form
+     * description is NOT used here — it's shown only on the profile page (see [nodeDescription]).
+     */
     private fun displayName(peerHex: String, contacts: Map<String, Contact>, topo: List<TopologyEntry>): String {
         if (isChannelPeer(peerHex)) {
             return channels.value.firstOrNull { it.pskHex == channelPskHexOf(peerHex) }?.name ?: "Channel"
         }
+        // Prefer the node's real name carried on the wire (ANNOUNCE/NODE_INFO); if it hasn't sent
+        // one (e.g. ESP32, or not yet learned), derive the deterministic default from its pubkey.
+        topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.name?.takeIf { it.isNotBlank() }?.let { return it }
+        val derived = nameFromPubKey(publicKeyHex(peerHex, contacts, topo))
+        return derived.ifBlank { shortHex(peerHex) }
+    }
+
+    /** The node's OS/device string (from its ANNOUNCE / NODE_INFO), or "". */
+    private fun nodePlatform(peerHex: String, topo: List<TopologyEntry>): String =
+        topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.platform?.takeIf { it.isNotBlank() } ?: ""
+
+    /** The node's own free-form description (from its ANNOUNCE / NODE_INFO), or "" — profile only. */
+    private fun nodeDescription(peerHex: String, contacts: Map<String, Contact>, topo: List<TopologyEntry>): String {
         contacts[peerHex]?.description?.takeIf { it.isNotBlank() }?.let { return it }
-        topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.description
-            ?.takeIf { it.isNotBlank() }?.let { return it }
-        return shortHex(peerHex)
+        return topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.description?.takeIf { it.isNotBlank() } ?: ""
     }
 
     /** The node's 32-byte Ed25519 key (hex), from a saved contact or the live topology, or "". */

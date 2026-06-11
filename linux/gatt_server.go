@@ -1,7 +1,6 @@
 package linux
 
 import (
-	"encoding/binary"
 	"fmt"
 	"log"
 	"sync"
@@ -38,6 +37,8 @@ type GattServer struct {
 	pubKey      []byte // 32-byte Ed25519 public key advertised via NODE_INFO
 	caps        core.Capabilities
 	description string
+	name        string
+	platform    string
 	onFrame     func(frame []byte, sender dbus.Sender)
 
 	mu           sync.Mutex
@@ -47,7 +48,7 @@ type GattServer struct {
 // NewGattServer creates and registers the GATT server. pubKey is the node's
 // 32-byte Ed25519 public key; the NodeID is derived as pubKey[:8].
 func NewGattServer(adapter *Adapter, pubKey []byte, caps core.Capabilities,
-	description string, onFrame func(frame []byte, sender dbus.Sender)) *GattServer {
+	description, name, platform string, onFrame func(frame []byte, sender dbus.Sender)) *GattServer {
 	return &GattServer{
 		conn:        adapter.Conn(),
 		adapter:     adapter,
@@ -55,6 +56,8 @@ func NewGattServer(adapter *Adapter, pubKey []byte, caps core.Capabilities,
 		pubKey:      pubKey,
 		caps:        caps,
 		description: description,
+		name:        name,
+		platform:    platform,
 		onFrame:     onFrame,
 		notifyConns: make(map[dbus.Sender]bool),
 	}
@@ -122,9 +125,9 @@ func (g *GattServer) NotifyFrame(frame []byte) {
 	g.conn.Emit(charPacketOut, gattCharIF+".ValueUpdated", frame) //nolint:errcheck
 }
 
-// nodeInfoValue encodes [version(1), pubkey(32), caps(1), descLen(1), desc(descLen)].
+// nodeInfoValue encodes the NODE_INFO characteristic (see core.EncodeNodeInfo).
 func (g *GattServer) nodeInfoValue() []byte {
-	return encodeNodeInfo(core.ProtocolVersion, g.pubKey, g.caps, g.description)
+	return core.EncodeNodeInfo(core.ProtocolVersion, g.pubKey, g.caps, g.description, g.name, g.platform)
 }
 
 // serviceProps returns a D-Bus property map for the GattService1 interface.
@@ -197,19 +200,3 @@ func (c *packetOutCharacteristic) GetAll(iface string) (map[string]dbus.Variant,
 	}, nil
 }
 
-// encodeNodeInfo encodes version(1) + pubkey(32) + caps(1) + descLen(1) + desc(descLen).
-// The description is UTF-8 and truncated to 255 bytes.
-func encodeNodeInfo(version uint8, pubKey []byte, caps core.Capabilities, description string) []byte {
-	desc := []byte(description)
-	if len(desc) > 255 {
-		desc = desc[:255]
-	}
-	b := make([]byte, 34+1+len(desc))
-	b[0] = version
-	copy(b[1:33], pubKey)
-	b[33] = uint8(caps)
-	b[34] = uint8(len(desc))
-	copy(b[35:], desc)
-	_ = binary.BigEndian // import kept for future use
-	return b
-}

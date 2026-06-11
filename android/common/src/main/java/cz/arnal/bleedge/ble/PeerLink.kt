@@ -41,6 +41,12 @@ class BLEPeerLink(
     val description: String
         get() = gattClient.peerDescription
 
+    val name: String
+        get() = gattClient.peerName
+
+    val platform: String
+        get() = gattClient.peerPlatform
+
     /** Send a complete packet by fragmenting it into MAX_FRAME_SIZE frames. */
     fun sendPacketData(data: ByteArray) {
         val pid = newPacketID()

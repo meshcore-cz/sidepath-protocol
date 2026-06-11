@@ -37,7 +37,9 @@ type Action struct {
 type Router struct {
 	LocalID     NodeID
 	Identity    *Identity // local signing identity; required to BuildAnnounce
-	Description string    // diagnostic node label advertised in ANNOUNCE (unsigned)
+	Name        string    // primary display label advertised in ANNOUNCE/NODE_INFO (unsigned)
+	Platform    string    // OS/device string advertised in ANNOUNCE/NODE_INFO (unsigned)
+	Description string    // free-form bio advertised in ANNOUNCE/NODE_INFO (unsigned)
 	dedup       *DedupCache
 	Neighbors   *NeighborTable
 	Topology    *Topology
@@ -111,6 +113,8 @@ func (r *Router) handleAnnounce(pkt Packet, incomingPeer *NodeID) []Action {
 		Neighbors:   ap.Neighbors,
 		Seq:         ap.Seq,
 		Description: ap.Description,
+		Name:        ap.Name,
+		Platform:    ap.Platform,
 		PublicKey:   ap.PublicKey,
 	})
 	// Flood ANNOUNCE to the rest of the network
@@ -271,6 +275,8 @@ func (r *Router) BuildAnnounce(caps Capabilities, seq uint32) (Packet, error) {
 		PublicKey:   r.Identity.Pub,
 		Signature:   sig,
 		Description: r.Description,
+		Name:        r.Name,
+		Platform:    r.Platform,
 	}
 	payload, err := ap.Encode()
 	if err != nil {
@@ -315,6 +321,36 @@ func (r *Router) DescriptionFor(id NodeID) string {
 	}
 	if tn, ok := r.Topology.GetNode(id); ok {
 		return tn.Description
+	}
+	return ""
+}
+
+// NameFor resolves a node's primary display label: the direct neighbor's NODE_INFO
+// name if known, else the name from its ANNOUNCE (topology), else the deterministic
+// default derived from its public key if we know it, else "".
+func (r *Router) NameFor(id NodeID) string {
+	if n, ok := r.Neighbors.Get(id); ok && n.Name != "" {
+		return n.Name
+	}
+	if tn, ok := r.Topology.GetNode(id); ok {
+		if tn.Name != "" {
+			return tn.Name
+		}
+		if name := DefaultNodeName(tn.PublicKey); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// PlatformFor resolves a node's OS/device string from its NODE_INFO (neighbor) or
+// ANNOUNCE (topology). Returns "" if unknown.
+func (r *Router) PlatformFor(id NodeID) string {
+	if n, ok := r.Neighbors.Get(id); ok && n.Platform != "" {
+		return n.Platform
+	}
+	if tn, ok := r.Topology.GetNode(id); ok {
+		return tn.Platform
 	}
 	return ""
 }

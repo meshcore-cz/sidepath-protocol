@@ -22,7 +22,9 @@ type Neighbor struct {
 	TxPHY       PHY
 	RxPHY       PHY
 	Caps        Capabilities
-	Description string // diagnostic label from the peer's NODE_INFO (direct links only)
+	Description string // free-form bio from the peer's NODE_INFO (direct links only)
+	Name        string // primary display label from the peer's NODE_INFO (direct links only)
+	Platform    string // OS/device string from the peer's NODE_INFO (direct links only)
 }
 
 func (n Neighbor) String() string {

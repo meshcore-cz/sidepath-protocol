@@ -20,7 +20,9 @@ type GattClient struct {
 
 	nodeID      core.NodeID // discovered from NODE_INFO (= pubKey[:8])
 	pubKey      []byte      // 32-byte Ed25519 public key from NODE_INFO
-	description string      // diagnostic label from NODE_INFO
+	description string      // free-form bio from NODE_INFO
+	name        string      // primary display label from NODE_INFO
+	platform    string      // OS/device string from NODE_INFO
 	caps        core.Capabilities
 	txPHY     core.PHY
 	rxPHY     core.PHY
@@ -187,20 +189,18 @@ func (c *GattClient) readNodeInfo(ctx context.Context) error {
 	if err := char.CallWithContext(ctx, gattCharIF+".ReadValue", 0, opts).Store(&data); err != nil {
 		return err
 	}
-	if len(data) < 34 {
+	ni, ok := core.DecodeNodeInfo(data)
+	if !ok {
 		return fmt.Errorf("node info too short: %d bytes", len(data))
 	}
-	c.pubKey = append([]byte(nil), data[1:33]...)
+	c.pubKey = ni.PubKey
 	c.nodeID = core.NodeIDFromPubKey(c.pubKey)
-	c.caps = core.Capabilities(data[33])
-	c.description = ""
-	if len(data) >= 35 {
-		descLen := int(data[34])
-		if 35+descLen <= len(data) {
-			c.description = string(data[35 : 35+descLen])
-		}
-	}
-	log.Printf("[gatt-client] node_info: peer=%s caps=0x%02x desc=%q", c.nodeID, c.caps, c.description)
+	c.caps = ni.Caps
+	c.description = ni.Description
+	c.name = ni.Name
+	c.platform = ni.Platform
+	log.Printf("[gatt-client] node_info: peer=%s caps=0x%02x name=%q platform=%q desc=%q",
+		c.nodeID, c.caps, c.name, c.platform, c.description)
 	return nil
 }
 

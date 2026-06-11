@@ -9,7 +9,9 @@ data class TopoNode(
     val caps: Capabilities,
     val neighbors: List<NodeID>,
     val seq: Int,
-    val description: String = "", // diagnostic label from the node's ANNOUNCE (key 8)
+    val description: String = "", // free-form bio from the node's ANNOUNCE (key 8)
+    val name: String = "",        // primary display label from the node's ANNOUNCE (key 9)
+    val platform: String = "",    // OS/device string from the node's ANNOUNCE (key 10)
     val publicKey: ByteArray = ByteArray(0), // 32-byte Ed25519 key from ANNOUNCE (key 6); used for chat encryption
     val lastSeenMs: Long = System.currentTimeMillis(),
 )
@@ -29,6 +31,40 @@ class Topology(private val expiryMs: Long = 90_000L) {
             val existing = nodes[key(node.id)]
             if (existing != null && existing.seq >= node.seq) return
             nodes[key(node.id)] = node.copy(lastSeenMs = System.currentTimeMillis())
+        }
+    }
+
+    /**
+     * Records a directly-connected peer's full public key learned from the NODE_INFO handshake,
+     * before its first signed ANNOUNCE arrives — so the UI can render a proper identicon and the
+     * deterministic name for it. Fills in the pubkey on an existing entry (if missing) or inserts a
+     * minimal stub with `seq = -1` that any later ANNOUNCE (seq >= 0) overrides.
+     */
+    fun learnPublicKey(
+        id: NodeID,
+        publicKey: ByteArray,
+        caps: Capabilities,
+        description: String = "",
+        name: String = "",
+        platform: String = "",
+    ) {
+        if (publicKey.size != 32) return
+        lock.write {
+            val existing = nodes[key(id)]
+            if (existing != null) {
+                // Fill in anything we didn't have yet (pubkey/name/platform), keep the rest.
+                nodes[key(id)] = existing.copy(
+                    publicKey = if (existing.publicKey.size == 32) existing.publicKey else publicKey,
+                    name = existing.name.ifEmpty { name },
+                    platform = existing.platform.ifEmpty { platform },
+                    lastSeenMs = System.currentTimeMillis(),
+                )
+            } else {
+                nodes[key(id)] = TopoNode(
+                    id, caps, emptyList(), seq = -1,
+                    description = description, name = name, platform = platform, publicKey = publicKey,
+                )
+            }
         }
     }
 

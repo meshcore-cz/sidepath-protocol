@@ -34,7 +34,9 @@ object DropReason {
  */
 class Router(val identity: Identity) {
     val localId: NodeID = identity.nodeId
-    var description: String = "" // diagnostic node label advertised in ANNOUNCE (unsigned)
+    var description: String = "" // free-form bio advertised in ANNOUNCE/NODE_INFO (unsigned)
+    var name: String = ""        // primary display label advertised in ANNOUNCE/NODE_INFO (unsigned)
+    var platform: String = ""    // OS/device string advertised in ANNOUNCE/NODE_INFO (unsigned)
     val neighbors = NeighborTable()
     val topology = Topology()
     val allowlist = mutableSetOf<String>() // hex NodeID strings; empty = allow all
@@ -89,6 +91,8 @@ class Router(val identity: Identity) {
                 neighbors = ap.neighbors,
                 seq = ap.seq,
                 description = ap.description,
+                name = ap.name,
+                platform = ap.platform,
                 publicKey = ap.publicKey,
             )
         )
@@ -228,6 +232,26 @@ class Router(val identity: Identity) {
         return topology.getNode(id)?.description ?: ""
     }
 
+    /**
+     * Resolves a node's primary display label: the direct neighbor's NODE_INFO name,
+     * else the name from its ANNOUNCE (topology), else the deterministic default
+     * derived from its public key if known, else "".
+     */
+    fun nameFor(id: NodeID): String {
+        neighbors.get(id)?.name?.takeIf { it.isNotEmpty() }?.let { return it }
+        topology.getNode(id)?.let { tn ->
+            if (tn.name.isNotEmpty()) return tn.name
+            defaultNodeName(tn.publicKey).takeIf { it.isNotEmpty() }?.let { return it }
+        }
+        return ""
+    }
+
+    /** Resolves a node's OS/device string from its NODE_INFO (neighbor) or ANNOUNCE (topology). */
+    fun platformFor(id: NodeID): String {
+        neighbors.get(id)?.platform?.takeIf { it.isNotEmpty() }?.let { return it }
+        return topology.getNode(id)?.platform ?: ""
+    }
+
     fun buildAnnounce(caps: Capabilities, seq: Int): Packet {
         val neighborIds = neighbors.ids()
         val ts = System.currentTimeMillis() / 1000
@@ -241,6 +265,8 @@ class Router(val identity: Identity) {
             publicKey = identity.publicKey,
             signature = sig,
             description = description,
+            name = name,
+            platform = platform,
         )
         return Packet(
             version = PROTOCOL_VERSION,

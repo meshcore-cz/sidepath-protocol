@@ -35,6 +35,8 @@ type Node struct {
 	nodeID      core.NodeID
 	identity    *core.Identity
 	description string
+	name        string
+	platform    string
 	caps        core.Capabilities
 	router      *core.Router
 	reassem     *core.Reassembler
@@ -61,7 +63,9 @@ type Node struct {
 // Config holds startup parameters.
 type Config struct {
 	Identity         *core.Identity
-	Description      string // node label for ANNOUNCE/NODE_INFO; empty = platform default
+	Name             string // primary display label; empty = deterministic default from pubkey
+	Platform         string // OS/device string; empty = core.PlatformDescription()
+	Description      string // free-form bio for ANNOUNCE/NODE_INFO; default empty
 	Caps             core.Capabilities
 	Allowlist        []core.NodeID
 	Verbose          bool
@@ -73,16 +77,25 @@ type Config struct {
 
 // New creates a Node. Call Run to start it.
 func New(cfg Config) *Node {
-	description := cfg.Description
-	if description == "" {
-		description = core.PlatformDescription()
+	name := cfg.Name
+	if name == "" {
+		name = core.DefaultNodeName(cfg.Identity.Pub)
 	}
+	platform := cfg.Platform
+	if platform == "" {
+		platform = core.PlatformDescription()
+	}
+	description := cfg.Description
 	router := core.NewRouterForIdentity(cfg.Identity)
 	router.Description = description
+	router.Name = name
+	router.Platform = platform
 	n := &Node{
 		nodeID:        cfg.Identity.NodeID(),
 		identity:      cfg.Identity,
 		description:   description,
+		name:          name,
+		platform:      platform,
 		caps:          cfg.Caps,
 		router:        router,
 		reassem:       core.NewReassembler(),
@@ -267,18 +280,15 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 
 	// Read NODE_INFO
 	var peerID core.NodeID
-	var peerDesc string
+	var peerDesc, peerName, peerPlatform string
 	if nodeInfoChar != nil {
 		data, err := cln.ReadCharacteristic(nodeInfoChar)
-		if err == nil && len(data) >= 34 {
-			peerID = core.NodeIDFromPubKey(data[1:33])
-			if len(data) >= 35 {
-				descLen := int(data[34])
-				if 35+descLen <= len(data) {
-					peerDesc = string(data[35 : 35+descLen])
-				}
+		if err == nil {
+			if ni, ok := core.DecodeNodeInfo(data); ok {
+				peerID = core.NodeIDFromPubKey(ni.PubKey)
+				peerDesc, peerName, peerPlatform = ni.Description, ni.Name, ni.Platform
+				n.logf("peer node_id=%s name=%q platform=%q desc=%q", peerID, peerName, peerPlatform, peerDesc)
 			}
-			n.logf("peer node_id=%s desc=%q", peerID, peerDesc)
 		}
 	}
 
@@ -345,6 +355,8 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 		TxPHY:       core.PHY1M,
 		RxPHY:       core.PHY1M,
 		Description: peerDesc,
+		Name:        peerName,
+		Platform:    peerPlatform,
 	})
 
 	// Subscribe to PACKET_OUT
@@ -748,19 +760,9 @@ func (n *Node) announceLoop(ctx context.Context) {
 	}
 }
 
-// buildNodeInfo encodes version(1)+pubkey(32)+caps(1)+descLen(1)+desc(descLen).
+// buildNodeInfo encodes the NODE_INFO characteristic (see core.EncodeNodeInfo).
 func (n *Node) buildNodeInfo() []byte {
-	desc := []byte(n.description)
-	if len(desc) > 255 {
-		desc = desc[:255]
-	}
-	data := make([]byte, 34+1+len(desc))
-	data[0] = core.ProtocolVersion
-	copy(data[1:33], n.identity.Pub)
-	data[33] = byte(n.caps)
-	data[34] = byte(len(desc))
-	copy(data[35:], desc)
-	return data
+	return core.EncodeNodeInfo(core.ProtocolVersion, n.identity.Pub, n.caps, n.description, n.name, n.platform)
 }
 
 // SendText sends a plaintext test message to dst (zero = broadcast).
@@ -971,14 +973,35 @@ func (n *Node) Identity() *core.Identity {
 	return n.identity
 }
 
-// Description returns this node's diagnostic label.
+// Description returns this node's free-form bio.
 func (n *Node) Description() string {
 	return n.description
 }
 
-// DescriptionFor resolves a peer's diagnostic label (neighbor or topology).
+// Name returns this node's primary display label.
+func (n *Node) Name() string {
+	return n.name
+}
+
+// Platform returns this node's OS/device string.
+func (n *Node) Platform() string {
+	return n.platform
+}
+
+// DescriptionFor resolves a peer's free-form bio (neighbor or topology).
 func (n *Node) DescriptionFor(id core.NodeID) string {
 	return n.router.DescriptionFor(id)
+}
+
+// NameFor resolves a peer's primary display label (neighbor, topology, or the
+// deterministic default from its public key).
+func (n *Node) NameFor(id core.NodeID) string {
+	return n.router.NameFor(id)
+}
+
+// PlatformFor resolves a peer's OS/device string (neighbor or topology).
+func (n *Node) PlatformFor(id core.NodeID) string {
+	return n.router.PlatformFor(id)
 }
 
 // LoadOrCreateIdentity loads the Ed25519 identity seed from ~/.bleedge/seed or

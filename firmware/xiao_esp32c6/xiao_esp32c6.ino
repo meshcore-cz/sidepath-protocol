@@ -40,7 +40,10 @@ static const char* PACKETOUT_UUID = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004";
 
 static const uint8_t  PROTOCOL_VERSION = mesh::PROTOCOL_VERSION;  // 2: Ed25519 + signed ANNOUNCE
 static const uint8_t  RELAY_CAPS = mesh::CAP_SENDER | mesh::CAP_RECEIVER | mesh::CAP_RELAY;
-static const char*    NODE_DESCRIPTION = "esp32-c6";  // diagnostic label in ANNOUNCE/NODE_INFO
+static const char*    NODE_PLATFORM = "esp32-c6";     // OS/device string in ANNOUNCE/NODE_INFO
+static const char*    NODE_DESCRIPTION = "";          // free-form bio (empty by default)
+// name="" => peers derive the deterministic DefaultNodeName from our pubkey.
+static const char*    NODE_NAME = "";
 // Build-time remote-control admins. Put 32-byte Ed25519 public keys here as
 // lowercase/uppercase hex. Runtime admins added with admin.add are stored in NVS.
 static const char* ADMIN_PUBKEYS[] = {
@@ -904,7 +907,8 @@ static void sendAnnounce() {
 
   std::vector<uint8_t> pkt;
   mesh::buildAnnounce(g_nodeId, RELAY_CAPS, seq, ts, pid,
-                      neighbors.data(), nNeighbors, g_pubKey, sig, NODE_DESCRIPTION, pkt);
+                      neighbors.data(), nNeighbors, g_pubKey, sig,
+                      NODE_DESCRIPTION, NODE_NAME, NODE_PLATFORM, pkt);
 
   // Heartbeat: blink the onboard LED once per advert (turned off in loop()).
   ledSet(true);
@@ -975,15 +979,20 @@ void setup() {
 
   NimBLEService* svc = server->createService(SERVICE_UUID);
 
-  // NODE_INFO (read): version(1) + pubkey(32) + caps(1) + descLen(1) + desc(descLen)
-  size_t descLen = strlen(NODE_DESCRIPTION);
-  if (descLen > 255) descLen = 255;
+  // NODE_INFO (read): version(1)+pubkey(32)+caps(1)+descLen|desc|nameLen|name|platLen|platform
   std::vector<uint8_t> nodeInfo;
   nodeInfo.push_back(PROTOCOL_VERSION);
   nodeInfo.insert(nodeInfo.end(), g_pubKey, g_pubKey + mesh::PUBKEY_LEN);
   nodeInfo.push_back(RELAY_CAPS);
-  nodeInfo.push_back((uint8_t)descLen);
-  nodeInfo.insert(nodeInfo.end(), NODE_DESCRIPTION, NODE_DESCRIPTION + descLen);
+  auto appendStr = [&](const char* s) {
+    size_t n = strlen(s);
+    if (n > 255) n = 255;
+    nodeInfo.push_back((uint8_t)n);
+    nodeInfo.insert(nodeInfo.end(), s, s + n);
+  };
+  appendStr(NODE_DESCRIPTION);
+  appendStr(NODE_NAME);
+  appendStr(NODE_PLATFORM);
   NimBLECharacteristic* ni = svc->createCharacteristic(NODEINFO_UUID, NIMBLE_PROPERTY::READ);
   ni->setValue(nodeInfo.data(), nodeInfo.size());
 

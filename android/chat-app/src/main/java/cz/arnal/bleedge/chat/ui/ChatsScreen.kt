@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.AdvertisedNode
 import cz.arnal.bleedge.chat.ChatViewModel
 import cz.arnal.bleedge.chat.ConversationSummary
+import cz.arnal.bleedge.chat.nameFromPubKey
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -55,10 +56,13 @@ fun ChatsScreen(
     onOpenConversation: (String) -> Unit,
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenTrace: ((String) -> Unit)? = null,
+    onOpenRxLog: (() -> Unit)? = null,
 ) {
     val conversations by vm.conversations.collectAsState()
     val myNode by vm.nodeId.collectAsState()
-    val myDescription by vm.description.collectAsState()
+    val myName by vm.myName.collectAsState()
+    val myPubKeyHex by vm.myPubKeyHex.collectAsState()
     var showPicker by remember { mutableStateOf(false) }
     var searching by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -76,7 +80,8 @@ fun ChatsScreen(
                     IconButton(onClick = onOpenSettings) {
                         Avatar(
                             seed = myNode.toHexString(),
-                            label = myDescription.ifBlank { "Me" },
+                            label = myName.ifBlank { "Me" },
+                            identiconKey = myPubKeyHex,
                             size = 32,
                         )
                     }
@@ -89,7 +94,7 @@ fun ChatsScreen(
                     }
                 },
                 actions = {
-                    ConnectionStatusButton(vm)
+                    ConnectionStatusButton(vm, onOpenTrace = onOpenTrace, onOpenRxLog = onOpenRxLog)
                     IconButton(onClick = {
                         searching = !searching
                         if (!searching) query = ""
@@ -246,7 +251,7 @@ private fun NewChatSheet(vm: ChatViewModel, onPick: (AdvertisedNode) -> Unit, on
                             .padding(horizontal = 16.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        val label = node.description.ifBlank { node.nodeHex }
+                        val label = nameFromPubKey(node.pubKeyHex).ifBlank { node.nodeHex.take(16) }
                         Avatar(seed = node.nodeHex, label = label, identiconKey = node.pubKeyHex)
                         Spacer(Modifier.width(12.dp))
                         Column {

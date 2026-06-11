@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -46,6 +45,7 @@ func main() {
 	seedHex := ""
 	allowPeers := ""
 	description := ""
+	nodeName := ""
 	botScript := ""
 	bunPath := "bun"
 	botChannels := "Public"
@@ -62,6 +62,10 @@ func main() {
 			description = strings.TrimPrefix(arg, "--description=")
 		case arg == "--description" && i+1 < len(os.Args[1:]):
 			description = os.Args[i+2]
+		case strings.HasPrefix(arg, "--name="):
+			nodeName = strings.TrimPrefix(arg, "--name=")
+		case arg == "--name" && i+1 < len(os.Args[1:]):
+			nodeName = os.Args[i+2]
 		case strings.HasPrefix(arg, "--allow-peer="):
 			allowPeers = strings.TrimPrefix(arg, "--allow-peer=")
 		case arg == "--allow-peer" && i+1 < len(os.Args[1:]):
@@ -177,6 +181,7 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	}
 	node = blenode.New(blenode.Config{
 		Identity:    identity,
+		Name:        nodeName,
 		Description: description,
 		Caps:        core.Capabilities(uint8(core.CapSender) | uint8(core.CapReceiver) | uint8(core.CapRelay)),
 		Allowlist:   allowlist,
@@ -217,11 +222,12 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	// the bot runs in the background and we fall through to the interactive TUI in front.
 	if botScript != "" {
 		channels := parseChannelList(botChannels)
-		var botStderr io.Writer = os.Stderr
-		if !headless {
-			botStderr = lineWriter{emit: emitLog} // keep Bun's stderr out of the TUI screen
+		// Interactive: bot diagnostics go to the TUI log. Headless: straight to stderr.
+		botLog := emitLog
+		if headless {
+			botLog = func(s string) { fmt.Fprintln(os.Stderr, s) }
 		}
-		b, err := startBot(ctx, node, bunPath, botScript, channels, botStderr)
+		b, err := startBot(ctx, node, bunPath, botScript, channels, botLog)
 		if err != nil {
 			fatalf("cannot start bot: %v", err)
 		}
@@ -363,12 +369,28 @@ func idShort(id core.NodeID) string {
 	return s
 }
 
-// descLabel renders a node description as "[desc]", or "[?]" when unknown.
+// descLabel renders a node's free-form bio as "(desc)", or "" when empty.
 func descLabel(desc string) string {
 	if desc == "" {
-		return "[?]"
+		return ""
 	}
-	return "[" + desc + "]"
+	return "(" + desc + ")"
+}
+
+// nameLabel renders a node's primary name, or "?" when unknown.
+func nameLabel(name string) string {
+	if name == "" {
+		return "?"
+	}
+	return name
+}
+
+// platLabel renders a node's platform as " [platform]", or "" when unknown.
+func platLabel(platform string) string {
+	if platform == "" {
+		return ""
+	}
+	return " [" + platform + "]"
 }
 
 // relativeTime formats a timestamp as a short "Ns ago" string.

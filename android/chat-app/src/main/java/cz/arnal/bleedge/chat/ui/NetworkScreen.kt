@@ -24,18 +24,24 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.ChatViewModel
 import cz.arnal.bleedge.chat.ConnState
+import cz.arnal.bleedge.chat.nameFromPubKey
 import cz.arnal.bleedge.chat.toHex
 import cz.arnal.bleedge.service.MeshStats
 import cz.arnal.bleedge.service.PeerInfo
@@ -56,6 +62,8 @@ fun NetworkScreen(
     val myNode by vm.nodeId.collectAsState()
     val status by vm.connectionStatus.collectAsState()
     val stats by vm.stats.collectAsState()
+    val running by vm.isRunning.collectAsState()
+    val lastPacketAt by vm.lastPacketAtMs.collectAsState()
     val myHex = myNode.toHexString()
 
     // Identicons are drawn from a node's 32-byte public key; learn it from the live topology.
@@ -70,7 +78,20 @@ fun NetworkScreen(
         topBar = {
             TopAppBar(
                 title = { Text("Network") },
-                actions = { OverflowMenu(onOpenSettings = onOpenSettings) },
+                actions = {
+                    // Start/stop the mesh radio right from the page header.
+                    Text(
+                        if (running) "On" else "Off",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Switch(
+                        checked = running,
+                        onCheckedChange = { on -> if (on) vm.startMesh() else vm.stopMesh() },
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                    )
+                    OverflowMenu(onOpenSettings = onOpenSettings)
+                },
             )
         },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
@@ -99,6 +120,15 @@ fun NetworkScreen(
                         Text("Rx Log")
                     }
                 }
+            }
+
+            item {
+                Text(
+                    lastPacketLabel(lastPacketAt),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                )
             }
 
             item { SectionHeader("Connected peers (${peers.size})") }
@@ -199,9 +229,31 @@ private fun EmptyLine(text: String) {
     )
 }
 
+/**
+ * "Last packet received Ns ago" — ticks every second so the relative time stays live. Returns
+ * a friendly string; shared by the Network page and the connection-status popup.
+ */
+@Composable
+fun lastPacketLabel(atMs: Long?): String {
+    if (atMs == null) return "No packets received yet"
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(atMs) {
+        while (true) { now = System.currentTimeMillis(); delay(1000) }
+    }
+    val secs = ((now - atMs) / 1000).coerceAtLeast(0)
+    val ago = when {
+        secs < 60 -> "${secs}s ago"
+        secs < 3600 -> "${secs / 60}m ${secs % 60}s ago"
+        else -> "${secs / 3600}h ago"
+    }
+    return "Last packet received $ago"
+}
+
 @Composable
 private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
-    val label = peer.description.ifBlank { peer.nodeId.toHexString() }
+    // Prefer the name the peer advertises on the wire; fall back to the derived default.
+    val label = peer.name.ifBlank { nameFromPubKey(pubKeyHex ?: "") }
+        .ifBlank { peer.nodeId.toHexString().take(16) }
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -210,8 +262,9 @@ private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(label, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            val platform = peer.platform.ifBlank { "unknown platform" }
             Text(
-                peer.nodeId.toHexString().take(16),
+                "${peer.nodeId.toHexString().take(16)} · $platform",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -227,7 +280,8 @@ private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
 
 @Composable
 private fun TopologyRow(node: TopologyEntry, pubKeyHex: String?, onClick: () -> Unit) {
-    val label = node.description.ifBlank { node.nodeId.toHexString() }
+    val label = node.name.ifBlank { nameFromPubKey(pubKeyHex ?: "") }
+        .ifBlank { node.nodeId.toHexString().take(16) }
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -237,8 +291,9 @@ private fun TopologyRow(node: TopologyEntry, pubKeyHex: String?, onClick: () -> 
         Column(Modifier.weight(1f)) {
             Text(label, fontWeight = FontWeight.Medium, maxLines = 1)
             val nb = node.neighborIds.size
+            val platform = node.platform.ifBlank { "unknown platform" }
             Text(
-                "${node.nodeId.toHexString().take(16)} · $nb neighbor${if (nb == 1) "" else "s"}",
+                "${node.nodeId.toHexString().take(16)} · $platform · $nb neighbor${if (nb == 1) "" else "s"}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

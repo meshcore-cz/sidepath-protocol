@@ -460,12 +460,16 @@ void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint8_t caps, uint32_t seq
                    int64_t unixSeconds, const uint8_t packetId[PACKET_ID_LEN],
                    const uint8_t* neighbors, size_t neighborCount,
                    const uint8_t pubKey[PUBKEY_LEN], const uint8_t signature[SIG_LEN],
-                   const char* description, std::vector<uint8_t>& out) {
-  // AnnouncePayload map(8): 1:nodeId 2:caps 3:neighbors 4:seq 5:timestamp
-  //                         6:pubkey 7:signature 8:description (text, unsigned)
+                   const char* description, const char* name, const char* platform,
+                   std::vector<uint8_t>& out) {
+  // AnnouncePayload map(10): 1:nodeId 2:caps 3:neighbors 4:seq 5:timestamp
+  //   6:pubkey 7:signature 8:description 9:name 10:platform (8/9/10 text, unsigned).
+  // name="" => receivers derive the deterministic DefaultNodeName from the pubkey.
   size_t descLen = description ? strlen(description) : 0;
+  size_t nameLen = name ? strlen(name) : 0;
+  size_t platLen = platform ? strlen(platform) : 0;
   std::vector<uint8_t> ap;
-  ap.push_back(0xa0 | 8);
+  ap.push_back(0xa0 | 10);
   ap.push_back(1); emitBstr(ap, selfId, NODE_ID_LEN);
   ap.push_back(2); emitUint(ap, caps);
   ap.push_back(3);                                 // neighbors array
@@ -481,6 +485,8 @@ void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint8_t caps, uint32_t seq
   ap.push_back(6); emitBstr(ap, pubKey, PUBKEY_LEN);
   ap.push_back(7); emitBstr(ap, signature, SIG_LEN);
   ap.push_back(8); emitTstr(ap, description ? description : "", descLen);
+  ap.push_back(9); emitTstr(ap, name ? name : "", nameLen);
+  ap.push_back(10); emitTstr(ap, platform ? platform : "", platLen);
 
   // Packet map(12): mirrors a fresh flood packet with empty route/trace.
   uint8_t zero[NODE_ID_LEN] = {0};

@@ -19,6 +19,8 @@ type Node struct {
 	nodeID      core.NodeID
 	identity    *core.Identity
 	description string
+	name        string
+	platform    string
 	phyMode     core.PHYMode
 	caps        core.Capabilities
 	router      *core.Router
@@ -45,7 +47,9 @@ type NodeConfig struct {
 	Identity    *core.Identity // nil = load/generate from ~/.bleedge/seed
 	PHYMode     core.PHYMode
 	Allowlist   []core.NodeID
-	Description string // node label advertised in ANNOUNCE/NODE_INFO; empty = platform default
+	Name        string // primary display label; empty = deterministic default from pubkey
+	Platform    string // OS/device string; empty = core.PlatformDescription()
+	Description string // free-form bio advertised in ANNOUNCE/NODE_INFO; default empty
 	Verbose     bool
 	JSONLog     bool
 }
@@ -67,13 +71,20 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("adapter: %w", err)
 	}
 
-	description := cfg.Description
-	if description == "" {
-		description = core.PlatformDescription()
+	name := cfg.Name
+	if name == "" {
+		name = core.DefaultNodeName(identity.Pub)
 	}
+	platform := cfg.Platform
+	if platform == "" {
+		platform = core.PlatformDescription()
+	}
+	description := cfg.Description
 
 	router := core.NewRouterForIdentity(identity)
 	router.Description = description
+	router.Name = name
+	router.Platform = platform
 	for _, id := range cfg.Allowlist {
 		router.Allowlist[id] = true
 	}
@@ -82,6 +93,8 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		nodeID:      nodeID,
 		identity:    identity,
 		description: description,
+		name:        name,
+		platform:    platform,
 		phyMode:     cfg.PHYMode,
 		caps:        core.Capabilities(core.LinuxCapabilities),
 		router:      router,
@@ -92,7 +105,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		jsonLog:     cfg.JSONLog,
 	}
 
-	n.gattServer = NewGattServer(adapter, identity.Pub, n.caps, description, n.handleIncomingFrame)
+	n.gattServer = NewGattServer(adapter, identity.Pub, n.caps, description, name, platform, n.handleIncomingFrame)
 	n.advertiser = NewAdvertiser(adapter, nodeID)
 	n.scanner = NewScanner(adapter)
 
@@ -637,6 +650,8 @@ func (n *Node) connectDevice(ctx context.Context, result ScanResult) {
 		RSSI:        link.RSSI(),
 		Caps:        client.caps,
 		Description: client.description,
+		Name:        client.name,
+		Platform:    client.platform,
 	})
 }
 

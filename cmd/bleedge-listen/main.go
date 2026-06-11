@@ -28,7 +28,8 @@ func main() {
 	var (
 		adapterFlag  = flag.String("adapter", "hci0", "Bluetooth adapter name (e.g. hci0)")
 		seedFlag     = flag.String("seed-hex", "", "Ed25519 identity seed (32 bytes / 64 hex chars); loaded from ~/.bleedge/seed if empty. NodeID = pubkey[:8]")
-		descFlag     = flag.String("description", "", "Node description shown to peers (default: OS/arch, e.g. linux/arm64)")
+		descFlag     = flag.String("description", "", "Free-form node bio shown to peers (default: empty)")
+		nameFlag     = flag.String("name", "", "Node display name (default: deterministic from public key, e.g. barrel-two-return)")
 		phyFlag      = flag.String("phy", "1m", "PHY mode: 1m (default) | coded-only | coded-preferred")
 		jsonFlag     = flag.Bool("json", false, "Output log lines as JSON")
 		verboseFlag  = flag.Bool("verbose", false, "Verbose logging")
@@ -79,6 +80,7 @@ func main() {
 		AdapterName: *adapterFlag,
 		Identity:    identity,
 		Description: *descFlag,
+		Name:        *nameFlag,
 		PHYMode:     phyMode,
 		Allowlist:   allowlist,
 		Verbose:     *verboseFlag,

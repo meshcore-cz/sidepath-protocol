@@ -12,7 +12,9 @@ data class NeighborEntry(
     val caps: Capabilities,
     val lastSeenMs: Long = System.currentTimeMillis(),
     val phyInvalid: Boolean = false, // true if coded-only mode and PHY is not Coded
-    val description: String = "",    // diagnostic label from the peer's NODE_INFO
+    val description: String = "",    // free-form bio from the peer's NODE_INFO
+    val name: String = "",           // primary display label from the peer's NODE_INFO
+    val platform: String = "",       // OS/device string from the peer's NODE_INFO
 )
 
 /**

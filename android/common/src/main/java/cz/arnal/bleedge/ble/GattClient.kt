@@ -35,8 +35,8 @@ class BLEEdgeGattClient(
     private val phyMode: PHYMode,
     private val onPhyUpdate: (txPhy: Int, rxPhy: Int) -> Unit,
     private val onFrameReceived: (ByteArray) -> Unit,
-    /** Return false to abort (deterministic connection rule). */
-    private val onNodeInfoRead: ((peerNodeId: NodeID, peerCaps: Capabilities) -> Boolean)? = null,
+    /** Return false to abort (deterministic connection rule). [peerPubKey] is the full 32-byte key. */
+    private val onNodeInfoRead: ((peerNodeId: NodeID, peerPubKey: ByteArray, peerCaps: Capabilities, peerName: String, peerPlatform: String) -> Boolean)? = null,
     private val onDisconnected: (() -> Unit)? = null,
     val onLog: ((addr: String, msg: String) -> Unit)? = null,
     initialRssi: Int = 0,
@@ -54,6 +54,8 @@ class BLEEdgeGattClient(
     var peerNodeId: NodeID? = null; private set
     var peerCaps: Capabilities = Capabilities(0); private set
     var peerDescription: String = ""; private set
+    var peerName: String = ""; private set
+    var peerPlatform: String = ""; private set
     var txPhy: PHY = PHY.UNKNOWN; private set
     var rxPhy: PHY = PHY.UNKNOWN; private set
     var rssi: Int = initialRssi; private set
@@ -237,19 +239,32 @@ class BLEEdgeGattClient(
         private fun handleNodeInfo(gatt: BluetoothGatt, data: ByteArray) {
             if (data.size < 34) return
             if (intentionalDisconnect) { gatt.disconnect(); return }
-            // version(1) + pubkey(32) + caps(1) + descLen(1) + desc(descLen); NodeID = pubkey[:8]
-            val nodeId = NodeID.fromPubKey(data.copyOfRange(1, 33))
+            // version(1)+pubkey(32)+caps(1)+descLen|desc|nameLen|name|platLen|platform; NodeID = pubkey[:8]
+            val pubKey = data.copyOfRange(1, 33)
+            val nodeId = NodeID.fromPubKey(pubKey)
             val caps = Capabilities(data[33].toInt() and 0xFF)
-            val description = if (data.size >= 35) {
-                val descLen = data[34].toInt() and 0xFF
-                if (35 + descLen <= data.size) String(data, 35, descLen, Charsets.UTF_8) else ""
-            } else ""
+            // Read the length-prefixed trailers (desc, name, platform) in order; any missing.
+            var off = 34
+            fun readStr(): String {
+                if (off >= data.size) return ""
+                val n = data[off].toInt() and 0xFF
+                off++
+                if (off + n > data.size) return ""
+                val s = String(data, off, n, Charsets.UTF_8)
+                off += n
+                return s
+            }
+            val description = readStr()
+            val name = readStr()
+            val platform = readStr()
             peerDescription = description
+            peerName = name
+            peerPlatform = platform
             peerNodeId = nodeId
             peerCaps = caps
-            Log.i(TAG, "NODE_INFO peer=${nodeId.toHexString()} caps=$caps")
-            onLog?.invoke(gatt.device.address, "peer=${nodeId.toHexString()} caps=$caps")
-            if (onNodeInfoRead != null && !onNodeInfoRead.invoke(nodeId, caps)) {
+            Log.i(TAG, "NODE_INFO peer=${nodeId.toHexString()} caps=$caps name=$name platform=$platform")
+            onLog?.invoke(gatt.device.address, "peer=${nodeId.toHexString()} caps=$caps name=$name")
+            if (onNodeInfoRead != null && !onNodeInfoRead.invoke(nodeId, pubKey, caps, name, platform)) {
                 Log.i(TAG, "Aborting connection to ${nodeId.toHexString()} per deterministic rule")
                 gatt.disconnect()
                 return

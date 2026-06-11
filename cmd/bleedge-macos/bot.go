@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -39,11 +38,12 @@ type bot struct {
 	node      *blenode.Node
 	mu        sync.Mutex
 	stdin     io.Writer
+	logf      func(string)           // where bot diagnostics go (TUI log when interactive, else stderr)
 	pubByNode map[core.NodeID][]byte // sender Ed25519 pubkeys learned from inbound DMs, for replies
 	channels  []*blenode.Channel     // channels this bot listens/broadcasts on; channels[0] is the default
 }
 
-func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, channelNames []string, stderr io.Writer) (*bot, error) {
+func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, channelNames []string, logf func(string)) (*bot, error) {
 	cmd := exec.CommandContext(ctx, bunPath, "run", script)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -53,14 +53,16 @@ func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, c
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stderr = stderr
+	// Bun's stderr (console.error from the script) goes line-by-line to the same sink as
+	// our own bot diagnostics, so nothing leaks to the terminal and corrupts the TUI.
+	cmd.Stderr = lineWriter{emit: logf}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start bun (%s): %w", bunPath, err)
 	}
 
 	// Join the configured channels (default: Public). Public is auto-joined by
 	// the node; "Public" is recognised specially, anything else is a named channel.
-	b := &bot{node: node, stdin: stdin, pubByNode: make(map[core.NodeID][]byte)}
+	b := &bot{node: node, stdin: stdin, logf: logf, pubByNode: make(map[core.NodeID][]byte)}
 	for _, name := range channelNames {
 		var ch *blenode.Channel
 		if name == "Public" {
@@ -74,7 +76,7 @@ func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, c
 	go b.readLoop(stdout)
 	go func() {
 		_ = cmd.Wait()
-		fmt.Fprintln(os.Stderr, "bot: bun process exited")
+		logf("bot: bun process exited")
 	}()
 
 	chNames := make([]string, len(b.channels))
@@ -85,7 +87,7 @@ func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, c
 		"type": "ready",
 		"self": map[string]any{
 			"node":     node.NodeID().String(),
-			"name":     node.Description(),
+			"name":     node.Name(),
 			"channels": chNames,
 		},
 	})
@@ -128,7 +130,7 @@ func (b *bot) onIncoming(from core.NodeID, ptype core.PayloadType, payload []byt
 	msg := map[string]any{
 		"type": "message",
 		"from": from.String(),
-		"name": b.node.DescriptionFor(from),
+		"name": b.node.NameFor(from),
 		"ts":   time.Now().UnixMilli(),
 	}
 	switch ptype {
@@ -180,14 +182,14 @@ func (b *bot) readLoop(r io.Reader) {
 		}
 		var c botCommand
 		if err := json.Unmarshal(line, &c); err != nil {
-			fmt.Fprintf(os.Stderr, "bot: bad command json: %v\n", err)
+			b.logf(fmt.Sprintf("bot: bad command json: %v", err))
 			continue
 		}
 		switch c.Type {
 		case "reply":
 			id, err := core.ParseNodeID(c.To)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "bot reply: bad 'to' %q: %v\n", c.To, err)
+				b.logf(fmt.Sprintf("bot reply: bad 'to' %q: %v", c.To, err))
 				continue
 			}
 			b.mu.Lock()
@@ -197,21 +199,21 @@ func (b *bot) readLoop(r io.Reader) {
 				pub = b.node.PublicKeyFor(id) // fall back to the topology (signed ANNOUNCE)
 			}
 			if len(pub) != 32 {
-				fmt.Fprintf(os.Stderr, "bot reply: no public key known for %s\n", c.To)
+				b.logf(fmt.Sprintf("bot reply: no public key known for %s", c.To))
 				continue
 			}
 			if err := b.node.SendChatTo(id, pub, c.Text); err != nil {
-				fmt.Fprintf(os.Stderr, "bot reply send: %v\n", err)
+				b.logf(fmt.Sprintf("bot reply send: %v", err))
 			}
 		case "broadcast":
 			// Broadcasts go to the named channel, or the bot's primary channel by default.
 			ch := b.channelByName(c.Channel)
 			if ch == nil {
-				fmt.Fprintln(os.Stderr, "bot broadcast: bot has no channels to broadcast on")
+				b.logf("bot broadcast: bot has no channels to broadcast on")
 				continue
 			}
 			if err := b.node.SendToChannel(ch.Secret, c.Text); err != nil {
-				fmt.Fprintf(os.Stderr, "bot broadcast: %v\n", err)
+				b.logf(fmt.Sprintf("bot broadcast: %v", err))
 			}
 		case "query":
 			if c.What == "stats" {
@@ -221,13 +223,13 @@ func (b *bot) readLoop(r io.Reader) {
 					"neighbors": len(b.node.Neighbors()),
 					"topology":  len(b.node.Topology()),
 					"node":      b.node.NodeID().String(),
-					"name":      b.node.Description(),
+					"name":      b.node.Name(),
 				})
 			}
 		case "log":
-			fmt.Fprintf(os.Stderr, "bot: %s\n", c.Text)
+			b.logf(fmt.Sprintf("bot: %s", c.Text))
 		default:
-			fmt.Fprintf(os.Stderr, "bot: unknown command %q\n", c.Type)
+			b.logf(fmt.Sprintf("bot: unknown command %q", c.Type))
 		}
 	}
 }

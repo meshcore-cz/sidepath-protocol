@@ -165,6 +165,8 @@ private fun TabsScaffold(
                     onOpenConversation = onOpenConversation,
                     onOpenProfile = onOpenProfile,
                     onOpenSettings = onOpenSettings,
+                    onOpenTrace = onOpenTrace,
+                    onOpenRxLog = onOpenRxLog,
                 )
                 1 -> ChannelsScreen(
                     vm,

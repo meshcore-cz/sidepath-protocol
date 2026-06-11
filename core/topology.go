@@ -11,7 +11,9 @@ type TopoNode struct {
 	Caps        Capabilities
 	Neighbors   []NodeID
 	Seq         uint32
-	Description string // diagnostic label from the node's ANNOUNCE (key 8)
+	Description string // free-form bio from the node's ANNOUNCE (key 8)
+	Name        string // primary display label from the node's ANNOUNCE (key 9)
+	Platform    string // OS/device string from the node's ANNOUNCE (key 10)
 	PublicKey   []byte // 32-byte Ed25519 key from ANNOUNCE (key 6); used for chat encryption
 	LastSeen    time.Time
 }

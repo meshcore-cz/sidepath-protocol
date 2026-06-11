@@ -1,5 +1,11 @@
 package cz.arnal.bleedge.chat.ui
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -22,17 +28,21 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Mood
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
@@ -59,6 +69,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
@@ -75,6 +86,7 @@ import cz.arnal.bleedge.chat.ChatViewModel
 import kotlinx.coroutines.delay
 import cz.arnal.bleedge.chat.MeshCoreUri
 import cz.arnal.bleedge.chat.ProfileInfo
+import cz.arnal.bleedge.chat.data.ChannelKind
 import cz.arnal.bleedge.chat.data.Message
 import cz.arnal.bleedge.chat.data.channelPskHexOf
 import cz.arnal.bleedge.chat.data.isChannelPeer
@@ -98,12 +110,16 @@ fun ConversationScreen(
     var showShare by remember { mutableStateOf(false) }
     var showEmoji by remember { mutableStateOf(false) }
     var confirmLeave by remember { mutableStateOf(false) }
+    var confirmDeleteChat by remember { mutableStateOf(false) }
 
     LaunchedEffect(peerHex, messages.size) { vm.markRead(peerHex) }
 
     // Whether the remote peer is currently typing (DMs only).
     val typingPeers by vm.typingPeers.collectAsState()
     val peerTyping = !isChannel && peerHex in typingPeers
+
+    // Repeats of our own flooded messages heard back, keyed by packet-id hex (= message id).
+    val floodRepeats by vm.floodRepeats.collectAsState()
 
     // Drive outgoing typing hints: each keystroke (re)arms this; after ~5s of no change we
     // consider the user stopped. An empty field stops immediately, as does leaving the screen.
@@ -175,7 +191,8 @@ fun ConversationScreen(
                                 val showKey = !isChannel && !peerTyping && profile.pubKeyHex.isNotBlank()
                                 val subtitle = when {
                                     peerTyping -> "typing…"
-                                    isChannel -> "Channel · shared-key encrypted"
+                                    isChannel && profile.channelKind == ChannelKind.SECRET -> "Channel · shared-key encrypted"
+                                    isChannel -> "Channel · anyone can read this"
                                     profile.pubKeyHex.isNotBlank() -> formatPubKey(profile.pubKeyHex)
                                     else -> "End-to-end encrypted"
                                 }
@@ -221,6 +238,12 @@ fun ConversationScreen(
                                 text = { Text("Leave channel") },
                                 leadingIcon = { Icon(Icons.Default.Logout, contentDescription = null) },
                                 onClick = { menuOpen = false; confirmLeave = true },
+                            )
+                        } else {
+                            DropdownMenuItem(
+                                text = { Text("Delete chat") },
+                                leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) },
+                                onClick = { menuOpen = false; confirmDeleteChat = true },
                             )
                         }
                     }
@@ -304,8 +327,13 @@ fun ConversationScreen(
                             DateSeparator(dateLabel(msg.timestampMs))
                         }
                     }
-                    MessageBubble(msg, isChannel, sender, onMentionClick) { detailsFor = msg }
+                    val repeatCount = floodRepeats[msg.id]?.size ?: 0
+                    MessageBubble(msg, isChannel, sender, repeatCount, onMentionClick) { detailsFor = msg }
                 }
+            }
+            // Animated "…" bubble where the peer's next message will appear, while they type.
+            if (peerTyping && !searching) {
+                item(key = "__typing__") { TypingBubble() }
             }
         }
     }
@@ -347,6 +375,57 @@ fun ConversationScreen(
             dismissButton = { TextButton(onClick = { confirmLeave = false }) { Text("Cancel") } },
         )
     }
+    if (confirmDeleteChat) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteChat = false },
+            title = { Text("Delete chat?") },
+            text = { Text("This permanently deletes this conversation's messages on this device. The contact stays.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDeleteChat = false
+                    vm.deleteChat(peerHex)
+                    onBack?.invoke()
+                }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteChat = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+/** An incoming-style bubble with three pulsing dots, shown while the peer is typing. */
+@Composable
+private fun TypingBubble() {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = RoundedCornerShape(16.dp),
+        ) {
+            Row(
+                Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val transition = rememberInfiniteTransition(label = "typing")
+                val dotColor = MaterialTheme.colorScheme.onSurfaceVariant
+                repeat(3) { i ->
+                    val alpha by transition.animateFloat(
+                        initialValue = 0.25f,
+                        targetValue = 1f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 600, delayMillis = i * 180),
+                            repeatMode = RepeatMode.Reverse,
+                        ),
+                        label = "dot$i",
+                    )
+                    Box(
+                        Modifier.size(8.dp)
+                            .clip(CircleShape)
+                            .background(dotColor.copy(alpha = alpha)),
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -354,6 +433,7 @@ private fun MessageBubble(
     msg: Message,
     isChannel: Boolean,
     senderLabel: String,
+    repeatCount: Int,
     onMentionClick: (String) -> Unit,
     onClick: () -> Unit,
 ) {
@@ -386,6 +466,20 @@ private fun MessageBubble(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     if (mine) DeliveryTick(msg.status) else RouteIndicator(msg.routeHex)
+                    // Repeats of this (flooded) message we heard echoed back across the mesh.
+                    if (mine && repeatCount > 0) {
+                        Icon(
+                            Icons.Default.Repeat,
+                            contentDescription = "repeats heard",
+                            modifier = Modifier.size(13.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "$repeatCount",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
@@ -501,11 +595,19 @@ private fun ConversationHeaderPanel(profile: ProfileInfo, isChannel: Boolean, on
                 textAlign = TextAlign.Center,
             )
             Spacer(Modifier.size(4.dp))
+            // Public and Named channels use well-known / name-derived keys — anyone can read them.
+            // Only Secret channels are protected by a private shared key.
+            val secret = profile.channelKind == ChannelKind.SECRET
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Icon(
+                    if (secret) Icons.Default.Lock else Icons.Default.LockOpen,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Spacer(Modifier.size(4.dp))
                 Text(
-                    "Shared-key encrypted",
+                    if (secret) "Shared-key encrypted" else "Anyone can read this",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

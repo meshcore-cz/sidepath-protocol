@@ -10,10 +10,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ListAlt
+import androidx.compose.material.icons.filled.Route
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -35,7 +42,12 @@ import cz.arnal.bleedge.service.RSSI_UNKNOWN
  * it opens a sheet with health, peers and topology stats. Reusable in any TopAppBar.
  */
 @Composable
-fun ConnectionStatusButton(vm: ChatViewModel, modifier: Modifier = Modifier) {
+fun ConnectionStatusButton(
+    vm: ChatViewModel,
+    modifier: Modifier = Modifier,
+    onOpenTrace: ((String) -> Unit)? = null,
+    onOpenRxLog: (() -> Unit)? = null,
+) {
     val status by vm.connectionStatus.collectAsState()
     val peers by vm.connectedPeers.collectAsState()
     var open by remember { mutableStateOf(false) }
@@ -56,15 +68,22 @@ fun ConnectionStatusButton(vm: ChatViewModel, modifier: Modifier = Modifier) {
         )
     }
 
-    if (open) ConnectionStatusSheet(vm) { open = false }
+    if (open) ConnectionStatusSheet(vm, onOpenTrace, onOpenRxLog) { open = false }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ConnectionStatusSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
+private fun ConnectionStatusSheet(
+    vm: ChatViewModel,
+    onOpenTrace: ((String) -> Unit)?,
+    onOpenRxLog: (() -> Unit)?,
+    onDismiss: () -> Unit,
+) {
     val status by vm.connectionStatus.collectAsState()
     val peers by vm.connectedPeers.collectAsState()
     val topology by vm.topology.collectAsState()
+    val running by vm.isRunning.collectAsState()
+    val lastPacketAt by vm.lastPacketAtMs.collectAsState()
     val myHex = vm.nodeId.collectAsState().value.toHexString()
 
     val others = remember(topology, myHex) { topology.filter { it.nodeId.toHexString() != myHex } }
@@ -79,12 +98,56 @@ private fun ConnectionStatusSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                 ConnectionDot(status, size = 14)
                 Spacer(Modifier.width(10.dp))
                 Text(healthLabel(status), style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.weight(1f))
+                Text(
+                    if (running) "Mesh on" else "Mesh off",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(6.dp))
+                Switch(
+                    checked = running,
+                    onCheckedChange = { on -> if (on) vm.startMesh() else vm.stopMesh() },
+                )
             }
+
+            Text(
+                lastPacketLabel(lastPacketAt),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatRow("Connected peers", "${peers.size}")
                 StatRow("Known nodes", "${others.size}")
                 StatRow("Topology links", "$links")
+            }
+
+            if (onOpenTrace != null || onOpenRxLog != null) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (onOpenTrace != null) {
+                        val traceTarget = peers.firstOrNull()?.nodeId?.toHexString()
+                        FilledTonalButton(
+                            onClick = { traceTarget?.let { onDismiss(); onOpenTrace(it) } },
+                            enabled = traceTarget != null,
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Icon(Icons.Default.Route, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Trace")
+                        }
+                    }
+                    if (onOpenRxLog != null) {
+                        OutlinedButton(
+                            onClick = { onDismiss(); onOpenRxLog() },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Rx Log")
+                        }
+                    }
+                }
             }
 
             HorizontalDivider()
@@ -94,7 +157,7 @@ private fun ConnectionStatusSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                 Text("None right now.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 peers.forEach { p ->
-                    val name = p.description.ifBlank { vm.nameForHex(p.nodeId.toHexString()) }
+                    val name = vm.nameForHex(p.nodeId.toHexString())
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(seed = p.nodeId.toHexString(), label = name, size = 32)
                         Spacer(Modifier.width(10.dp))

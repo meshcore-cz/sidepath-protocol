@@ -45,6 +45,35 @@ A node identity is an **Ed25519 keypair** (RFC 8032), MeshCore-compatible:
 
 > Reference: `core.Identity`, `core.NodeIDFromPubKey`, `core.LoadOrCreateIdentity`.
 
+### 1.1 Deterministic bootstrap name
+
+Every identity has a friendly **name** (the primary label shown in UIs), carried
+on the wire in [`NODE_INFO`](#21-gatt-service--characteristics) and
+[ANNOUNCE](#41-announce-payload). It is user-overridable, but when an identity is
+first created it gets a default derived purely from its public key, so a node
+always has a stable, human-readable label and peers can show the same default as
+a fallback until they receive the on-wire name (the ESP32 relay relies on this —
+it sends an empty name and every receiver derives this).
+
+`DefaultNodeName(pubkey)` is a deterministic, varied three-token string (e.g.
+`barrel-two-return`, `five-meadow-one`, `cedar-pine-eight`). The algorithm MUST
+match across platforms (`core.DefaultNodeName` / Kotlin `defaultNodeName` /
+C++ port):
+
+```
+d = MD5( ascii(lowercase hex of the 32-byte public key) )      # 16 bytes
+w0 = NAME_WORDS[d[0] % 64];  num = NUMBER_WORDS[d[1] % 10];  w2 = NAME_WORDS[d[2] % 64]
+switch d[3] % 3:
+  0 -> "{w0}-{num}-{w2}"
+  1 -> "{NUMBER_WORDS[d[4] % 10]}-{w0}-{NUMBER_WORDS[... ]}"   # number-word-number (num then num2=d[4])
+  2 -> "{w0}-{w2}-{num}"
+```
+
+`NUMBER_WORDS` = `zero`..`nine`. `NAME_WORDS` is the fixed 64-entry list in
+`core/nodename.go` / `NodeName.kt` (kept identical). Shared vector: public key
+`03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8`
+→ `marble-seven-kelp` (asserted by `NodeNameTest` and the Go core tests).
+
 ---
 
 ## 2. BLE layer
@@ -63,12 +92,23 @@ A node identity is an **Ed25519 keypair** (RFC 8032), MeshCore-compatible:
 - Both directions carry the same [frame format](#3-gatt-frame-format).
 
 **`NODE_INFO`** identifies the peer without parsing an ANNOUNCE. The reader
-derives `NodeID = pubkey[:8]`. It is `34 + 1 + descLen` bytes; `desc` is a UTF-8
-diagnostic label (≤255 bytes, defaults to the peer's platform/OS):
+derives `NodeID = pubkey[:8]`. After the fixed 34-byte header it carries three
+length-prefixed UTF-8 strings (each ≤255 bytes), appended in order so a reader
+that stops after `desc` still parses the header + description:
 
 ```
-version(1) | pubkey(32) | caps(1) | descLen(1) | desc(descLen)
+version(1) | pubkey(32) | caps(1) | descLen(1) | desc | nameLen(1) | name | platLen(1) | platform
 ```
+
+- `desc` — free-form bio (default empty).
+- `name` — primary display label. Default is the deterministic
+  [`DefaultNodeName`](#11-deterministic-bootstrap-name) derived from the public
+  key; user-overridable. An empty `name` means "derive the default from my
+  pubkey" (the ESP32 relay sends empty on purpose).
+- `platform` — OS/device string (e.g. `darwin/arm64`, `Android 14 (Pixel 7)`,
+  `esp32-c6`). Auto-set per platform, read-only.
+
+All three are informational only — **never** use them for routing or trust.
 
 ### 2.2 Advertising & discovery
 
@@ -203,13 +243,19 @@ When `type == 2`, `payload` (key 12) is itself a CBOR map:
 | 5 | `timestamp` | int64 (unix seconds) |
 | 6 | `public_key` | 32 bytes (Ed25519) |
 | 7 | `signature` | 64 bytes (Ed25519) |
-| 8 | `description` | text string (diagnostic; **not** signed) |
+| 8 | `description` | text string — free-form bio (**not** signed) |
+| 9 | `name` | text string — primary display label (**not** signed) |
+| 10 | `platform` | text string — OS/device string (**not** signed) |
 
-`description` is a free-form, human-readable label that defaults to the node's
-platform/OS (`linux/arm64`, `darwin/arm64`, `Android 14 (Pixel 7)`, `esp32-c6`).
-It is **not** covered by the signature and must never be used for routing or
-trust decisions — it is informational only. Encoded as a CBOR **text** string
-(major type 3), so it decodes to a native string on every platform.
+Keys 8/9/10 mirror the [`NODE_INFO`](#21-gatt-service--characteristics) tail and
+carry the same meaning. `name` defaults to the deterministic
+[`DefaultNodeName`](#11-deterministic-bootstrap-name) and is user-overridable;
+an empty `name` means peers derive that default from `public_key`. `platform`
+is the auto OS/device string. None are covered by the signature and must never
+be used for routing or trust — they are informational only. Each is a CBOR
+**text** string (major type 3), so it decodes to a native string on every
+platform. They are `omitempty` on encode (Go); decoders treat any missing
+key as `""`.
 
 **Signed message.** `signature` is an Ed25519 signature, by the node's identity
 key, over a **fixed explicit byte layout** (not the CBOR — CBOR is not byte-stable
@@ -463,9 +509,13 @@ A new or modified implementation must:
 - [ ] Derive an Ed25519 identity from a persisted 32-byte seed; `NodeID =
       pubkey[:8]`; advertise the 8-byte NodeID under company ID `0xBEED`.
 - [ ] Expose the GATT service + 3 characteristics with the exact UUIDs above;
-      serve `NODE_INFO` as `version|pubkey(32)|caps|descLen(1)|desc`.
-- [ ] Populate `description` (ANNOUNCE key 8, text; NODE_INFO tail) with the
-      platform/OS by default; never sign it or trust it for routing.
+      serve `NODE_INFO` as
+      `version|pubkey(32)|caps|descLen|desc|nameLen|name|platLen|platform`.
+- [ ] Carry `description`(8) / `name`(9) / `platform`(10) as text in ANNOUNCE and
+      the NODE_INFO tail; never sign them or trust them for routing. `name`
+      defaults to `DefaultNodeName(pubkey)` (§1.1) and is user-overridable; an
+      empty `name` means peers derive that default. `platform` is the auto OS
+      string; `description` is a free-form bio (default empty).
 - [ ] Encode/decode the 23-byte big-endian frame header; CRC-32/IEEE over the
       full packet; fragment at `MAX_FRAME_SIZE = 200` (177 data bytes/frame).
 - [ ] CBOR-encode packets with **integer** keys 1–14 exactly as in section 4;

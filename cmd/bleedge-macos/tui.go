@@ -638,7 +638,8 @@ func (m tuiModel) renderPeers() []string {
 	}
 	out := make([]string, 0, len(peers))
 	for _, p := range peers {
-		out = append(out, fmt.Sprintf("peer: %s  %s", p, descLabel(m.node.DescriptionFor(p))))
+		out = append(out, fmt.Sprintf("peer: %s  %s%s  %s",
+			p, nameLabel(m.node.NameFor(p)), platLabel(m.node.PlatformFor(p)), descLabel(m.node.DescriptionFor(p))))
 	}
 	return out
 }
@@ -650,8 +651,8 @@ func (m tuiModel) renderNeighbors() []string {
 	}
 	out := make([]string, 0, len(nbs))
 	for _, nb := range nbs {
-		out = append(out, fmt.Sprintf("neighbor: %s  %s  rssi=%d  tx=%s  rx=%s",
-			nb.ID, descLabel(m.node.DescriptionFor(nb.ID)), nb.RSSI, nb.TxPHY, nb.RxPHY))
+		out = append(out, fmt.Sprintf("neighbor: %s  %s%s  rssi=%d  tx=%s  rx=%s",
+			nb.ID, nameLabel(m.node.NameFor(nb.ID)), platLabel(m.node.PlatformFor(nb.ID)), nb.RSSI, nb.TxPHY, nb.RxPHY))
 	}
 	return out
 }
@@ -671,8 +672,8 @@ func (m tuiModel) renderTopology() []string {
 			}
 			nbs[i] = s
 		}
-		out = append(out, fmt.Sprintf("node: %s  %s  caps=%s  last-announce=%s  neighbors=[%s]",
-			tn.ID, descLabel(tn.Description), tn.Caps, relativeTime(tn.LastSeen), strings.Join(nbs, " ")))
+		out = append(out, fmt.Sprintf("node: %s  %s%s  caps=%s  last-announce=%s  neighbors=[%s]",
+			tn.ID, nameLabel(m.node.NameFor(tn.ID)), platLabel(tn.Platform), tn.Caps, relativeTime(tn.LastSeen), strings.Join(nbs, " ")))
 	}
 	return out
 }

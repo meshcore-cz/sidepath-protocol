@@ -31,6 +31,8 @@ class BLEEdgeGattServer(
     private val pubKey: ByteArray, // 32-byte Ed25519 public key (NodeID = pubKey[:8])
     private val caps: Capabilities,
     private val description: String,
+    private val name: String,
+    private val platform: String,
     private val onFrameReceived: (ByteArray, BluetoothDevice) -> Unit,
     private val onDeviceConnected: ((BluetoothDevice) -> Unit)? = null,
     private val onDeviceDisconnected: ((BluetoothDevice) -> Unit)? = null,
@@ -117,15 +119,20 @@ class BLEEdgeGattServer(
     }
 
     private fun nodeInfoValue(): ByteArray {
-        // version(1) + pubkey(32) + caps(1) + descLen(1) + desc(descLen)
-        val desc = description.toByteArray(Charsets.UTF_8).let { if (it.size > 255) it.copyOf(255) else it }
-        val b = ByteArray(34 + 1 + desc.size)
-        b[0] = PROTOCOL_VERSION
-        pubKey.copyInto(b, 1)
-        b[33] = caps.value.toByte()
-        b[34] = desc.size.toByte()
-        desc.copyInto(b, 35)
-        return b
+        // version(1) + pubkey(32) + caps(1) + descLen|desc | nameLen|name | platLen|platform
+        fun clip(s: String) = s.toByteArray(Charsets.UTF_8).let { if (it.size > 255) it.copyOf(255) else it }
+        val desc = clip(description)
+        val nm = clip(name)
+        val plat = clip(platform)
+        val out = ArrayList<Byte>(34 + 3 + desc.size + nm.size + plat.size)
+        out.add(PROTOCOL_VERSION)
+        pubKey.take(32).forEach { out.add(it) }
+        out.add(caps.value.toByte())
+        for (part in listOf(desc, nm, plat)) {
+            out.add(part.size.toByte())
+            part.forEach { out.add(it) }
+        }
+        return out.toByteArray()
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
