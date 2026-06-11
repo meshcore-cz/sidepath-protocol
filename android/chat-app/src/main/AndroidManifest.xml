@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- BLE/foreground-service permissions and the BLEEdgeService are declared in the
          :common library manifest and merged in. -->
+    <!-- Camera is used only to scan MeshCore QR codes (channel/contact URIs). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <application
         android:name="cz.arnal.bleedge.chat.ChatApp"
         android:label="BLEEdge Chat"

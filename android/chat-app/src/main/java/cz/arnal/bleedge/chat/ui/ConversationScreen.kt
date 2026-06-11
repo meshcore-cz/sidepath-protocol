@@ -115,6 +115,7 @@ fun ConversationScreen(
                         }
                     }
                 },
+                actions = { ConnectionStatusButton(vm) },
             )
         },
         bottomBar = {
@@ -133,9 +134,18 @@ fun ConversationScreen(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
         val listState = rememberLazyListState()
-        // Auto-scroll to the newest message when one arrives.
+        // Jump straight to the newest message the first time the conversation loads (no
+        // visible scroll-down), then *animate* to the bottom only for messages that arrive
+        // while it's open.
+        var positioned by remember(peerHex) { mutableStateOf(false) }
         LaunchedEffect(messages.size) {
-            if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+            if (messages.isEmpty()) return@LaunchedEffect
+            if (!positioned) {
+                listState.scrollToItem(messages.size - 1)
+                positioned = true
+            } else {
+                listState.animateScrollToItem(messages.size - 1)
+            }
         }
         // When the keyboard opens, keep the latest message in view — but only if we're
         // already at the bottom, so scrolling up to read history isn't interrupted.

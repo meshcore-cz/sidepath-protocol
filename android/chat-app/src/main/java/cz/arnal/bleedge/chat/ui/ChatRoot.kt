@@ -1,5 +1,9 @@
 package cz.arnal.bleedge.chat.ui
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -25,6 +29,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import cz.arnal.bleedge.chat.ChatViewModel
 
+/**
+ * Navigation destinations, ordered by [depth] (how deep in the push stack they are). The
+ * depth drives the slide direction: going to a deeper screen slides in from the right;
+ * going back (shallower) slides in from the left.
+ */
+private sealed class Dest(val depth: Int) {
+    data object Tabs : Dest(0)
+    data object Settings : Dest(1)
+    data class Conversation(val peer: String) : Dest(1)
+    data class Profile(val peer: String) : Dest(2)
+}
+
 @Composable
 fun ChatRoot(vm: ChatViewModel) {
     var openPeer by rememberSaveable { mutableStateOf<String?>(null) }
@@ -32,28 +48,62 @@ fun ChatRoot(vm: ChatViewModel) {
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var tab by rememberSaveable { mutableStateOf(0) }
 
-    // A profile page / direct conversation / settings are shown full-screen over the tabs.
-    if (openProfile != null) {
-        ProfileScreen(
-            vm, openProfile!!,
-            onBack = { openProfile = null },
-            onOpenConversation = { openProfile = null; openPeer = it },
-        )
-        return
-    }
-    if (openPeer != null) {
-        ConversationScreen(
-            vm, openPeer!!,
-            onBack = { openPeer = null },
-            onOpenProfile = { openProfile = it },
-        )
-        return
-    }
-    if (showSettings) {
-        SettingsScreen(vm, onBack = { showSettings = false })
-        return
+    // The top-most destination, recomputed from the navigation flags. Profile sits above a
+    // conversation, which sits above the tabs — so closing a profile opened from a chat
+    // returns to that chat.
+    val top: Dest = when {
+        openProfile != null -> Dest.Profile(openProfile!!)
+        openPeer != null -> Dest.Conversation(openPeer!!)
+        showSettings -> Dest.Settings
+        else -> Dest.Tabs
     }
 
+    AnimatedContent(
+        targetState = top,
+        modifier = Modifier.fillMaxSize(),
+        transitionSpec = {
+            // Push (deeper): new enters from the right, old exits left. Back: the reverse.
+            if (targetState.depth >= initialState.depth) {
+                slideInHorizontally { it } togetherWith slideOutHorizontally { -it }
+            } else {
+                slideInHorizontally { -it } togetherWith slideOutHorizontally { it }
+            }
+        },
+        label = "nav",
+    ) { dest ->
+        when (dest) {
+            is Dest.Profile -> ProfileScreen(
+                vm, dest.peer,
+                onBack = { openProfile = null },
+                onOpenConversation = { openProfile = null; openPeer = it },
+            )
+            is Dest.Conversation -> ConversationScreen(
+                vm, dest.peer,
+                onBack = { openPeer = null },
+                onOpenProfile = { openProfile = it },
+            )
+            Dest.Settings -> SettingsScreen(vm, onBack = { showSettings = false })
+            Dest.Tabs -> TabsScaffold(
+                vm,
+                tab = tab,
+                onSelectTab = { tab = it },
+                onOpenConversation = { openPeer = it },
+                onOpenProfile = { openProfile = it },
+                onOpenSettings = { showSettings = true },
+            )
+        }
+    }
+}
+
+@Composable
+private fun TabsScaffold(
+    vm: ChatViewModel,
+    tab: Int,
+    onSelectTab: (Int) -> Unit,
+    onOpenConversation: (String) -> Unit,
+    onOpenProfile: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+) {
     val conversations by vm.conversations.collectAsState()
     val unread = remember(conversations) { conversations.sumOf { it.unread } }
 
@@ -63,13 +113,12 @@ fun ChatRoot(vm: ChatViewModel) {
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
             // The tab bar is always shown. Full-screen views (conversation, profile, settings)
-            // render outside this scaffold via early return, so the only keyboard that ever
-            // coexists with the bar is the Chats search field — keeping the bar visible there
-            // is fine, and tying it to IME-inset detection broke on some Android 13 devices.
+            // render as separate destinations, so the only keyboard that ever coexists with
+            // the bar is the Chats search field — keeping the bar visible there is fine.
             NavigationBar {
                 NavigationBarItem(
                     selected = tab == 0,
-                    onClick = { tab = 0 },
+                    onClick = { onSelectTab(0) },
                     icon = {
                         BadgedBox(badge = { if (unread > 0) Badge { Text("$unread") } }) {
                             Icon(Icons.Default.Forum, contentDescription = "Chats")
@@ -79,13 +128,13 @@ fun ChatRoot(vm: ChatViewModel) {
                 )
                 NavigationBarItem(
                     selected = tab == 1,
-                    onClick = { tab = 1 },
+                    onClick = { onSelectTab(1) },
                     icon = { Icon(Icons.Default.Public, contentDescription = "Channels") },
                     label = { Text("Channels") },
                 )
                 NavigationBarItem(
                     selected = tab == 2,
-                    onClick = { tab = 2 },
+                    onClick = { onSelectTab(2) },
                     icon = { Icon(Icons.Default.Hub, contentDescription = "Network") },
                     label = { Text("Network") },
                 )
@@ -96,16 +145,16 @@ fun ChatRoot(vm: ChatViewModel) {
             when (tab) {
                 0 -> ChatsScreen(
                     vm,
-                    onOpenConversation = { openPeer = it },
-                    onOpenProfile = { openProfile = it },
-                    onOpenSettings = { showSettings = true },
+                    onOpenConversation = onOpenConversation,
+                    onOpenProfile = onOpenProfile,
+                    onOpenSettings = onOpenSettings,
                 )
                 1 -> ChannelsScreen(
                     vm,
-                    onOpenChannel = { openPeer = it },
-                    onOpenProfile = { openProfile = it },
+                    onOpenChannel = onOpenConversation,
+                    onOpenProfile = onOpenProfile,
                 )
-                else -> NetworkScreen(vm, onOpenProfile = { openProfile = it })
+                else -> NetworkScreen(vm, onOpenProfile = onOpenProfile)
             }
         }
     }

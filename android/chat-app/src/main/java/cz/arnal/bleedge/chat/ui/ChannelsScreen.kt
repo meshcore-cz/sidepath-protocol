@@ -1,5 +1,6 @@
 package cz.arnal.bleedge.chat.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -15,19 +16,26 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -37,12 +45,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import cz.arnal.bleedge.chat.ChannelSummary
 import cz.arnal.bleedge.chat.ChatViewModel
+import cz.arnal.bleedge.chat.MeshCoreUri
+import cz.arnal.bleedge.chat.data.ChannelKind
 import cz.arnal.bleedge.chat.data.channelPeerId
+import cz.arnal.bleedge.chat.isHex32
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -52,10 +66,53 @@ fun ChannelsScreen(
     onOpenProfile: (String) -> Unit,
 ) {
     val channels by vm.channelConversations.collectAsState()
+    val joined by vm.channels.collectAsState()
+    val publicJoined = remember(joined) { joined.any { it.kind == ChannelKind.PUBLIC } }
     var showJoin by remember { mutableStateOf(false) }
+    var searching by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+
+    val visible = remember(channels, query) {
+        if (query.isBlank()) channels
+        else channels.filter { it.name.contains(query.trim(), ignoreCase = true) }
+    }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Channels") }) },
+        topBar = {
+            TopAppBar(
+                title = {
+                    if (searching) {
+                        TextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            placeholder = { Text("Search channels") },
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else {
+                        Text("Channels")
+                    }
+                },
+                actions = {
+                    ConnectionStatusButton(vm)
+                    IconButton(onClick = {
+                        searching = !searching
+                        if (!searching) query = ""
+                    }) {
+                        Icon(
+                            if (searching) Icons.Default.Close else Icons.Default.Search,
+                            contentDescription = if (searching) "Close search" else "Search",
+                        )
+                    }
+                },
+            )
+        },
         floatingActionButton = {
             FloatingActionButton(onClick = { showJoin = true }) {
                 Icon(Icons.Default.Add, contentDescription = "Join channel")
@@ -63,7 +120,7 @@ fun ChannelsScreen(
         },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
-        if (channels.isEmpty()) {
+        if (visible.isEmpty()) {
             Column(
                 Modifier.fillMaxSize().padding(padding),
                 verticalArrangement = Arrangement.Center,
@@ -71,12 +128,12 @@ fun ChannelsScreen(
             ) {
                 Icon(Icons.Default.Public, null, Modifier.size(64.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.size(12.dp))
-                Text("No channels", style = MaterialTheme.typography.titleMedium)
-                Text("Tap + to join a channel.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (searching) "No matching channels" else "No channels", style = MaterialTheme.typography.titleMedium)
+                if (!searching) Text("Tap + to join a channel.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
             LazyColumn(Modifier.fillMaxSize().padding(padding)) {
-                items(channels, key = { it.pskHex }) { ch ->
+                items(visible, key = { it.pskHex }) { ch ->
                     ChannelRow(
                         ch,
                         onClick = { onOpenChannel(channelPeerId(ch.pskHex)) },
@@ -90,6 +147,7 @@ fun ChannelsScreen(
     if (showJoin) {
         JoinChannelSheet(
             vm = vm,
+            showPublic = !publicJoined,
             onJoined = { showJoin = false },
             onDismiss = { showJoin = false },
         )
@@ -140,33 +198,61 @@ private fun ChannelRow(ch: ChannelSummary, onClick: () -> Unit, onAvatarClick: (
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun JoinChannelSheet(vm: ChatViewModel, onJoined: () -> Unit, onDismiss: () -> Unit) {
+private fun JoinChannelSheet(
+    vm: ChatViewModel,
+    showPublic: Boolean,
+    onJoined: () -> Unit,
+    onDismiss: () -> Unit,
+) {
     var namedName by remember { mutableStateOf("") }
     var secretName by remember { mutableStateOf("") }
     var secretValue by remember { mutableStateOf("") }
+
+    // Scan a MeshCore QR; a channel URI pre-fills the secret-channel fields.
+    val scan = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val contents = result.contents ?: return@rememberLauncherForActivityResult
+        MeshCoreUri.parseChannel(contents)?.let { ch ->
+            secretName = ch.name
+            secretValue = ch.secretHex
+        }
+    }
+    fun launchScan() = scan.launch(
+        ScanOptions()
+            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            .setBeepEnabled(false)
+            .setOrientationLocked(false)
+            .setPrompt("Scan a MeshCore channel QR"),
+    )
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("Join channel", style = MaterialTheme.typography.titleMedium)
-
-            // Public
-            Text("Public", style = MaterialTheme.typography.labelLarge)
-            Text(
-                "MeshCore's default public channel (hash 0x11).",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Button(onClick = { vm.joinPublic(); onJoined() }, modifier = Modifier.fillMaxWidth()) {
-                Text("Join Public")
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Join channel", style = MaterialTheme.typography.titleMedium)
+                // Scan affordance, top-right of the title.
+                IconButton(onClick = { launchScan() }) {
+                    Icon(Icons.Default.QrCodeScanner, contentDescription = "Scan MeshCore QR")
+                }
             }
 
-            HorizontalDivider()
+            // Public — only offered when not already joined.
+            if (showPublic) {
+                Text("Public", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    "MeshCore's default public channel (hash 0x11).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Button(onClick = { vm.joinPublic(); onJoined() }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Join Public")
+                }
+                HorizontalDivider()
+            }
 
             // Named (public hash, derived from name)
-            Text("Named channel", style = MaterialTheme.typography.labelLarge)
+            Text("Named channel (hash channels)", style = MaterialTheme.typography.labelLarge)
             Text(
                 "Anyone who knows the name joins the same channel (key = SHA-256(name)).",
                 style = MaterialTheme.typography.bodySmall,
@@ -176,6 +262,7 @@ private fun JoinChannelSheet(vm: ChatViewModel, onJoined: () -> Unit, onDismiss:
                 value = namedName,
                 onValueChange = { namedName = it },
                 label = { Text("Channel name") },
+                prefix = { Text("#") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -187,10 +274,10 @@ private fun JoinChannelSheet(vm: ChatViewModel, onJoined: () -> Unit, onDismiss:
 
             HorizontalDivider()
 
-            // Secret
+            // Secret — a raw 16-byte PSK (32 hex chars), shared out-of-band or scanned.
             Text("Secret channel", style = MaterialTheme.typography.labelLarge)
             Text(
-                "Share a secret out-of-band. A 32-hex-char value is used as the raw key; otherwise it's hashed.",
+                "Share the 32-hex-character key out-of-band, or scan a MeshCore QR.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -201,16 +288,27 @@ private fun JoinChannelSheet(vm: ChatViewModel, onJoined: () -> Unit, onDismiss:
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            val secretValid = isHex32(secretValue)
             OutlinedTextField(
                 value = secretValue,
-                onValueChange = { secretValue = it },
-                label = { Text("Secret") },
+                onValueChange = { secretValue = it.trim() },
+                label = { Text("Secret (32 hex chars)") },
                 singleLine = true,
+                isError = secretValue.isNotEmpty() && !secretValid,
+                leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
+                trailingIcon = {
+                    IconButton(onClick = { launchScan() }) {
+                        Icon(Icons.Default.QrCodeScanner, contentDescription = "Scan QR")
+                    }
+                },
+                supportingText = {
+                    if (secretValue.isNotEmpty() && !secretValid) Text("Must be exactly 32 hexadecimal characters.")
+                },
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedButton(
                 onClick = { vm.joinSecretChannel(secretName, secretValue); onJoined() },
-                enabled = secretValue.isNotBlank(),
+                enabled = secretValid,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Join secret channel") }
         }

@@ -62,8 +62,6 @@ fun ChatsScreen(
     val conversations by vm.conversations.collectAsState()
     val myNode by vm.nodeId.collectAsState()
     val myDescription by vm.description.collectAsState()
-    val status by vm.connectionStatus.collectAsState()
-    val peers by vm.connectedPeers.collectAsState()
     var showPicker by remember { mutableStateOf(false) }
     var searching by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -102,20 +100,11 @@ fun ChatsScreen(
                             modifier = Modifier.fillMaxWidth(),
                         )
                     } else {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("BLEEdge")
-                            Spacer(Modifier.width(10.dp))
-                            ConnectionDot(status)
-                            Spacer(Modifier.width(4.dp))
-                            Text(
-                                "${peers.size}",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                        Text("BLEEdge")
                     }
                 },
                 actions = {
+                    ConnectionStatusButton(vm)
                     IconButton(onClick = {
                         searching = !searching
                         if (!searching) query = ""

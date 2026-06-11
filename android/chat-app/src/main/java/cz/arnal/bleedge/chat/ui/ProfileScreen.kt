@@ -41,6 +41,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.ChatViewModel
+import cz.arnal.bleedge.chat.MeshCoreUri
 import cz.arnal.bleedge.chat.ProfileInfo
 import cz.arnal.bleedge.chat.data.ChannelKind
 
@@ -144,6 +145,25 @@ fun ProfileScreen(
                     Spacer(Modifier.size(8.dp))
                     Text("Delete from contacts")
                 }
+            }
+
+            // Share QR — a MeshCore URI other apps can scan to add this contact/channel.
+            val shareUri = when {
+                profile.isChannel && profile.pskHex.isNotBlank() ->
+                    MeshCoreUri.channel(profile.name, profile.pskHex)
+                !profile.isChannel && profile.pubKeyHex.isNotBlank() ->
+                    MeshCoreUri.contact(profile.name, profile.pubKeyHex)
+                else -> null
+            }
+            if (shareUri != null) {
+                Spacer(Modifier.size(28.dp))
+                Text(
+                    if (profile.isChannel) "Scan to join this channel" else "Scan to add this contact",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.size(12.dp))
+                QrImage(shareUri, modifier = Modifier.size(240.dp))
             }
         }
     }
