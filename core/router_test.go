@@ -729,6 +729,52 @@ func TestACKReverseRoute(t *testing.T) {
 	}
 }
 
+// TestACKReachesSource models the real flood path where the originator does NOT put
+// itself in the trace: alice → bob → carol arrives at carol with trace [bob]. The ACK
+// source route must end at alice so it is actually delivered there, not at bob.
+func TestACKReachesSource(t *testing.T) {
+	alice := nodeID(1)
+	bob := nodeID(2)
+	carol := nodeID(3)
+	r := NewRouter(carol)
+
+	pkt := Packet{
+		Version:     ProtocolVersion,
+		Type:        PacketTypeData,
+		ID:          NewPacketID(),
+		Source:      alice,
+		Destination: carol,
+		Mode:        RoutingModeFlood,
+		TTL:         3,
+		Trace:       []NodeID{bob}, // source alice not in trace; carol appends itself
+		PayloadType: PayloadTypeTextTest,
+		Payload:     []byte("ack me"),
+	}
+
+	var ack *Packet
+	for _, a := range r.HandlePacket(pkt, &bob) {
+		if a.Type == ActionSendAck {
+			p := a.Packet
+			ack = &p
+		}
+	}
+	if ack == nil {
+		t.Fatal("expected ActionSendAck")
+	}
+	want := []NodeID{bob, alice} // carol → bob → alice
+	if len(ack.Route) != len(want) {
+		t.Fatalf("ACK route = %v, want %v", ack.Route, want)
+	}
+	for i := range want {
+		if ack.Route[i] != want[i] {
+			t.Fatalf("ACK route[%d] = %v, want %v (full %v)", i, ack.Route[i], want[i], ack.Route)
+		}
+	}
+	if ack.Route[len(ack.Route)-1] != alice {
+		t.Errorf("ACK route must terminate at source alice, got %v", ack.Route[len(ack.Route)-1])
+	}
+}
+
 // ---- BFS topology -----------------------------------------------------------
 
 func TestBFSShortestPath(t *testing.T) {

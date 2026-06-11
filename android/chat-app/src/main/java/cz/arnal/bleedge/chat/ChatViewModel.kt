@@ -24,6 +24,7 @@ import cz.arnal.bleedge.core.PHYMode
 import cz.arnal.bleedge.core.PayloadType
 import cz.arnal.bleedge.core.SEED_SIZE
 import cz.arnal.bleedge.service.BLEEdgeService
+import cz.arnal.bleedge.service.PeerInfo
 import cz.arnal.bleedge.service.ReceivedMessage
 import cz.arnal.bleedge.service.TopologyEntry
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -52,6 +53,9 @@ data class ConversationSummary(
     val lastTimestampMs: Long,
     val unread: Int,
 )
+
+/** Connection health shown as a colored status dot. */
+enum class ConnState { CONNECTED, NO_PEERS, OFFLINE, ERROR }
 
 /** A node we've heard advertise, offered in the "New chat" picker. */
 data class AdvertisedNode(
@@ -87,9 +91,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         it?.phyMode ?: flowOf(PHYMode.DEBUG_1M)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, PHYMode.DEBUG_1M)
 
-    private val topology: StateFlow<List<TopologyEntry>> = _service.flatMapLatest {
+    val topology: StateFlow<List<TopologyEntry>> = _service.flatMapLatest {
         it?.knownTopology ?: flowOf(emptyList())
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val connectedPeers: StateFlow<List<PeerInfo>> = _service.flatMapLatest {
+        it?.connectedPeers ?: flowOf(emptyList())
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val isRunning: StateFlow<Boolean> = _service.flatMapLatest {
+        it?.isRunning ?: flowOf(false)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /** Overall connection health, surfaced as the status dot in the Chats header. */
+    val connectionStatus: StateFlow<ConnState> =
+        combine(permissionsGranted, isRunning, connectedPeers) { granted, running, peers ->
+            when {
+                !granted -> ConnState.ERROR
+                !running -> ConnState.OFFLINE
+                peers.isEmpty() -> ConnState.NO_PEERS
+                else -> ConnState.CONNECTED
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, ConnState.OFFLINE)
 
     val contacts: StateFlow<List<Contact>> =
         dao.contacts().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())

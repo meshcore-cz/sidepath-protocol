@@ -11,9 +11,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Route
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -30,6 +32,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import cz.arnal.bleedge.chat.ChatViewModel
+import cz.arnal.bleedge.chat.ConnState
 import cz.arnal.bleedge.chat.data.Message
 import cz.arnal.bleedge.chat.data.MsgStatus
 import java.text.SimpleDateFormat
@@ -51,6 +54,45 @@ fun Avatar(seed: String, label: String, size: Int = 44) {
     ) {
         Text(initials, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = (size / 2.6).sp)
     }
+}
+
+/**
+ * Number of intermediate relays a packet passed through. The stored route is the packet
+ * trace, whose last hop is always this node, so relays = hops − 1 (0 = direct).
+ */
+fun relayCount(routeHex: String): Int =
+    (routeHex.split(",").count { it.isNotBlank() } - 1).coerceAtLeast(0)
+
+/** Compact "direct / N relays" chip shown on a message bubble. */
+@Composable
+fun RouteIndicator(routeHex: String) {
+    if (routeHex.isBlank()) return
+    val relays = relayCount(routeHex)
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        Icon(
+            if (relays == 0) Icons.Default.Bolt else Icons.Default.Route,
+            contentDescription = if (relays == 0) "Direct" else "$relays relays",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(14.dp),
+        )
+        Text(
+            if (relays == 0) "direct" else "$relays",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** Colored connection-health dot shown next to the app name. */
+@Composable
+fun ConnectionDot(state: ConnState, size: Int = 10) {
+    val color = when (state) {
+        ConnState.CONNECTED -> Color(0xFF2E7D32) // green
+        ConnState.NO_PEERS -> Color(0xFFEF6C00)  // orange
+        ConnState.OFFLINE -> Color(0xFF9E9E9E)   // grey
+        ConnState.ERROR -> Color(0xFFC62828)     // red
+    }
+    Box(Modifier.size(size.dp).clip(CircleShape).background(color))
 }
 
 @Composable
@@ -91,20 +133,22 @@ fun MessageDetailsSheet(msg: Message, vm: ChatViewModel, onDismiss: () -> Unit) 
                     else -> "Failed to send"
                 })
             }
-            val hops = msg.routeHex.split(",").filter { it.isNotBlank() }
-            Text(
-                if (msg.incoming) "Route to me (${hops.size} hop${if (hops.size == 1) "" else "s"})"
-                else "ACK return route (${hops.size} hop${if (hops.size == 1) "" else "s"})",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (hops.isEmpty()) {
+            val relays = relayCount(msg.routeHex)
+            // Real intermediate relays only — drop the final hop (always this node); the
+            // sender/recipient endpoints aren't shown.
+            val relayHops = msg.routeHex.split(",").filter { it.isNotBlank() }.dropLast(1)
+            DetailRow("Delivery", when {
+                msg.routeHex.isBlank() -> if (msg.incoming) "—" else "Awaiting confirmation"
+                relays == 0 -> "Direct (no relays)"
+                else -> "$relays relay${if (relays == 1) "" else "s"}"
+            })
+            if (relayHops.isNotEmpty()) {
                 Text(
-                    if (msg.incoming) "Direct (no relays)" else "No delivery confirmation yet",
-                    fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                    "Relays",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            } else {
-                hops.forEachIndexed { i, hop ->
+                relayHops.forEachIndexed { i, hop ->
                     Text(
                         "${i + 1}. ${vm.nameForHex(hop)}  ·  ${hop.take(8)}",
                         fontFamily = FontFamily.Monospace, fontSize = 13.sp,

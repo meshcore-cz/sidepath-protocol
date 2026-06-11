@@ -168,9 +168,15 @@ class Router(val identity: Identity) {
         val ackTtl = (data.trace.size + 1).toByte()
         val ack: Packet
         if (data.trace.size > 1) {
-            // Reverse the trace excluding self (last element)
+            // Reverse the trace excluding self (last element), then append the original
+            // source as the final hop so the ACK is actually delivered there (source-route
+            // delivery happens by route exhaustion). The source isn't in the trace (the
+            // originator doesn't add itself), so without this the ACK would stop at the last
+            // relay. Guard against the source already being terminal.
             val hops = data.trace.dropLast(1)
-            val route = hops.reversed()
+            val reversed = hops.reversed()
+            val route = if (reversed.lastOrNull()?.toHexString() == data.source.toHexString()) reversed
+                        else reversed + data.source
             ack = Packet(
                 version = PROTOCOL_VERSION,
                 type = PacketType.ACK,

@@ -316,7 +316,10 @@ ACKs are generated automatically for **unicast DATA** that is delivered locally:
 
 - `destination = original.source`, `ttl = len(trace)+1`.
 - If the inbound `trace` had >1 hop, the ACK is sent **SOURCE_ROUTE** along the
-  reversed trace (excluding self); otherwise it is **FLOOD**.
+  reversed trace (excluding self) **with the original `source` appended as the final
+  hop** — source-route delivery happens by route exhaustion and the originator is not
+  in the trace, so without the appended source the ACK would stop at the last relay.
+  If the `trace` had ≤1 hop, the ACK is **FLOOD**.
 - The originator records the ACK's own `id` in its dedup cache so a flood echo of
   its own ACK is dropped rather than re-flooded. The same applies to *any* packet
   a node originates (`MarkOriginated`).

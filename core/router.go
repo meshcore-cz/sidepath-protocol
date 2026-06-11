@@ -217,6 +217,13 @@ func (r *Router) buildAck(data Packet) Action {
 		for i, hop := range hops {
 			route[len(hops)-1-i] = hop
 		}
+		// Append the original source as the final hop. Source-route delivery happens by
+		// route exhaustion, and the originator isn't in the trace, so without this the ACK
+		// would be "delivered" at the last relay instead of reaching the source. Guard
+		// against the source already being terminal.
+		if len(route) == 0 || route[len(route)-1] != data.Source {
+			route = append(route, data.Source)
+		}
 		ack.Mode = RoutingModeSourceRoute
 		ack.Route = route
 		ack.RouteCursor = 0

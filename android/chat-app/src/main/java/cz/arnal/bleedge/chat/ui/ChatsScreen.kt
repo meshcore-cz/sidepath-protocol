@@ -11,18 +11,28 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Create
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -32,6 +42,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -41,23 +52,106 @@ import cz.arnal.bleedge.chat.ConversationSummary
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatsScreen(vm: ChatViewModel, onOpenConversation: (String) -> Unit) {
+fun ChatsScreen(
+    vm: ChatViewModel,
+    onOpenConversation: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+) {
     val conversations by vm.conversations.collectAsState()
+    val myNode by vm.nodeId.collectAsState()
+    val myDescription by vm.description.collectAsState()
+    val status by vm.connectionStatus.collectAsState()
+    val peers by vm.connectedPeers.collectAsState()
     var showPicker by remember { mutableStateOf(false) }
+    var searching by remember { mutableStateOf(false) }
+    var menuOpen by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+
+    val visible = remember(conversations, query) {
+        if (query.isBlank()) conversations
+        else conversations.filter { it.title.contains(query.trim(), ignoreCase = true) }
+    }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("BLEEdge") }) },
+        topBar = {
+            TopAppBar(
+                navigationIcon = {
+                    IconButton(onClick = onOpenSettings) {
+                        Avatar(
+                            seed = myNode.toHexString(),
+                            label = myDescription.ifBlank { "Me" },
+                            size = 32,
+                        )
+                    }
+                },
+                title = {
+                    if (searching) {
+                        TextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            placeholder = { Text("Search chats") },
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("BLEEdge")
+                            Spacer(Modifier.width(10.dp))
+                            ConnectionDot(status)
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "${peers.size}",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                },
+                actions = {
+                    IconButton(onClick = {
+                        searching = !searching
+                        if (!searching) query = ""
+                    }) {
+                        Icon(
+                            if (searching) Icons.Default.Close else Icons.Default.Search,
+                            contentDescription = if (searching) "Close search" else "Search",
+                        )
+                    }
+                    IconButton(onClick = { menuOpen = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "More")
+                    }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Settings") },
+                            leadingIcon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                            onClick = {
+                                menuOpen = false
+                                onOpenSettings()
+                            },
+                        )
+                    }
+                },
+            )
+        },
         floatingActionButton = {
             FloatingActionButton(onClick = { showPicker = true }) {
                 Icon(Icons.Default.Create, contentDescription = "New chat")
             }
         },
+        // Root scaffold reserves the bottom-nav space; TopAppBar handles the status bar.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
-        if (conversations.isEmpty()) {
-            EmptyState(Modifier.fillMaxSize().padding(padding))
+        if (visible.isEmpty()) {
+            EmptyState(Modifier.fillMaxSize().padding(padding), searching = searching)
         } else {
             LazyColumn(Modifier.fillMaxSize().padding(padding)) {
-                items(conversations, key = { it.peerHex }) { conv ->
+                items(visible, key = { it.peerHex }) { conv ->
                     ConversationRow(conv) { onOpenConversation(conv.peerHex) }
                 }
             }
@@ -110,7 +204,7 @@ private fun ConversationRow(conv: ConversationSummary, onClick: () -> Unit) {
 }
 
 @Composable
-private fun EmptyState(modifier: Modifier) {
+private fun EmptyState(modifier: Modifier, searching: Boolean) {
     Column(
         modifier,
         verticalArrangement = Arrangement.Center,
@@ -123,12 +217,16 @@ private fun EmptyState(modifier: Modifier) {
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.size(12.dp))
-        Text("No chats yet", style = MaterialTheme.typography.titleMedium)
-        Text(
-            "Tap the pencil to start a chat with a nearby node.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        if (searching) {
+            Text("No matching chats", style = MaterialTheme.typography.titleMedium)
+        } else {
+            Text("No chats yet", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Tap the pencil to start a chat with a nearby node.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
     }
 }
 

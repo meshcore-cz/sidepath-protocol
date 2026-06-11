@@ -7,6 +7,10 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -46,7 +50,7 @@ import cz.arnal.bleedge.chat.shortHex
 import cz.arnal.bleedge.chat.data.CHANNEL_PEER
 import cz.arnal.bleedge.chat.data.Message
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 fun ConversationScreen(vm: ChatViewModel, peerHex: String, onBack: (() -> Unit)?) {
     val isChannel = peerHex == CHANNEL_PEER
@@ -80,15 +84,26 @@ fun ConversationScreen(vm: ChatViewModel, peerHex: String, onBack: (() -> Unit)?
             )
         },
         bottomBar = {
-            MessageInput(draft, onChange = { draft = it }) {
+            MessageInput(draft, onChange = { draft = it }, fullScreen = onBack != null) {
                 vm.sendChat(peerHex, draft)
                 draft = ""
             }
         },
+        // TopAppBar + composer handle their own system-bar/ime insets.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
         val listState = rememberLazyListState()
+        // Auto-scroll to the newest message when one arrives.
         LaunchedEffect(messages.size) {
             if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+        }
+        // When the keyboard opens, keep the latest message in view — but only if we're
+        // already at the bottom, so scrolling up to read history isn't interrupted.
+        val imeVisible = WindowInsets.isImeVisible
+        LaunchedEffect(imeVisible) {
+            if (imeVisible && messages.isNotEmpty() && !listState.canScrollForward) {
+                listState.animateScrollToItem(messages.size - 1)
+            }
         }
         LazyColumn(
             state = listState,
@@ -136,7 +151,7 @@ private fun MessageBubble(msg: Message, isChannel: Boolean, senderLabel: String,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (mine) DeliveryTick(msg.status)
+                    if (mine) DeliveryTick(msg.status) else RouteIndicator(msg.routeHex)
                 }
             }
         }
@@ -145,10 +160,20 @@ private fun MessageBubble(msg: Message, isChannel: Boolean, senderLabel: String,
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MessageInput(draft: String, onChange: (String) -> Unit, onSend: () -> Unit) {
+private fun MessageInput(
+    draft: String,
+    onChange: (String) -> Unit,
+    fullScreen: Boolean,
+    onSend: () -> Unit,
+) {
+    // Surface (background) stays full-bleed to the screen edge; the Row content is lifted
+    // above the gesture/navigation bar and above the keyboard when it opens.
     Surface(tonalElevation = 2.dp) {
         Row(
-            Modifier.fillMaxWidth().padding(8.dp),
+            Modifier.fillMaxWidth()
+                .then(if (fullScreen) Modifier.navigationBarsPadding() else Modifier)
+                .imePadding()
+                .padding(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             OutlinedTextField(
