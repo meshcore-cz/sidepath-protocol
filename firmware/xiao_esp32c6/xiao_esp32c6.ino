@@ -44,7 +44,9 @@ static const char*    NODE_DESCRIPTION = "esp32-c6";  // diagnostic label in ANN
 // Build-time remote-control admins. Put 32-byte Ed25519 public keys here as
 // lowercase/uppercase hex. Runtime admins added with admin.add are stored in NVS.
 static const char* ADMIN_PUBKEYS[] = {
-  // "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+#ifdef BLEEDGE_ADMIN_PUBKEY
+  BLEEDGE_ADMIN_PUBKEY,
+#endif
 };
 
 // Onboard user LED — blinks once per ANNOUNCE (advert) as a heartbeat.
