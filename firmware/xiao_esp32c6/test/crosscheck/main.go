@@ -1,0 +1,155 @@
+// crosscheck validates the XIAO ESP32-C6 firmware mesh logic (mesh.cpp) against
+// the Go reference implementation in core/. It generates packets, runs them
+// through the compiled host_test binary, and verifies the results decode
+// correctly and that CRC32 / fragmentation are byte-identical.
+//
+// Usage: go run ./firmware/xiao_esp32c6/test/crosscheck <path-to-host_test>
+// (host_test is built by firmware/xiao_esp32c6/test/run_tests.sh)
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"hash/crc32"
+	"os"
+	"os/exec"
+	"strings"
+
+	"github.com/bleedge/bleedge/core"
+)
+
+var (
+	bin  string
+	self = core.NodeID{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+	fail bool
+)
+
+func check(name string, cond bool) {
+	if !cond {
+		fmt.Printf("FAIL %s\n", name)
+		fail = true
+		return
+	}
+	fmt.Printf("ok   %s\n", name)
+}
+
+func runFwd(pkt []byte) (parsed string, fwd []byte) {
+	out, err := exec.Command(bin, hex.EncodeToString(pkt), hex.EncodeToString(self[:])).Output()
+	if err != nil {
+		fmt.Printf("FAIL exec forward: %v\n", err)
+		os.Exit(1)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	fwd, _ = hex.DecodeString(lines[1])
+	return lines[0], fwd
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: crosscheck <path-to-host_test>")
+		os.Exit(2)
+	}
+	bin = os.Args[1]
+
+	// ---- relay transcode --------------------------------------------------
+	pktA := core.Packet{Version: 1, Type: core.PacketTypeData, ID: core.NewPacketID(),
+		Source: core.NodeID{0, 0, 0, 0, 0, 0, 0, 0xAA}, Mode: core.RoutingModeFlood, TTL: 4,
+		PayloadType: core.PayloadTypeTextTest, Payload: []byte("hi")}
+	encA, _ := pktA.Encode()
+	parsedA, fwdA := runFwd(encA)
+	gotA, errA := core.DecodePacket(fwdA)
+	check("A: fresh flood (trace=nil) decodes", errA == nil)
+	check("A: ttl 4->3", gotA.TTL == 3)
+	check("A: trace=[self]", len(gotA.Trace) == 1 && gotA.Trace[0] == self)
+	check("A: id/payload/source unchanged", gotA.ID == pktA.ID && string(gotA.Payload) == "hi" && gotA.Source == pktA.Source)
+	// fresh packet → direct neighbor is the source
+	check("A: neighbor=source", strings.Contains(parsedA, "neighbor="+hex.EncodeToString(pktA.Source[:])))
+
+	x := core.NodeID{0xDE, 0, 0, 0, 0, 0, 0, 0x01}
+	pktB := core.Packet{Version: 1, Type: core.PacketTypeData, ID: core.NewPacketID(),
+		Source: core.NodeID{0, 0, 0, 0, 0, 0, 0, 0xBB}, Destination: core.NodeID{0, 0, 0, 0, 0, 0, 0, 0xCC},
+		Mode: core.RoutingModeFlood, TTL: 3, Trace: []core.NodeID{x},
+		PayloadType: core.PayloadTypeTextTest, Payload: []byte("relay me")}
+	encB, _ := pktB.Encode()
+	parsedB, fwdB := runFwd(encB)
+	gotB, errB := core.DecodePacket(fwdB)
+	check("B: existing trace decodes", errB == nil)
+	check("B: ttl 3->2", gotB.TTL == 2)
+	check("B: trace=[x,self]", len(gotB.Trace) == 2 && gotB.Trace[0] == x && gotB.Trace[1] == self)
+	check("B: dest unchanged", gotB.Destination == pktB.Destination)
+	// packet with a trace → direct neighbor is the last hop (x)
+	check("B: neighbor=lastHop(x)", strings.Contains(parsedB, "neighbor="+hex.EncodeToString(x[:])))
+
+	ap := core.AnnouncePayload{NodeID: pktB.Source, Caps: core.Capabilities(0x07), Seq: 9, Timestamp: 1700000000}
+	apEnc, _ := ap.Encode()
+	pktC := core.Packet{Version: 1, Type: core.PacketTypeAnnounce, ID: core.NewPacketID(),
+		Source: pktB.Source, Mode: core.RoutingModeFlood, TTL: 3,
+		PayloadType: core.PayloadTypeMeshCoreRaw, Payload: apEnc}
+	encC, _ := pktC.Encode()
+	_, fwdC := runFwd(encC)
+	gotC, errC := core.DecodePacket(fwdC)
+	check("C: announce decodes", errC == nil)
+	check("C: ttl 3->2 trace=[self]", gotC.TTL == 2 && len(gotC.Trace) == 1 && gotC.Trace[0] == self)
+	gotAP, errAP := core.DecodeAnnounce(gotC.Payload)
+	check("C: announce payload intact", errAP == nil && gotAP.Seq == 9 && gotAP.Caps == 0x07 && gotAP.NodeID == pktB.Source)
+
+	pktD := core.Packet{Version: 1, Type: core.PacketTypeData, ID: core.NewPacketID(),
+		Source: core.NodeID{0, 0, 0, 0, 0, 0, 0, 0xBB}, Mode: core.RoutingModeFlood, TTL: 3,
+		Trace: []core.NodeID{self}, PayloadType: core.PayloadTypeTextTest, Payload: []byte("x")}
+	encD, _ := pktD.Encode()
+	parsedD, _ := runFwd(encD)
+	check("D: loop detected (self in trace)", strings.Contains(parsedD, "loop=1"))
+
+	// ---- CRC32 ------------------------------------------------------------
+	for _, s := range []string{"", "00", "74657374", "deadbeefcafe0011223344556677"} {
+		d, _ := hex.DecodeString(s)
+		want := fmt.Sprintf("%08x", crc32.ChecksumIEEE(d))
+		out, _ := exec.Command(bin, "--crc", s).Output()
+		check("crc("+s+")", strings.TrimSpace(string(out)) == want)
+	}
+
+	// ---- fragmentation byte-identical to core.FragmentPacket --------------
+	pid := core.NewPacketID()
+	data := make([]byte, 600)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	mtu := 200
+	var goHex []string
+	for _, f := range core.FragmentPacket(data, mtu, pid) {
+		goHex = append(goHex, hex.EncodeToString(f.Encode()))
+	}
+	out, _ := exec.Command(bin, "--frag", hex.EncodeToString(data), fmt.Sprint(mtu), hex.EncodeToString(pid[:])).Output()
+	cppHex := strings.Split(strings.TrimSpace(string(out)), "\n")
+	check("frag count matches", len(goHex) == len(cppHex))
+	allEq := len(goHex) == len(cppHex)
+	for i := 0; i < len(goHex) && i < len(cppHex); i++ {
+		if goHex[i] != cppHex[i] {
+			allEq = false
+			fmt.Printf("  frame %d differs\n   go : %s\n   cpp: %s\n", i, goHex[i], cppHex[i])
+		}
+	}
+	check("frames byte-identical", allEq)
+
+	// ---- ANNOUNCE with neighbors decodes correctly in Go ------------------
+	selfA := core.NodeID{0xE5, 0xC6, 1, 2, 3, 4, 5, 6}
+	n1 := core.NodeID{0, 0, 0, 0, 0, 0, 0, 0xAA}
+	n2 := core.NodeID{0xDE, 0, 0, 0, 0, 0, 0, 0x01}
+	annOut, _ := exec.Command(bin, "--announce", hex.EncodeToString(selfA[:]), "7", "42",
+		hex.EncodeToString(n1[:]), hex.EncodeToString(n2[:])).Output()
+	annBytes, _ := hex.DecodeString(strings.TrimSpace(string(annOut)))
+	annPkt, errAnn := core.DecodePacket(annBytes)
+	check("announce packet decodes", errAnn == nil)
+	check("announce is ANNOUNCE type, flood, ttl=3", annPkt.Type == core.PacketTypeAnnounce &&
+		annPkt.Mode == core.RoutingModeFlood && annPkt.TTL == 3 && annPkt.Source == selfA)
+	payload, errPL := core.DecodeAnnounce(annPkt.Payload)
+	check("announce payload decodes", errPL == nil)
+	check("announce nodeId/caps/seq", payload.NodeID == selfA && payload.Caps == 7 && payload.Seq == 42)
+	check("announce neighbors=[n1,n2]", len(payload.Neighbors) == 2 &&
+		payload.Neighbors[0] == n1 && payload.Neighbors[1] == n2)
+
+	if fail {
+		os.Exit(1)
+	}
+	fmt.Println("ALL PASS")
+}

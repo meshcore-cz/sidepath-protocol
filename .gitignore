@@ -1,0 +1,16 @@
+# Compiled Go binaries (built into the repo root)
+/bleedge-macos
+/bleedge-listen
+/bleedge-simulate
+
+# Go build/test artifacts
+*.test
+*.out
+*.prof
+
+# Node identity / secrets (never commit a node's Ed25519 seed)
+*.seed
+
+# macOS
+.DS_Store
+screenshot*
