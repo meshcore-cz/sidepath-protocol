@@ -55,8 +55,10 @@ const (
 type PayloadType uint8
 
 const (
-	PayloadTypeTextTest    PayloadType = 1
-	PayloadTypeMeshCoreRaw PayloadType = 2
+	PayloadTypeTextTest      PayloadType = 1
+	PayloadTypeMeshCoreRaw   PayloadType = 2
+	PayloadTypeChatPlain     PayloadType = 3 // broadcast channel text (UTF-8)
+	PayloadTypeChatEncrypted PayloadType = 4 // direct message: Crypto sealed envelope (CBOR)
 )
 
 type PHY uint8

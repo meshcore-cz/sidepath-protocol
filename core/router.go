@@ -111,6 +111,7 @@ func (r *Router) handleAnnounce(pkt Packet, incomingPeer *NodeID) []Action {
 		Neighbors:   ap.Neighbors,
 		Seq:         ap.Seq,
 		Description: ap.Description,
+		PublicKey:   ap.PublicKey,
 	})
 	// Flood ANNOUNCE to the rest of the network
 	return r.handleFlood(pkt, incomingPeer)
@@ -303,6 +304,16 @@ func (r *Router) DescriptionFor(id NodeID) string {
 		return tn.Description
 	}
 	return ""
+}
+
+// PublicKeyFor returns a node's 32-byte Ed25519 public key as learned from its
+// signed ANNOUNCE (topology), or nil if unknown. Used to encrypt a DM to a node
+// we haven't received a message from yet.
+func (r *Router) PublicKeyFor(id NodeID) []byte {
+	if tn, ok := r.Topology.GetNode(id); ok && len(tn.PublicKey) == 32 {
+		return tn.PublicKey
+	}
+	return nil
 }
 
 // FloodJitter returns a random relay delay between 10ms and 100ms to reduce collision probability.

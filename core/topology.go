@@ -12,6 +12,7 @@ type TopoNode struct {
 	Neighbors   []NodeID
 	Seq         uint32
 	Description string // diagnostic label from the node's ANNOUNCE (key 8)
+	PublicKey   []byte // 32-byte Ed25519 key from ANNOUNCE (key 6); used for chat encryption
 	LastSeen    time.Time
 }
 

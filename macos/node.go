@@ -47,7 +47,7 @@ type Node struct {
 	notifiers map[string]ble.Notifier
 
 	logFn            func(string)
-	onMessage        func(core.NodeID, []byte)
+	onMessage        func(core.NodeID, core.PayloadType, []byte)
 	onPeerConnect    func(core.NodeID)
 	onPeerDisconnect func(core.NodeID)
 }
@@ -60,7 +60,7 @@ type Config struct {
 	Allowlist        []core.NodeID
 	Verbose          bool
 	LogFn            func(string)
-	OnMessage        func(from core.NodeID, payload []byte) // called for received DATA packets
+	OnMessage        func(from core.NodeID, ptype core.PayloadType, payload []byte) // called for received DATA packets
 	OnPeerConnect    func(id core.NodeID)                   // called when outgoing peer connects
 	OnPeerDisconnect func(id core.NodeID)                   // called when peer disconnects
 }
@@ -440,7 +440,7 @@ func (n *Node) deliverLocal(pkt core.Packet) {
 	n.logf("deliver payload-type=%d payload=%q trace=%v",
 		pkt.PayloadType, string(pkt.Payload), nodeIDs(pkt.Trace))
 	if n.onMessage != nil {
-		n.onMessage(pkt.Source, pkt.Payload)
+		n.onMessage(pkt.Source, pkt.PayloadType, pkt.Payload)
 	}
 }
 
@@ -552,8 +552,45 @@ func (n *Node) buildNodeInfo() []byte {
 	return data
 }
 
-// SendText sends a text message to dst (zero = broadcast).
+// SendText sends a plaintext test message to dst (zero = broadcast).
 func (n *Node) SendText(dst core.NodeID, text string, ttl uint8) error {
+	return n.sendData(dst, core.PayloadTypeTextTest, []byte(text), ttl)
+}
+
+// SendChannel broadcasts a plaintext chat message on the public channel.
+func (n *Node) SendChannel(text string) error {
+	return n.sendData(core.NodeID{}, core.PayloadTypeChatPlain, []byte(text), 4)
+}
+
+// SendChatTo sends an end-to-end encrypted direct message to dst, encrypted to
+// recipientPub (the recipient's 32-byte Ed25519 public key). For replies the
+// public key is the one carried in the inbound envelope (core.ChatEnvelopeSenderPub).
+func (n *Node) SendChatTo(dst core.NodeID, recipientPub []byte, text string) error {
+	env, err := core.SealChat(text, n.identity, recipientPub)
+	if err != nil {
+		return err
+	}
+	return n.sendData(dst, core.PayloadTypeChatEncrypted, env, 4)
+}
+
+// SendChat sends an encrypted DM to dst, resolving its public key from the
+// topology (learned via the node's signed ANNOUNCE). Returns an error if dst's
+// key isn't known yet.
+func (n *Node) SendChat(dst core.NodeID, text string) error {
+	pub := n.router.PublicKeyFor(dst)
+	if pub == nil {
+		return fmt.Errorf("no public key known for %s (not in topology yet)", dst)
+	}
+	return n.SendChatTo(dst, pub, text)
+}
+
+// PublicKeyFor returns a node's 32-byte Ed25519 public key from the topology, or nil.
+func (n *Node) PublicKeyFor(id core.NodeID) []byte {
+	return n.router.PublicKeyFor(id)
+}
+
+// sendData builds, originates and transmits a DATA packet.
+func (n *Node) sendData(dst core.NodeID, ptype core.PayloadType, payload []byte, ttl uint8) error {
 	pkt := core.Packet{
 		Version:     core.ProtocolVersion,
 		Type:        core.PacketTypeData,
@@ -561,8 +598,8 @@ func (n *Node) SendText(dst core.NodeID, text string, ttl uint8) error {
 		Source:      n.nodeID,
 		Destination: dst,
 		TTL:         ttl,
-		PayloadType: core.PayloadTypeTextTest,
-		Payload:     []byte(text),
+		PayloadType: ptype,
+		Payload:     payload,
 	}
 	var zero core.NodeID
 	if dst == zero {
@@ -623,6 +660,16 @@ func (n *Node) ConnectedPeers() []core.NodeID {
 // NodeID returns this node's ID.
 func (n *Node) NodeID() core.NodeID {
 	return n.nodeID
+}
+
+// Identity returns this node's Ed25519 identity (used for chat decryption).
+func (n *Node) Identity() *core.Identity {
+	return n.identity
+}
+
+// Description returns this node's diagnostic label.
+func (n *Node) Description() string {
+	return n.description
 }
 
 // DescriptionFor resolves a peer's diagnostic label (neighbor or topology).

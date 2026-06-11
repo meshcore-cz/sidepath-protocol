@@ -4,7 +4,7 @@ DEBUG_APK := android/debug-app/build/outputs/apk/debug/debug-app-debug.apk
 # Which app `install-all` deploys: chat (default) or debug.
 APK ?= $(CHAT_APK)
 
-.PHONY: build test install-all install-debug devices clean
+.PHONY: build test test-go build-macos bot install-all install-debug devices clean
 
 build:
 	cd android && ./gradlew assembleDebug
@@ -35,6 +35,18 @@ _install:
 
 clean:
 	cd android && ./gradlew clean
+
+test-go:
+	go test ./core/
+
+build-macos:
+	go build -o bin/bleedge-macos ./cmd/bleedge-macos
+
+# Run the macOS node as a bot driven by a Bun script, e.g.:
+#   make bot SCRIPT=bots/time-bot.ts
+SCRIPT ?= bots/echo-bot.ts
+bot: build-macos
+	./bin/bleedge-macos --bot $(SCRIPT) --verbose
 
 build-esp32:
 	arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 firmware/xiao_esp32c6

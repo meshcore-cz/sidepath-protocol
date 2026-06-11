@@ -26,6 +26,8 @@ func main() {
 	seedHex := ""
 	allowPeers := ""
 	description := ""
+	botScript := ""
+	bunPath := "bun"
 	verbose := false
 	for i, arg := range os.Args[1:] {
 		switch {
@@ -43,18 +45,33 @@ func main() {
 			allowPeers = strings.TrimPrefix(arg, "--allow-peer=")
 		case arg == "--allow-peer" && i+1 < len(os.Args[1:]):
 			allowPeers = os.Args[i+2]
+		case strings.HasPrefix(arg, "--bot="):
+			botScript = strings.TrimPrefix(arg, "--bot=")
+		case arg == "--bot" && i+1 < len(os.Args[1:]):
+			botScript = os.Args[i+2]
+		case strings.HasPrefix(arg, "--bun="):
+			bunPath = strings.TrimPrefix(arg, "--bun=")
+		case arg == "--bun" && i+1 < len(os.Args[1:]):
+			bunPath = os.Args[i+2]
 		case arg == "--help" || arg == "-h":
 			fmt.Fprintf(os.Stderr, `bleedge-macos — interactive BLEEdge node for macOS (1M PHY)
 
 Usage:
-  bleedge-macos [--seed-hex <hex>] [--allow-peer <id,...>] [--verbose]
+  bleedge-macos [--seed-hex <hex>] [--description <str>] [--allow-peer <id,...>] [--verbose]
+  bleedge-macos --bot <script.ts> [--bun <path>]   # run as a bot driven by a Bun script
 
 Interactive commands (type and press Enter):
-  <text>         broadcast message to all peers
-  /peers         list connected peers
-  /neighbors     list neighbor table
-  /topology      list known topology
-  /quit          exit
+  <text>             broadcast a message on the public channel
+  /dm <id> <text>    send an encrypted direct message to a node
+  /peers             list connected peers
+  /neighbors         list neighbor table
+  /topology          list known topology
+  /quit              exit
+
+Bot mode (--bot): the node runs headless and forwards chat messages to a Bun
+  JS/TS script over stdin/stdout JSON. The script can reply (encrypted DM),
+  broadcast on the channel, and query mesh stats. See bots/ for examples:
+    bleedge-macos --bot bots/time-bot.ts
 
 NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
       Use bleedge-listen on Linux for the Long Range PoC.
@@ -107,6 +124,9 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// In bot mode, the bridge (set below) consumes incoming messages; otherwise we
+	// print them interactively, decrypting encrypted DMs with our identity.
+	var theBot *bot
 	node := blenode.New(blenode.Config{
 		Identity:    identity,
 		Description: description,
@@ -114,9 +134,13 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		Allowlist: allowlist,
 		Verbose:   verbose,
 		LogFn:     logFn,
-		OnMessage: func(from core.NodeID, payload []byte) {
+		OnMessage: func(from core.NodeID, ptype core.PayloadType, payload []byte) {
+			if theBot != nil {
+				theBot.onIncoming(from, ptype, payload)
+				return
+			}
 			ts := time.Now().Format("15:04:05")
-			fmt.Printf("\n[%s] MSG from %s: %s\n> ", ts, from, string(payload))
+			fmt.Printf("\n[%s] MSG from %s: %s\n> ", ts, from, renderIncoming(ptype, payload, identity))
 		},
 		OnPeerConnect: func(id core.NodeID) {
 			ts := time.Now().Format("15:04:05")
@@ -132,10 +156,28 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	errCh := make(chan error, 1)
 	go func() { errCh <- node.Run(ctx) }()
 
+	// Bot mode: start the Bun bridge and run headless until interrupted.
+	if botScript != "" {
+		b, err := startBot(ctx, node, bunPath, botScript)
+		if err != nil {
+			fatalf("cannot start bot: %v", err)
+		}
+		theBot = b
+		fmt.Fprintf(os.Stderr, "BLEEdge macOS bot  node=%s  script=%s\n", identity.NodeID(), botScript)
+		select {
+		case err := <-errCh:
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "node error: %v\n", err)
+			}
+		case <-ctx.Done():
+		}
+		return
+	}
+
 	// Banner
 	fmt.Printf("BLEEdge macOS  node=%s  phy=1m\n", identity.NodeID())
 	fmt.Println("Advertising and scanning... type a message and press Enter to broadcast.")
-	fmt.Println("Commands: /peers  /neighbors  /topology  /quit")
+	fmt.Println("Commands: /dm <id> <text>  /peers  /neighbors  /topology  /quit")
 	fmt.Println()
 
 	// Interactive loop
@@ -210,14 +252,33 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 			}
 
 		default:
-			if strings.HasPrefix(line, "/") {
-				fmt.Println("  unknown command. try /peers /neighbors /topology /quit")
+			if strings.HasPrefix(line, "/dm ") {
+				rest := strings.TrimSpace(strings.TrimPrefix(line, "/dm "))
+				parts := strings.SplitN(rest, " ", 2)
+				if len(parts) < 2 {
+					fmt.Println("  usage: /dm <nodeid> <message>")
+					continue
+				}
+				id, err := core.ParseNodeID(parts[0])
+				if err != nil {
+					fmt.Printf("  bad node id: %v\n", err)
+					continue
+				}
+				if err := node.SendChat(id, parts[1]); err != nil {
+					fmt.Printf("  dm error: %v\n", err)
+				} else {
+					fmt.Printf("  dm sent to %s\n", id)
+				}
 				continue
 			}
-			if err := node.SendText(core.NodeID{}, line, 4); err != nil {
+			if strings.HasPrefix(line, "/") {
+				fmt.Println("  unknown command. try /dm /peers /neighbors /topology /quit")
+				continue
+			}
+			if err := node.SendChannel(line); err != nil {
 				fmt.Printf("  send error: %v\n", err)
 			} else {
-				fmt.Printf("  sent: %s\n", line)
+				fmt.Printf("  sent to channel: %s\n", line)
 			}
 		}
 	}
@@ -228,6 +289,20 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "bleedge-macos: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// renderIncoming turns a received payload into displayable text, decrypting
+// encrypted DMs with our identity.
+func renderIncoming(ptype core.PayloadType, payload []byte, id *core.Identity) string {
+	switch ptype {
+	case core.PayloadTypeChatEncrypted:
+		if text, ok := core.OpenChat(payload, id); ok {
+			return text
+		}
+		return "[encrypted — not for me]"
+	default:
+		return string(payload)
+	}
 }
 
 // descLabel renders a node description as "[desc]", or "[?]" when unknown.
