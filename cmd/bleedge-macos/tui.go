@@ -4,13 +4,16 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/bleedge/bleedge/core"
 	blenode "github.com/bleedge/bleedge/macos"
@@ -33,6 +36,11 @@ type nodeErrMsg struct {
 	err error
 }
 
+type uiLine struct {
+	text string
+	kind uiEventKind
+}
+
 type tuiModel struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -48,9 +56,12 @@ type tuiModel struct {
 	width    int
 	height   int
 
-	lines   []string
-	history []string
-	histIdx int
+	lines       []uiLine
+	history     []string
+	histIdx     int
+	chatMode    bool
+	dmTarget    *core.NodeID
+	dmTargetPub []byte
 
 	completions []string
 	compToken   string
@@ -67,7 +78,7 @@ var (
 func runTUI(ctx context.Context, cancel context.CancelFunc, errCh <-chan error, events <-chan uiEvent, node *blenode.Node, identity *core.Identity, current *blenode.Channel) error {
 	ti := textinput.New()
 	ti.Prompt = "> "
-	ti.Placeholder = "message or /command"
+	ti.Placeholder = "command"
 	ti.Focus()
 	ti.CharLimit = 0
 	ti.Width = 80
@@ -88,8 +99,8 @@ func runTUI(ctx context.Context, cancel context.CancelFunc, errCh <-chan error, 
 	m.appendLines(true,
 		fmt.Sprintf("BLEEdge macOS  node=%s  phy=1m", identity.NodeID()),
 		"Advertising and scanning...",
-		"Commands: /dm <id> <text>  /trace <id> [via <hop> ...]  /route <id>  /join <name>|public",
-		"          /channels  /peers  /neighbors  /topology  /quit",
+		"Commands: trace <id> [via <hop> ...]  route <id>  topology  peers  neighbors  channels",
+		"          dm <id> <text>  /join|/open <channel|nodeid|pubkey>  /close  quit",
 		"Keys: Up/Down history  PageUp/PageDown scroll  Tab autocomplete",
 	)
 
@@ -134,12 +145,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport(true)
 	case uiEvent:
 		if msg.line != "" {
-			m.appendLines(false, styleUIEvent(msg))
+			m.appendUILines(false, uiLine{text: msg.line, kind: msg.kind})
 		}
 		cmds = append(cmds, waitForUIEvent(m.events))
 	case nodeErrMsg:
 		if msg.err != nil {
-			m.appendLines(true, errStyle.Render(fmt.Sprintf("node error: %v", msg.err)))
+			m.appendUILines(true, uiLine{text: fmt.Sprintf("node error: %v", msg.err), kind: uiEventError})
 		}
 		m.cancel()
 		return m, tea.Quit
@@ -198,32 +209,48 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func styleUIEvent(ev uiEvent) string {
-	switch ev.kind {
-	case uiEventLog:
-		return logStyle.Render(ev.line)
-	case uiEventError:
-		return errStyle.Render(ev.line)
-	default:
-		return ev.line
-	}
-}
-
 func (m tuiModel) View() string {
-	status := titleStyle.Render(fmt.Sprintf("BLEEdge #%s", m.current.Name))
+	status := titleStyle.Render(m.statusText())
 	if m.width > 0 {
 		status = lipgloss.NewStyle().Width(m.width).Render(status)
 	}
-	return status + "\n" + m.viewport.View() + "\n" + m.input.View() + "\n" + helpStyle.Render("tab complete • up/down history • pgup/pgdown scroll • ctrl+c quit")
+	help := "tab complete • up/down history • pgup/pgdown scroll • ctrl+c quit"
+	if m.chatMode {
+		help = "chat mode • /close command mode • slash commands still work • " + help
+	}
+	return status + "\n" + m.viewport.View() + "\n" + m.input.View() + "\n" + helpStyle.Render(help)
+}
+
+func (m tuiModel) statusText() string {
+	if !m.chatMode {
+		return "BLEEdge command"
+	}
+	if m.dmTarget != nil {
+		return fmt.Sprintf("BLEEdge DM %s", *m.dmTarget)
+	}
+	return fmt.Sprintf("BLEEdge #%s", m.current.Name)
 }
 
 func (m *tuiModel) appendLines(forceBottom bool, lines ...string) {
 	if len(lines) == 0 {
 		return
 	}
+	uiLines := make([]uiLine, 0, len(lines))
+	for _, line := range lines {
+		if line != "" {
+			uiLines = append(uiLines, uiLine{text: line})
+		}
+	}
+	m.appendUILines(forceBottom, uiLines...)
+}
+
+func (m *tuiModel) appendUILines(forceBottom bool, lines ...uiLine) {
+	if len(lines) == 0 {
+		return
+	}
 	wasBottom := m.viewport.AtBottom()
 	for _, line := range lines {
-		if line == "" {
+		if line.text == "" {
 			continue
 		}
 		m.lines = append(m.lines, line)
@@ -232,10 +259,78 @@ func (m *tuiModel) appendLines(forceBottom bool, lines ...string) {
 }
 
 func (m *tuiModel) refreshViewport(bottom bool) {
-	m.viewport.SetContent(strings.Join(m.lines, "\n"))
+	width := m.viewport.Width
+	if width <= 0 {
+		width = 80
+	}
+	rendered := make([]string, 0, len(m.lines))
+	for _, line := range m.lines {
+		for _, wrapped := range wrapText(line.text, width) {
+			rendered = append(rendered, styleLine(wrapped, line.kind))
+		}
+	}
+	m.viewport.SetContent(strings.Join(rendered, "\n"))
 	if bottom {
 		m.viewport.GotoBottom()
 	}
+}
+
+func styleLine(line string, kind uiEventKind) string {
+	switch kind {
+	case uiEventLog:
+		return logStyle.Render(line)
+	case uiEventError:
+		return errStyle.Render(line)
+	default:
+		return line
+	}
+}
+
+func wrapText(s string, width int) []string {
+	if width <= 1 {
+		return []string{s}
+	}
+	var out []string
+	for _, part := range strings.Split(s, "\n") {
+		if part == "" {
+			out = append(out, "")
+			continue
+		}
+		for runewidth.StringWidth(part) > width {
+			cut := wrapCut(part, width)
+			out = append(out, strings.TrimRightFunc(part[:cut], unicode.IsSpace))
+			part = strings.TrimLeftFunc(part[cut:], unicode.IsSpace)
+			if part == "" {
+				break
+			}
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func wrapCut(s string, width int) int {
+	used := 0
+	lastSpace := -1
+	for i, r := range s {
+		if unicode.IsSpace(r) {
+			lastSpace = i
+		}
+		next := used + runewidth.RuneWidth(r)
+		if next > width {
+			if lastSpace > 0 {
+				return lastSpace
+			}
+			if i > 0 {
+				return i
+			}
+			return len(string(r))
+		}
+		used = next
+	}
+	return len(s)
 }
 
 func (m *tuiModel) historyPrev() {
@@ -285,7 +380,7 @@ func (m *tuiModel) complete() {
 	value := m.input.Value()
 	pos := m.input.Position()
 	token, start, end := completionToken(value, pos)
-	if token == "" && !strings.HasPrefix(value, "/") {
+	if token == "" && m.chatMode && !strings.HasPrefix(value, "/") {
 		return
 	}
 	if token != m.compToken || len(m.completions) == 0 {
@@ -322,14 +417,25 @@ func completionToken(s string, pos int) (token string, start int, end int) {
 func (m tuiModel) completionCandidates(line, token string) []string {
 	var base []string
 	fields := strings.Fields(line)
+	cmds := []string{"channels", "close", "dm", "help", "neighbors", "peers", "quit", "route", "topology", "trace"}
+	slashCmds := []string{"/channels", "/close", "/dm", "/help", "/join", "/neighbors", "/open", "/peers", "/quit", "/route", "/topology", "/trace"}
+	cmd := ""
+	if len(fields) > 0 {
+		cmd = strings.TrimPrefix(fields[0], "/")
+	}
 	if strings.HasPrefix(token, "/") || (len(fields) == 0 && strings.HasPrefix(line, "/")) {
-		base = []string{"/channels", "/dm", "/join", "/neighbors", "/peers", "/quit", "/route", "/topology", "/trace"}
-	} else if len(fields) > 0 && fields[0] == "/join" {
+		base = slashCmds
+	} else if len(fields) <= 1 {
+		if !m.chatMode {
+			base = cmds
+		}
+	} else if cmd == "join" || cmd == "open" {
 		base = []string{"public"}
 		for _, ch := range m.node.Channels() {
 			base = append(base, ch.Name)
 		}
-	} else if len(fields) > 0 && fields[0] == "/trace" && strings.HasPrefix("via", token) {
+		base = append(base, m.nodeIDCandidates()...)
+	} else if cmd == "trace" && strings.HasPrefix("via", token) {
 		base = []string{"via"}
 	} else {
 		base = m.nodeIDCandidates()
@@ -364,34 +470,50 @@ func (m tuiModel) nodeIDCandidates() []string {
 }
 
 func (m *tuiModel) executeLine(line string) ([]string, bool) {
-	switch line {
-	case "/quit", "/q", "/exit":
-		return []string{"exiting"}, true
-	case "/peers", "/p":
-		return m.renderPeers(), false
-	case "/neighbors", "/n":
-		return m.renderNeighbors(), false
-	case "/topology", "/t":
-		return m.renderTopology(), false
-	case "/channels", "/c":
-		return m.renderChannels(), false
+	if m.chatMode && !strings.HasPrefix(line, "/") {
+		return m.sendChatLine(line), false
 	}
 
-	if strings.HasPrefix(line, "/join ") {
-		name := strings.TrimSpace(strings.TrimPrefix(line, "/join "))
-		if name == "" {
-			return []string{"usage: /join <name>  (use 'public' for the Public channel)"}, false
-		}
-		if strings.EqualFold(name, "public") {
-			m.current = m.node.JoinPublicChannel()
-		} else {
-			m.current = m.node.JoinNamedChannel(name)
-		}
-		return []string{fmt.Sprintf("joined #%s (hash=0x%02x)", m.current.Name, m.current.Hash)}, false
+	cmdLine := strings.TrimSpace(line)
+	if strings.HasPrefix(cmdLine, "/") {
+		cmdLine = strings.TrimPrefix(cmdLine, "/")
 	}
-	if strings.HasPrefix(line, "/dm ") {
-		rest := strings.TrimSpace(strings.TrimPrefix(line, "/dm "))
-		parts := strings.SplitN(rest, " ", 2)
+	fields := strings.Fields(cmdLine)
+	if len(fields) == 0 {
+		return nil, false
+	}
+	cmd := fields[0]
+	args := strings.TrimSpace(strings.TrimPrefix(cmdLine, cmd))
+
+	switch cmd {
+	case "quit", "q", "exit":
+		return []string{"exiting"}, true
+	case "help", "h":
+		return []string{
+			"commands: trace, route, topology, peers, neighbors, channels, dm, quit",
+			"chat: /join|/open <public|channel-name|16-byte-channel-secret|nodeid|pubkey>, /close",
+		}, false
+	case "peers", "p":
+		return m.renderPeers(), false
+	case "neighbors", "n":
+		return m.renderNeighbors(), false
+	case "topology", "t":
+		return m.renderTopology(), false
+	case "channels", "c":
+		return m.renderChannels(), false
+	case "close":
+		m.chatMode = false
+		m.dmTarget = nil
+		m.dmTargetPub = nil
+		m.updateInputPlaceholder()
+		return []string{"command mode"}, false
+	}
+
+	if cmd == "join" || cmd == "open" {
+		return m.openChat(args), false
+	}
+	if cmd == "dm" {
+		parts := strings.SplitN(args, " ", 2)
 		if len(parts) < 2 {
 			return []string{"usage: /dm <nodeid> <message>"}, false
 		}
@@ -404,8 +526,8 @@ func (m *tuiModel) executeLine(line string) ([]string, bool) {
 		}
 		return []string{fmt.Sprintf("dm sent to %s", id)}, false
 	}
-	if strings.HasPrefix(line, "/route ") {
-		id, err := core.ParseNodeID(strings.TrimSpace(strings.TrimPrefix(line, "/route ")))
+	if cmd == "route" {
+		id, err := core.ParseNodeID(args)
 		if err != nil {
 			return []string{fmt.Sprintf("bad node id: %v", err)}, false
 		}
@@ -415,8 +537,8 @@ func (m *tuiModel) executeLine(line string) ([]string, bool) {
 		}
 		return []string{fmt.Sprintf("route to %s: %s", id, formatRoute(route))}, false
 	}
-	if strings.HasPrefix(line, "/trace ") {
-		dst, route, err := parseTraceCommand(strings.TrimSpace(strings.TrimPrefix(line, "/trace ")))
+	if cmd == "trace" {
+		dst, route, err := parseTraceCommand(args)
 		if err != nil {
 			return []string{fmt.Sprintf("usage: /trace <nodeid> [via <hop1> <hop2> ...]  (%v)", err)}, false
 		}
@@ -429,13 +551,84 @@ func (m *tuiModel) executeLine(line string) ([]string, bool) {
 		}
 		return []string{fmt.Sprintf("trace sent to %s tag=%08x route=%s", dst, tag, formatRoute(route))}, false
 	}
-	if strings.HasPrefix(line, "/") {
-		return []string{"unknown command. try /dm /trace /route /join /channels /peers /neighbors /topology /quit"}, false
+
+	return []string{"unknown command. try help, trace, route, topology, peers, neighbors, channels, /join, /open"}, false
+}
+
+func (m *tuiModel) sendChatLine(line string) []string {
+	if m.dmTarget != nil {
+		var err error
+		if len(m.dmTargetPub) == 32 {
+			err = m.node.SendChatTo(*m.dmTarget, m.dmTargetPub, line)
+		} else {
+			err = m.node.SendChat(*m.dmTarget, line)
+		}
+		if err != nil {
+			return []string{fmt.Sprintf("dm error: %v", err)}
+		}
+		return []string{fmt.Sprintf("dm sent to %s", *m.dmTarget)}
 	}
 	if err := m.node.SendToChannel(m.current.Secret, line); err != nil {
-		return []string{fmt.Sprintf("send error: %v", err)}, false
+		return []string{fmt.Sprintf("send error: %v", err)}
 	}
-	return []string{fmt.Sprintf("sent to #%s: %s", m.current.Name, line)}, false
+	return []string{fmt.Sprintf("sent to #%s: %s", m.current.Name, line)}
+}
+
+func (m *tuiModel) openChat(target string) []string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return []string{"usage: /join <public|channel-name|16-byte-channel-secret|nodeid|pubkey>"}
+	}
+	m.dmTarget = nil
+	m.dmTargetPub = nil
+	switch {
+	case strings.EqualFold(target, "public"):
+		m.current = m.node.JoinPublicChannel()
+	case isHexLen(target, core.ChannelSecretLen*2):
+		secret, err := hex.DecodeString(target)
+		if err != nil {
+			return []string{fmt.Sprintf("bad channel secret: %v", err)}
+		}
+		m.current = m.node.JoinChannel(secret, target[:8])
+	case isHexLen(target, 16):
+		id, err := core.ParseNodeID(target)
+		if err != nil {
+			return []string{fmt.Sprintf("bad node id: %v", err)}
+		}
+		m.dmTarget = &id
+	case isHexLen(target, 64):
+		pub, err := hex.DecodeString(target)
+		if err != nil {
+			return []string{fmt.Sprintf("bad pubkey: %v", err)}
+		}
+		id := core.NodeIDFromPubKey(pub)
+		m.dmTarget = &id
+		m.dmTargetPub = pub
+	default:
+		m.current = m.node.JoinNamedChannel(target)
+	}
+	m.chatMode = true
+	m.updateInputPlaceholder()
+	if m.dmTarget != nil {
+		return []string{fmt.Sprintf("opened DM with %s", *m.dmTarget)}
+	}
+	return []string{fmt.Sprintf("opened #%s (hash=0x%02x)", m.current.Name, m.current.Hash)}
+}
+
+func (m *tuiModel) updateInputPlaceholder() {
+	if m.chatMode {
+		m.input.Placeholder = "message"
+		return
+	}
+	m.input.Placeholder = "command"
+}
+
+func isHexLen(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 func (m tuiModel) renderPeers() []string {
