@@ -39,9 +39,9 @@ type Router struct {
 	Identity    *Identity // local signing identity; required to BuildAnnounce
 	Description string    // diagnostic node label advertised in ANNOUNCE (unsigned)
 	dedup       *DedupCache
-	Neighbors *NeighborTable
-	Topology  *Topology
-	Allowlist map[NodeID]bool // if non-empty, only these peers are allowed
+	Neighbors   *NeighborTable
+	Topology    *Topology
+	Allowlist   map[NodeID]bool // if non-empty, only these peers are allowed
 }
 
 // NewRouter creates a router with a bare NodeID and no signing identity. It can
@@ -141,14 +141,17 @@ func (r *Router) handleFlood(pkt Packet, incomingPeer *NodeID) []Action {
 	// Deliver locally?
 	if pkt.IsBroadcast() || pkt.Destination == r.LocalID {
 		actions = append(actions, Action{Type: ActionDeliverLocal, Packet: pkt})
-		// ACK for unicast DATA
-		if pkt.Type == PacketTypeData && !pkt.IsBroadcast() {
+		// ACK for unicast DATA. TRACE has its own request/response exchange.
+		if pkt.Type == PacketTypeData && !pkt.IsBroadcast() && !isTracePayload(pkt.PayloadType) {
 			actions = append(actions, r.buildAck(pkt))
 		}
 	}
 
 	// Relay?
 	if pkt.TTL > 1 && (pkt.IsBroadcast() || pkt.Destination != r.LocalID) {
+		if isTracePayload(pkt.PayloadType) {
+			return actions
+		}
 		relayPkt := pkt
 		relayPkt.TTL--
 		hop := Action{Type: ActionRelayFlood, Packet: relayPkt}
@@ -160,6 +163,10 @@ func (r *Router) handleFlood(pkt Packet, incomingPeer *NodeID) []Action {
 	}
 
 	return actions
+}
+
+func isTracePayload(pt PayloadType) bool {
+	return pt == PayloadTypeTraceRequest || pt == PayloadTypeTraceResponse
 }
 
 func (r *Router) handleSourceRoute(pkt Packet, incomingPeer *NodeID) []Action {
@@ -188,7 +195,7 @@ func (r *Router) handleSourceRoute(pkt Packet, incomingPeer *NodeID) []Action {
 	if int(pkt.RouteCursor) >= len(pkt.Route) {
 		// We are the destination
 		actions := []Action{{Type: ActionDeliverLocal, Packet: pkt}}
-		if pkt.Type == PacketTypeData {
+		if pkt.Type == PacketTypeData && !isTracePayload(pkt.PayloadType) {
 			actions = append(actions, r.buildAck(pkt))
 		}
 		return actions
@@ -250,10 +257,10 @@ func (r *Router) BuildAnnounce(caps Capabilities, seq uint32) (Packet, error) {
 	ts := time.Now().Unix()
 	sig := r.Identity.SignAnnounce(uint32(ts), caps, seq, neighbors)
 	ap := AnnouncePayload{
-		NodeID:    r.LocalID,
-		Caps:      caps,
-		Neighbors: neighbors,
-		Seq:       seq,
+		NodeID:      r.LocalID,
+		Caps:        caps,
+		Neighbors:   neighbors,
+		Seq:         seq,
 		Timestamp:   ts,
 		PublicKey:   r.Identity.Pub,
 		Signature:   sig,

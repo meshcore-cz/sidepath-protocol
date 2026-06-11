@@ -112,15 +112,17 @@ class Router(val identity: Identity) {
 
         if (withTrace.isBroadcast() || withTrace.destination.toHexString() == localHex) {
             actions += Action(ActionType.DELIVER_LOCAL, packet = withTrace)
-            if (withTrace.type == PacketType.DATA && !withTrace.isBroadcast()) {
+            if (withTrace.type == PacketType.DATA && !withTrace.isBroadcast() && !withTrace.payloadType.isTracePayload()) {
                 actions += buildAck(withTrace)
             }
         }
 
         val ttlInt = pkt.ttl.toInt() and 0xFF
         if (ttlInt > 1 && (withTrace.isBroadcast() || withTrace.destination.toHexString() != localHex)) {
-            val relayPkt = withTrace.copy(ttl = (ttlInt - 1).toByte())
-            actions += Action(ActionType.RELAY_FLOOD, packet = relayPkt, nextHop = incomingPeer)
+            if (!withTrace.payloadType.isTracePayload()) {
+                val relayPkt = withTrace.copy(ttl = (ttlInt - 1).toByte())
+                actions += Action(ActionType.RELAY_FLOOD, packet = relayPkt, nextHop = incomingPeer)
+            }
         }
 
         return actions
@@ -154,7 +156,7 @@ class Router(val identity: Identity) {
         if (newCursor >= updated.route.size) {
             // We are the final destination
             val actions = mutableListOf(Action(ActionType.DELIVER_LOCAL, packet = updated))
-            if (updated.type == PacketType.DATA) {
+            if (updated.type == PacketType.DATA && !updated.payloadType.isTracePayload()) {
                 actions += buildAck(updated)
             }
             return actions
@@ -269,4 +271,7 @@ class Router(val identity: Identity) {
 
     /** Returns a random relay jitter delay between 10ms and 100ms. */
     fun floodJitterMs(): Long = (10L + Random.nextLong(90L))
+
+    private fun PayloadType.isTracePayload(): Boolean =
+        this == PayloadType.TRACE_REQUEST || this == PayloadType.TRACE_RESPONSE
 }

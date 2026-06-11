@@ -24,9 +24,9 @@ import (
 )
 
 var (
-	serviceUUID  = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A001")
-	nodeInfoUUID = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A002")
-	packetInUUID = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A003")
+	serviceUUID   = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A001")
+	nodeInfoUUID  = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A002")
+	packetInUUID  = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A003")
 	packetOutUUID = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A004")
 )
 
@@ -36,16 +36,18 @@ type Node struct {
 	identity    *core.Identity
 	description string
 	caps        core.Capabilities
-	router    *core.Router
-	reassem   *core.Reassembler
-	allowlist map[core.NodeID]bool
-	verbose   bool
+	router      *core.Router
+	reassem     *core.Reassembler
+	allowlist   map[core.NodeID]bool
+	verbose     bool
 
-	mu        sync.Mutex
+	mu sync.Mutex
 	// peer addr string → link
-	peers     map[string]*MacPeerLink
+	peers map[string]*MacPeerLink
 	// notifiers for PACKET_OUT (server-side subscribers)
 	notifiers map[string]ble.Notifier
+	// server-side peer addr string → learned NodeID
+	serverPeerIDs map[string]core.NodeID
 
 	// joined channels keyed by lowercase PSK hex (see channels.go)
 	channels map[string]*Channel
@@ -65,8 +67,8 @@ type Config struct {
 	Verbose          bool
 	LogFn            func(string)
 	OnMessage        func(from core.NodeID, ptype core.PayloadType, payload []byte) // called for received DATA packets
-	OnPeerConnect    func(id core.NodeID)                   // called when outgoing peer connects
-	OnPeerDisconnect func(id core.NodeID)                   // called when peer disconnects
+	OnPeerConnect    func(id core.NodeID)                                           // called when outgoing peer connects
+	OnPeerDisconnect func(id core.NodeID)                                           // called when peer disconnects
 }
 
 // New creates a Node. Call Run to start it.
@@ -78,18 +80,19 @@ func New(cfg Config) *Node {
 	router := core.NewRouterForIdentity(cfg.Identity)
 	router.Description = description
 	n := &Node{
-		nodeID:      cfg.Identity.NodeID(),
-		identity:    cfg.Identity,
-		description: description,
-		caps:        cfg.Caps,
-		router:      router,
-		reassem:     core.NewReassembler(),
-		allowlist: make(map[core.NodeID]bool),
-		verbose:   cfg.Verbose,
-		peers:     make(map[string]*MacPeerLink),
-		notifiers: make(map[string]ble.Notifier),
-		channels:  make(map[string]*Channel),
-		logFn:     cfg.LogFn,
+		nodeID:        cfg.Identity.NodeID(),
+		identity:      cfg.Identity,
+		description:   description,
+		caps:          cfg.Caps,
+		router:        router,
+		reassem:       core.NewReassembler(),
+		allowlist:     make(map[core.NodeID]bool),
+		verbose:       cfg.Verbose,
+		peers:         make(map[string]*MacPeerLink),
+		notifiers:     make(map[string]ble.Notifier),
+		serverPeerIDs: make(map[string]core.NodeID),
+		channels:      make(map[string]*Channel),
+		logFn:         cfg.LogFn,
 	}
 	n.JoinPublicChannel() // MeshCore's default Public channel, like the Android app
 	if n.logFn == nil {
@@ -163,7 +166,7 @@ func (n *Node) buildGATTService() *ble.Service {
 	// PACKET_IN — writable (write without response)
 	piChar := ble.NewCharacteristic(packetInUUID)
 	piChar.HandleWrite(ble.WriteHandlerFunc(func(req ble.Request, rsp ble.ResponseWriter) {
-		n.handleIncomingFrame(req.Data(), nil)
+		n.handleIncomingFrame(req.Data(), nil, req.Conn().RemoteAddr().String())
 	}))
 	svc.AddCharacteristic(piChar)
 
@@ -178,6 +181,7 @@ func (n *Node) buildGATTService() *ble.Service {
 		<-notifier.Context().Done()
 		n.mu.Lock()
 		delete(n.notifiers, addr)
+		delete(n.serverPeerIDs, addr)
 		n.mu.Unlock()
 		n.logf("server: peer %s unsubscribed from PACKET_OUT", addr)
 	}))
@@ -316,14 +320,14 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 	n.logf("connected peer=%s mtu=%d tx-phy=1M rx-phy=1M", peerID, mtu)
 
 	link := &MacPeerLink{
-		peerID:  peerID,
-		addr:    addr,
-		cln:     cln,
-		piChar:  packetInChar,
-		mtu:     mtu,
-		txPHY:   core.PHY1M,
-		rxPHY:   core.PHY1M,
-		rssi:    adv.RSSI(),
+		peerID: peerID,
+		addr:   addr,
+		cln:    cln,
+		piChar: packetInChar,
+		mtu:    mtu,
+		txPHY:  core.PHY1M,
+		rxPHY:  core.PHY1M,
+		rssi:   adv.RSSI(),
 	}
 
 	n.mu.Lock()
@@ -346,7 +350,7 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 	// Subscribe to PACKET_OUT
 	if packetOutChar != nil {
 		cln.Subscribe(packetOutChar, false, func(data []byte) {
-			n.handleIncomingFrame(data, &peerID)
+			n.handleIncomingFrame(data, &peerID, "")
 		})
 	}
 
@@ -363,7 +367,7 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 }
 
 // handleIncomingFrame receives a raw GATT frame, reassembles, decodes and routes.
-func (n *Node) handleIncomingFrame(raw []byte, fromPeer *core.NodeID) {
+func (n *Node) handleIncomingFrame(raw []byte, fromPeer *core.NodeID, fromAddr string) {
 	frame, err := core.DecodeFrame(raw)
 	if err != nil {
 		n.logf("decode frame error: %v", err)
@@ -383,6 +387,7 @@ func (n *Node) handleIncomingFrame(raw []byte, fromPeer *core.NodeID) {
 		n.logf("decode packet error: %v", err)
 		return
 	}
+	n.recordTraceMetric(&pkt, fromPeer)
 
 	srcHex := pkt.Source.String()[:8]
 	n.logf("rx packet id=%s source=%s ttl=%d trace=%v",
@@ -391,7 +396,7 @@ func (n *Node) handleIncomingFrame(raw []byte, fromPeer *core.NodeID) {
 	// Learn the directly-connected neighbor (last trace hop, or source if fresh) so
 	// the neighbor table — and our ANNOUNCE — stay populated even when all peers
 	// connected inbound to us.
-	n.learnNeighbor(pkt)
+	n.learnNeighbor(pkt, fromAddr)
 
 	actions := n.router.HandlePacket(pkt, fromPeer)
 	// In verbose mode, dump the full packet as JSON the first time we see it (the router
@@ -437,6 +442,7 @@ func (n *Node) logPacketJSON(pkt core.Packet, raw []byte, fromPeer *core.NodeID)
 		"routeCursor": pkt.RouteCursor,
 		"route":       nodeIDs(pkt.Route),
 		"trace":       nodeIDs(pkt.Trace),
+		"traceMetric": pkt.TraceMetric,
 		"payloadType": uint8(pkt.PayloadType),
 		"payloadLen":  len(pkt.Payload),
 		"payloadHex":  hex.EncodeToString(pkt.Payload),
@@ -450,7 +456,7 @@ func (n *Node) logPacketJSON(pkt core.Packet, raw []byte, fromPeer *core.NodeID)
 	n.logf("%s", b)
 }
 
-func (n *Node) learnNeighbor(pkt core.Packet) {
+func (n *Node) learnNeighbor(pkt core.Packet, fromAddr string) {
 	var nb core.NodeID
 	if len(pkt.Trace) > 0 {
 		nb = pkt.Trace[len(pkt.Trace)-1]
@@ -461,11 +467,85 @@ func (n *Node) learnNeighbor(pkt core.Packet) {
 	if nb == n.nodeID || nb == zero {
 		return
 	}
+	if fromAddr != "" {
+		n.mu.Lock()
+		if _, ok := n.notifiers[fromAddr]; ok {
+			n.serverPeerIDs[fromAddr] = nb
+		}
+		n.mu.Unlock()
+	}
 	if _, ok := n.router.Neighbors.Get(nb); ok {
 		n.router.Neighbors.Touch(nb)
 	} else {
 		n.router.Neighbors.Upsert(core.Neighbor{ID: nb, Direction: core.DirectionIncoming})
 	}
+}
+
+func (n *Node) isReachablePeer(id core.NodeID) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, link := range n.peers {
+		if link.peerID == id {
+			return true
+		}
+	}
+	for _, peerID := range n.serverPeerIDs {
+		if peerID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (n *Node) selectTraceRoute(dst core.NodeID) ([]core.NodeID, bool) {
+	if n.isReachablePeer(dst) {
+		return []core.NodeID{dst}, true
+	}
+	path := n.router.Topology.BFSPath(n.nodeID, dst)
+	if len(path) == 0 {
+		return nil, false
+	}
+	if !n.isReachablePeer(path[0]) {
+		return nil, false
+	}
+	return path, true
+}
+
+func (n *Node) recordTraceMetric(pkt *core.Packet, fromPeer *core.NodeID) {
+	if pkt.Type != core.PacketTypeData {
+		return
+	}
+	if pkt.PayloadType != core.PayloadTypeTraceRequest && pkt.PayloadType != core.PayloadTypeTraceResponse {
+		return
+	}
+	pkt.TraceMetric = append(pkt.TraceMetric, int8(clampRSSI(n.rssiForPeer(fromPeer))))
+}
+
+func (n *Node) rssiForPeer(id *core.NodeID) int {
+	if id == nil {
+		return 0
+	}
+	if nb, ok := n.router.Neighbors.Get(*id); ok && nb.RSSI != 0 {
+		return nb.RSSI
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, link := range n.peers {
+		if link.peerID == *id {
+			return link.rssi
+		}
+	}
+	return 0
+}
+
+func clampRSSI(v int) int {
+	if v < -128 {
+		return -128
+	}
+	if v > 127 {
+		return 127
+	}
+	return v
 }
 
 func (n *Node) executeActions(actions []core.Action) {
@@ -496,11 +576,79 @@ func (n *Node) deliverLocal(pkt core.Packet) {
 	if pkt.Type == core.PacketTypeAnnounce {
 		return // topology update, not user data
 	}
+	if pkt.PayloadType == core.PayloadTypeTraceRequest {
+		if err := n.returnTrace(pkt); err != nil {
+			n.logf("trace response error: %v", err)
+		}
+		return
+	}
+	if pkt.PayloadType == core.PayloadTypeTraceResponse {
+		if result, err := core.DecodeTraceResult(pkt.Payload); err == nil {
+			result.ReturnNodes = append([]core.NodeID(nil), pkt.Trace...)
+			result.ReturnSamples = append([]int8(nil), pkt.TraceMetric...)
+			if payload, err := result.Encode(); err == nil {
+				pkt.Payload = payload
+			}
+		}
+	}
 	n.logf("deliver payload-type=%d payload=%q trace=%v",
 		pkt.PayloadType, string(pkt.Payload), nodeIDs(pkt.Trace))
 	if n.onMessage != nil {
 		n.onMessage(pkt.Source, pkt.PayloadType, pkt.Payload)
 	}
+}
+
+func (n *Node) returnTrace(req core.Packet) error {
+	tp, err := core.DecodeTracePayload(req.Payload)
+	if err != nil {
+		return err
+	}
+	result := core.TraceResult{
+		Tag:            tp.Tag,
+		AuthCode:       tp.AuthCode,
+		Route:          append([]core.NodeID(nil), req.Route...),
+		ForwardNodes:   append([]core.NodeID(nil), req.Trace...),
+		ForwardSamples: append([]int8(nil), req.TraceMetric...),
+		Metric:         core.TraceMetricRSSI,
+	}
+	payload, err := result.Encode()
+	if err != nil {
+		return err
+	}
+	route := reverseTraceRoute(req.Trace, req.Source)
+	pkt := core.Packet{
+		Version:     core.ProtocolVersion,
+		Type:        core.PacketTypeData,
+		ID:          core.NewPacketID(),
+		Source:      n.nodeID,
+		Destination: req.Source,
+		Mode:        core.RoutingModeSourceRoute,
+		TTL:         uint8(len(route) + 1),
+		Route:       route,
+		PayloadType: core.PayloadTypeTraceResponse,
+		Payload:     payload,
+	}
+	if len(route) == 0 {
+		pkt.Mode = core.RoutingModeFlood
+		pkt.TTL = 3
+	}
+	n.router.MarkOriginated(pkt.ID)
+	return n.transmitToRoute(pkt)
+}
+
+func reverseTraceRoute(trace []core.NodeID, dst core.NodeID) []core.NodeID {
+	if len(trace) == 0 {
+		return []core.NodeID{dst}
+	}
+	hops := trace[:len(trace)-1]
+	route := make([]core.NodeID, len(hops), len(hops)+1)
+	for i, hop := range hops {
+		route[len(hops)-1-i] = hop
+	}
+	if len(route) == 0 || route[len(route)-1] != dst {
+		route = append(route, dst)
+	}
+	return route
 }
 
 func (n *Node) relayFlood(a core.Action) {
@@ -537,17 +685,9 @@ func (n *Node) relayNextHop(a core.Action) {
 		return
 	}
 	frames := core.FragmentPacket(data, core.MaxFrameSize, a.Packet.ID)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for _, link := range n.peers {
-		if link.peerID == *a.NextHop {
-			for _, f := range frames {
-				_ = link.sendFrame(f.Encode())
-			}
-			return
-		}
+	if n.sendFramesToPeer(frames, *a.NextHop) {
+		return
 	}
-	// Check notifiers (server-side connections where we don't know peer addr yet)
 	n.logf("relay-next-hop: peer %s not connected", *a.NextHop)
 }
 
@@ -638,6 +778,57 @@ func (n *Node) SendChat(dst core.NodeID, text string) error {
 	return n.SendChatTo(dst, pub, text)
 }
 
+// RouteTo returns the currently selected source route to dst. A nil route with
+// ok=true means dst is a direct neighbor; ok=false means no known route.
+func (n *Node) RouteTo(dst core.NodeID) ([]core.NodeID, bool) {
+	return n.selectTraceRoute(dst)
+}
+
+// SendTrace sends a trace request to dst. If route is empty, the current topology
+// is used to select a direct/source route. Trace never falls back to flood:
+// only repeaters on the selected track may relay it.
+func (n *Node) SendTrace(dst core.NodeID, route []core.NodeID) (uint32, error) {
+	tag := core.RandomUint32()
+	if len(route) == 0 {
+		if selected, ok := n.selectTraceRoute(dst); ok {
+			route = selected
+		}
+		if len(route) == 0 {
+			return 0, fmt.Errorf("no route known to %s", dst)
+		}
+	} else if route[len(route)-1] != dst {
+		route = append(append([]core.NodeID(nil), route...), dst)
+	}
+	flags, err := core.TraceFlagsForHashWidth(core.TraceHashWidth8)
+	if err != nil {
+		return 0, err
+	}
+	routeData, err := core.TraceRouteData(route, core.TraceHashWidth8)
+	if err != nil {
+		return 0, err
+	}
+	payload := core.EncodeTracePayload(core.TracePayload{
+		Tag:       tag,
+		AuthCode:  0,
+		Flags:     flags,
+		RouteData: routeData,
+	})
+	pkt := core.Packet{
+		Version:     core.ProtocolVersion,
+		Type:        core.PacketTypeData,
+		ID:          core.NewPacketID(),
+		Source:      n.nodeID,
+		Destination: dst,
+		TTL:         uint8(len(route) + 2),
+		PayloadType: core.PayloadTypeTraceRequest,
+		Payload:     payload,
+	}
+	pkt.Mode = core.RoutingModeSourceRoute
+	pkt.Route = route
+	n.router.MarkOriginated(pkt.ID)
+	return tag, n.transmitToRoute(pkt)
+}
+
 // PublicKeyFor returns a node's 32-byte Ed25519 public key from the topology, or nil.
 func (n *Node) PublicKeyFor(id core.NodeID) []byte {
 	return n.router.PublicKeyFor(id)
@@ -669,6 +860,10 @@ func (n *Node) sendData(dst core.NodeID, ptype core.PayloadType, payload []byte,
 	}
 	// Record our own packet so a flood echo doesn't get re-flooded back out.
 	n.router.MarkOriginated(pkt.ID)
+	return n.transmit(pkt)
+}
+
+func (n *Node) transmit(pkt core.Packet) error {
 	data, err := pkt.Encode()
 	if err != nil {
 		return err
@@ -688,6 +883,49 @@ func (n *Node) sendData(dst core.NodeID, ptype core.PayloadType, payload []byte,
 		}
 	}
 	return nil
+}
+
+func (n *Node) transmitToRoute(pkt core.Packet) error {
+	if len(pkt.Route) == 0 {
+		return fmt.Errorf("source route is empty")
+	}
+	data, err := pkt.Encode()
+	if err != nil {
+		return err
+	}
+	frames := core.FragmentPacket(data, core.MaxFrameSize, pkt.ID)
+	firstHop := pkt.Route[0]
+	if n.sendFramesToPeer(frames, firstHop) {
+		return nil
+	}
+	return fmt.Errorf("first hop %s not connected", firstHop)
+}
+
+func (n *Node) sendFramesToPeer(frames []core.Frame, peer core.NodeID) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, link := range n.peers {
+		if link.peerID == peer {
+			for _, f := range frames {
+				_ = link.sendFrame(f.Encode())
+			}
+			return true
+		}
+	}
+	for addr, peerID := range n.serverPeerIDs {
+		if peerID != peer {
+			continue
+		}
+		notifier, ok := n.notifiers[addr]
+		if !ok {
+			continue
+		}
+		for _, f := range frames {
+			notifier.Write(f.Encode())
+		}
+		return true
+	}
+	return false
 }
 
 // Neighbors returns the current neighbor table entries.

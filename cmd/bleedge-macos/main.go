@@ -7,7 +7,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -122,13 +121,6 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		}
 	}
 
-	// logFn writes to stderr so it doesn't pollute the interactive stdout
-	logFn := func(msg string) {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "%s  %s\n", time.Now().Format("15:04:05"), msg)
-		}
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -136,13 +128,37 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	// print them interactively, decrypting encrypted DMs with our identity.
 	var theBot *bot
 	var node *blenode.Node
+	uiEvents := make(chan uiEvent, 128)
+	emitUI := func(line string) {
+		select {
+		case uiEvents <- uiEvent{line: line}:
+		default:
+		}
+	}
+	emitLog := func(line string) {
+		select {
+		case uiEvents <- uiEvent{line: line, kind: uiEventLog}:
+		default:
+		}
+	}
+	logFn := func(msg string) {
+		if !verbose {
+			return
+		}
+		line := fmt.Sprintf("%s  %s", time.Now().Format("15:04:05"), msg)
+		if botScript != "" {
+			fmt.Fprintln(os.Stderr, line)
+			return
+		}
+		emitLog(line)
+	}
 	node = blenode.New(blenode.Config{
 		Identity:    identity,
 		Description: description,
 		Caps:        core.Capabilities(uint8(core.CapSender) | uint8(core.CapReceiver) | uint8(core.CapRelay)),
-		Allowlist: allowlist,
-		Verbose:   verbose,
-		LogFn:     logFn,
+		Allowlist:   allowlist,
+		Verbose:     verbose,
+		LogFn:       logFn,
 		OnMessage: func(from core.NodeID, ptype core.PayloadType, payload []byte) {
 			if theBot != nil {
 				theBot.onIncoming(from, ptype, payload)
@@ -151,19 +167,19 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 			ts := time.Now().Format("15:04:05")
 			if ptype == core.PayloadTypeChannel {
 				if in, ok := node.DecodeChannel(payload); ok {
-					fmt.Printf("\n[%s] #%s %s: %s\n> ", ts, in.Channel, in.Sender, in.Text)
+					emitUI(fmt.Sprintf("[%s] #%s %s: %s", ts, in.Channel, in.Sender, in.Text))
 				}
 				return
 			}
-			fmt.Printf("\n[%s] MSG from %s: %s\n> ", ts, from, renderIncoming(ptype, payload, identity))
+			emitUI(fmt.Sprintf("[%s] MSG from %s: %s", ts, from, renderIncoming(ptype, payload, identity)))
 		},
 		OnPeerConnect: func(id core.NodeID) {
 			ts := time.Now().Format("15:04:05")
-			fmt.Printf("\n[%s] +++ connected: %s\n> ", ts, id)
+			emitUI(fmt.Sprintf("[%s] +++ connected: %s", ts, id))
 		},
 		OnPeerDisconnect: func(id core.NodeID) {
 			ts := time.Now().Format("15:04:05")
-			fmt.Printf("\n[%s] --- disconnected: %s\n> ", ts, id)
+			emitUI(fmt.Sprintf("[%s] --- disconnected: %s", ts, id))
 		},
 	})
 
@@ -191,142 +207,12 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		return
 	}
 
-	// Banner
-	fmt.Printf("BLEEdge macOS  node=%s  phy=1m\n", identity.NodeID())
-	fmt.Println("Advertising and scanning... type a message and press Enter to send it to the current channel.")
-	fmt.Println("Commands: /dm <id> <text>  /join <name>|public  /channels  /peers  /neighbors  /topology  /quit")
-	fmt.Println()
-
 	// Plain lines are sent to the current channel; defaults to MeshCore's Public channel.
 	current := node.JoinPublicChannel()
-
-	// Interactive loop
-	scanner := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Print("> ")
-
-		// Check if node exited
-		select {
-		case err := <-errCh:
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "node error: %v\n", err)
-			}
-			return
-		default:
-		}
-
-		if !scanner.Scan() {
-			cancel()
-			break
-		}
-
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		switch line {
-		case "/quit", "/q", "/exit":
-			cancel()
-			<-errCh
-			return
-
-		case "/peers", "/p":
-			peers := node.ConnectedPeers()
-			if len(peers) == 0 {
-				fmt.Println("  (no peers connected)")
-			} else {
-				for _, p := range peers {
-					fmt.Printf("  peer: %s  %s\n", p, descLabel(node.DescriptionFor(p)))
-				}
-			}
-
-		case "/neighbors", "/n":
-			nbs := node.Neighbors()
-			if len(nbs) == 0 {
-				fmt.Println("  (no neighbors)")
-			} else {
-				for _, nb := range nbs {
-					fmt.Printf("  neighbor: %s  %s  rssi=%d  tx=%s  rx=%s\n",
-						nb.ID, descLabel(node.DescriptionFor(nb.ID)), nb.RSSI, nb.TxPHY, nb.RxPHY)
-				}
-			}
-
-		case "/topology", "/t":
-			nodes := node.Topology()
-			if len(nodes) == 0 {
-				fmt.Println("  (no topology data)")
-			} else {
-				for _, tn := range nodes {
-					nbs := make([]string, len(tn.Neighbors))
-					for i, id := range tn.Neighbors {
-						s := id.String()
-						if len(s) > 8 {
-							s = s[:8] + "…"
-						}
-						nbs[i] = s
-					}
-					fmt.Printf("  node: %s  %s  caps=%s  last-announce=%s  neighbors=[%s]\n",
-						tn.ID, descLabel(tn.Description), tn.Caps, relativeTime(tn.LastSeen), strings.Join(nbs, " "))
-				}
-			}
-
-		case "/channels", "/c":
-			for _, ch := range node.Channels() {
-				marker := "  "
-				if string(ch.Secret) == string(current.Secret) {
-					marker = "* "
-				}
-				fmt.Printf("  %s#%s  hash=0x%02x\n", marker, ch.Name, ch.Hash)
-			}
-
-		default:
-			if strings.HasPrefix(line, "/join ") {
-				name := strings.TrimSpace(strings.TrimPrefix(line, "/join "))
-				if name == "" {
-					fmt.Println("  usage: /join <name>  (use 'public' for the Public channel)")
-					continue
-				}
-				if strings.EqualFold(name, "public") {
-					current = node.JoinPublicChannel()
-				} else {
-					current = node.JoinNamedChannel(name)
-				}
-				fmt.Printf("  joined #%s (hash=0x%02x) — now the current channel\n", current.Name, current.Hash)
-				continue
-			}
-			if strings.HasPrefix(line, "/dm ") {
-				rest := strings.TrimSpace(strings.TrimPrefix(line, "/dm "))
-				parts := strings.SplitN(rest, " ", 2)
-				if len(parts) < 2 {
-					fmt.Println("  usage: /dm <nodeid> <message>")
-					continue
-				}
-				id, err := core.ParseNodeID(parts[0])
-				if err != nil {
-					fmt.Printf("  bad node id: %v\n", err)
-					continue
-				}
-				if err := node.SendChat(id, parts[1]); err != nil {
-					fmt.Printf("  dm error: %v\n", err)
-				} else {
-					fmt.Printf("  dm sent to %s\n", id)
-				}
-				continue
-			}
-			if strings.HasPrefix(line, "/") {
-				fmt.Println("  unknown command. try /dm /join /channels /peers /neighbors /topology /quit")
-				continue
-			}
-			if err := node.SendToChannel(current.Secret, line); err != nil {
-				fmt.Printf("  send error: %v\n", err)
-			} else {
-				fmt.Printf("  sent to #%s: %s\n", current.Name, line)
-			}
-		}
+	if err := runTUI(ctx, cancel, errCh, uiEvents, node, identity, current); err != nil {
+		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
+		cancel()
 	}
-
-	<-ctx.Done()
 }
 
 // parseChannelList splits a comma-separated channel list, trimming blanks and
@@ -358,9 +244,89 @@ func renderIncoming(ptype core.PayloadType, payload []byte, id *core.Identity) s
 			return text
 		}
 		return "[encrypted — not for me]"
+	case core.PayloadTypeTraceResponse:
+		result, err := core.DecodeTraceResult(payload)
+		if err != nil {
+			return fmt.Sprintf("[bad trace result: %v]", err)
+		}
+		return renderTraceResult(result)
 	default:
 		return string(payload)
 	}
+}
+
+func parseTraceCommand(s string) (core.NodeID, []core.NodeID, error) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return core.NodeID{}, nil, fmt.Errorf("missing destination")
+	}
+	dst, err := core.ParseNodeID(fields[0])
+	if err != nil {
+		return core.NodeID{}, nil, err
+	}
+	if len(fields) == 1 {
+		return dst, nil, nil
+	}
+	if fields[1] != "via" {
+		return core.NodeID{}, nil, fmt.Errorf("expected via")
+	}
+	route := make([]core.NodeID, 0, len(fields)-1)
+	for _, f := range fields[2:] {
+		hop, err := core.ParseNodeID(f)
+		if err != nil {
+			return core.NodeID{}, nil, err
+		}
+		route = append(route, hop)
+	}
+	if len(route) == 0 || route[len(route)-1] != dst {
+		route = append(route, dst)
+	}
+	return dst, route, nil
+}
+
+func formatRoute(route []core.NodeID) string {
+	parts := make([]string, len(route))
+	for i, id := range route {
+		parts[i] = id.String()
+	}
+	return strings.Join(parts, " -> ")
+}
+
+func renderTraceResult(r core.TraceResult) string {
+	metric := r.Metric
+	if metric == "" {
+		metric = core.TraceMetricUnknown
+	}
+	return fmt.Sprintf("TRACE tag=%08x metric=%s forward=[%s] return=[%s]",
+		r.Tag, metric, formatTraceSamples(r.ForwardNodes, r.ForwardSamples), formatTraceSamples(r.ReturnNodes, r.ReturnSamples))
+}
+
+func formatTraceSamples(nodes []core.NodeID, samples []int8) string {
+	n := len(nodes)
+	if len(samples) > n {
+		n = len(samples)
+	}
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		node := "?"
+		if i < len(nodes) {
+			node = idShort(nodes[i])
+		}
+		if i < len(samples) {
+			parts = append(parts, fmt.Sprintf("%s:%d", node, samples[i]))
+		} else {
+			parts = append(parts, node+":?")
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func idShort(id core.NodeID) string {
+	s := id.String()
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }
 
 // descLabel renders a node description as "[desc]", or "[?]" when unknown.

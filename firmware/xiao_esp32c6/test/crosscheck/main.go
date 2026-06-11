@@ -101,6 +101,23 @@ func main() {
 	parsedD, _ := runFwd(encD)
 	check("D: loop detected (self in trace)", strings.Contains(parsedD, "loop=1"))
 
+	carol := core.NodeID{0xCA, 0, 0, 0, 0, 0, 0, 0x03}
+	traceRoute := []core.NodeID{self, carol}
+	routeData, _ := core.TraceRouteData(traceRoute, core.TraceHashWidth8)
+	tracePayload := core.EncodeTracePayload(core.TracePayload{Tag: 1, Flags: 3, RouteData: routeData})
+	pktE := core.Packet{Version: core.ProtocolVersion, Type: core.PacketTypeData, ID: core.NewPacketID(),
+		Source: pktB.Source, Destination: carol, Mode: core.RoutingModeSourceRoute, TTL: 4,
+		Route: traceRoute, PayloadType: core.PayloadTypeTraceRequest, Payload: tracePayload}
+	encE, _ := pktE.Encode()
+	outE, errE := exec.Command(bin, "--trace-fwd", hex.EncodeToString(encE), hex.EncodeToString(self[:])).Output()
+	check("E: trace source-route helper runs", errE == nil)
+	fwdE, _ := hex.DecodeString(strings.TrimSpace(string(outE)))
+	gotE, errE2 := core.DecodePacket(fwdE)
+	check("E: trace source-route decodes", errE2 == nil)
+	check("E: ttl 4->3 cursor 0->1", gotE.TTL == 3 && gotE.RouteCursor == 1)
+	check("E: trace=[self]", len(gotE.Trace) == 1 && gotE.Trace[0] == self)
+	check("E: trace metric appended", len(gotE.TraceMetric) == 1 && gotE.TraceMetric[0] == 0)
+
 	// ---- CRC32 ------------------------------------------------------------
 	for _, s := range []string{"", "00", "74657374", "deadbeefcafe0011223344556677"} {
 		d, _ := hex.DecodeString(s)

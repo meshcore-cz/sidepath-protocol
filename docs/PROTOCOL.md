@@ -183,9 +183,10 @@ cross-language compactness. Field order is irrelevant; keys are authoritative.
 | 8 | `route_cursor` | uint8 | index into `route` (source-route) |
 | 9 | `route` | array of 8-byte | ordered next-hops (source-route) |
 | 10 | `trace` | array of 8-byte | hops visited so far (appended per hop) |
-| 11 | `payload_type` | uint8 | 1=TEXT_TEST, 2=MESHCORE_RAW, 3=CHAT_PLAIN, 4=CHAT_ENCRYPTED, 5=CHANNEL |
+| 11 | `payload_type` | uint8 | 1=TEXT_TEST, 2=MESHCORE_RAW, 3=CHAT_PLAIN, 4=CHAT_ENCRYPTED, 5=CHANNEL, 6=TRACE_REQ, 7=TRACE_RESP |
 | 12 | `payload` | bytes | opaque |
 | 13 | `seq` | uint32 | ANNOUNCE sequence; omitted when 0 |
+| 14 | `trace_metric` | array of int8 | optional TRACE link samples; metric meaning is payload-specific |
 
 > Note: the GATT frame `packet_id` (16 bytes) is the same value as packet key 3.
 
@@ -227,8 +228,8 @@ neighbors       [neighbor_count * 8]   each NodeID, in ANNOUNCE order
 A receiver **must**, before trusting an ANNOUNCE: check `public_key` is 32 bytes,
 check `node_id == public_key[:8]` and `packet.source == public_key[:8]`, then
 verify the signature. Any failure → drop as `bad-signature` and **do not relay**.
-(The ESP32 flood-only relay forwards opaque packets without verifying; verifying
-endpoints reject forgeries.)
+(The ESP32 relay forwards opaque flood packets and on-track TRACE source-route
+packets without verifying; verifying endpoints reject forgeries.)
 
 ### 4.2 Capabilities bitmask
 
@@ -271,6 +272,13 @@ mesh treats both as opaque `payload` and routes them like any other DATA packet
   envelope) and its own private key. The sender's public key is learned from the
   recipient's signed ANNOUNCE (key 6).
 
+  ESP32 relay nodes also consume encrypted direct messages addressed to their own
+  NodeID as remote-control commands. The command sender is authenticated by the
+  envelope's `sender_pub`: it must match a build-time or NVS-stored admin public
+  key, otherwise the node replies with `not authenticated`. Commands are firmware
+  local behavior (`help`, `sensors`, `stats`, `admins`, `admin.add`, `admin.remove`)
+  and are not interpreted by the routing layer.
+
 ### 4.4 Channels — MeshCore-compatible (`CHANNEL`, payload_type 5)
 
 Group channels mirror MeshCore (`meshcore-cz/meshpkt`) so they can interoperate. A
@@ -295,6 +303,53 @@ PSK derivation by channel kind:
 A receiver matches an inbound packet to a joined channel by `channelHash`, then confirms
 with the MAC (the hash is 1 byte, so collisions are resolved by which PSK's MAC verifies).
 Reference impls: Kotlin `core.ChannelCrypto` and Go `core.SealChannel`/`OpenChannel` (byte-identical). Broadcast → no per-message ACK.
+
+### 4.5 Trace (`TRACE_REQ` payload_type 6, `TRACE_RESP` payload_type 7)
+
+Trace is a diagnostic round trip similar to `ping`/`traceroute`: the originator
+chooses a destination and optionally a specific source route. The request follows
+that path, each receiver records a link metric, and the destination sends a
+`TRACE_RESP` back along the reversed observed path.
+
+`TRACE_REQ` intentionally starts with the MeshCore TRACE payload layout so the
+diagnostic body can be made radio-compatible later:
+
+```
+payload = tag[4 LE] | auth_code[4 LE] | flags[1] | route_hashes[...]
+```
+
+- `tag` is a random request identifier echoed by the response.
+- `auth_code` is opaque and forwarded/echoed; current BLEEdge does not validate
+  it cryptographically.
+- `flags & 0x03` selects each `route_hash` width: `0=1 byte`, `1=2 bytes`,
+  `2=4 bytes`, `3=8 bytes`.
+- BLEEdge uses 8-byte NodeID route hashes (`flags & 0x03 == 3`) for exact routes.
+
+MeshCore stores TRACE SNR samples in its outer path accumulator. BLEEdge keeps
+normal route loop detection in `trace` (key 10), so TRACE link samples live in
+packet key 14, `trace_metric`. The values are signed 8-bit samples whose unit is
+declared by the result payload. On macOS/CoreBluetooth the metric is `rssi` in
+dBm because CoreBluetooth does not expose LoRa SNR; future LoRa/Coded-PHY radio
+implementations may use `snr` encoded as MeshCore-style `int8 = SNR * 4`.
+
+`TRACE_RESP` payload is a CBOR map with compact integer keys:
+
+| Key | Field | Type | Notes |
+| --- | --- | --- | --- |
+| 1 | `tag` | uint32 | copied from request |
+| 2 | `auth_code` | uint32 | copied from request |
+| 3 | `route` | array of 8-byte NodeID | requested source route |
+| 4 | `forward_nodes` | array of 8-byte NodeID | nodes that handled request |
+| 5 | `forward_samples` | array of int8 | request-leg `trace_metric` samples |
+| 6 | `return_nodes` | array of 8-byte NodeID | nodes that handled response; filled by final receiver |
+| 7 | `return_samples` | array of int8 | response-leg `trace_metric` samples; filled by final receiver |
+| 8 | `metric` | text | currently `rssi`; reserved value `snr` for SNR-capable radios |
+
+TRACE requests do not generate generic ACK packets. The trace response is the
+delivery confirmation. If no explicit route is supplied, a node first tries
+`SelectRoute(dst)` (section 5.5). If no route is known, the trace is not sent.
+TRACE packets must not be flood-relayed: only nodes on the selected source-route
+track may repeat the request or response.
 
 ---
 
@@ -321,9 +376,11 @@ given an incoming packet and the peer it arrived from, it returns a list of
 3. **TTL**: if `ttl == 0` → drop (`ttl-exhausted`).
 4. Append `LocalID` to `trace`.
 5. **Deliver locally** if broadcast or `destination == LocalID`. For a *unicast*
-   DATA packet addressed to us, also emit an ACK (section 5.5).
+   DATA packet addressed to us, also emit an ACK (section 5.4), except
+   `TRACE_REQ`, which returns a `TRACE_RESP` instead.
 6. **Relay** if `ttl > 1` and (broadcast or not addressed to us): decrement TTL
    and re-flood. The incoming peer is excluded from the relay set (split-horizon).
+   TRACE packets are never re-flooded.
 
 Apply **flood jitter** of a random 10–100 ms before relaying to reduce collisions.
 
@@ -333,11 +390,13 @@ Apply **flood jitter** of a random 10–100 ms before relaying to reduce collisi
 2. If `route[route_cursor] != LocalID` → drop (`not-next-hop`).
 3. Append self to `trace`, increment `route_cursor`, decrement `ttl`.
 4. If `route_cursor >= len(route)` we are the destination → deliver locally
-   (+ ACK for DATA). Otherwise relay to `route[route_cursor]` (`relay-next-hop`).
+   (+ ACK for DATA except `TRACE_REQ`). Otherwise relay to `route[route_cursor]`
+   (`relay-next-hop`).
 
 ### 5.4 ACK (`type == 3`)
 
-ACKs are generated automatically for **unicast DATA** that is delivered locally:
+ACKs are generated automatically for **unicast DATA** that is delivered locally,
+except `TRACE_REQ` packets:
 
 - `destination = original.source`, `ttl = len(trace)+1`.
 - If the inbound `trace` had >1 hop, the ACK is sent **SOURCE_ROUTE** along the
@@ -359,6 +418,10 @@ ACKs are generated automatically for **unicast DATA** that is delivered locally:
 - If `dst` is a direct neighbor → send direct (no source route).
 - Else BFS over learned topology for a path; if found → SOURCE_ROUTE.
 - Else → fall back to FLOOD.
+
+The macOS app exposes this as `/route <nodeid>` and uses the same selection for
+`/trace <nodeid>` when no explicit `via` route is supplied. Trace requires a
+known route; it does not use the generic flood fallback.
 
 ---
 
@@ -393,12 +456,16 @@ A new or modified implementation must:
       platform/OS by default; never sign it or trust it for routing.
 - [ ] Encode/decode the 23-byte big-endian frame header; CRC-32/IEEE over the
       full packet; fragment at `MAX_FRAME_SIZE = 200` (177 data bytes/frame).
-- [ ] CBOR-encode packets with **integer** keys 1–13 exactly as in section 4;
+- [ ] CBOR-encode packets with **integer** keys 1–14 exactly as in section 4;
       ANNOUNCE payload keys 1–7 including `public_key`(6) + `signature`(7).
 - [ ] Sign ANNOUNCE over the exact byte layout in section 4.1; on receive, verify
       the signature + `node_id==pubkey[:8]` and drop `bad-signature` on failure.
 - [ ] Drop on version mismatch (`!= 2`), duplicate `id`, loop (self in trace), TTL 0.
 - [ ] Append self to `trace` and decrement TTL on every relay.
+- [ ] For TRACE, append the current link metric to packet key 14, return
+      `TRACE_RESP` instead of a generic ACK, and preserve the MeshCore-shaped
+      `TRACE_REQ` prefix. Do not flood-relay TRACE; only source-route hops on
+      the selected track may repeat it.
 - [ ] Exclude the inbound peer when re-flooding; apply 10–100 ms jitter.
 - [ ] Emit ANNOUNCE every 15 s with TTL 3 and the correct caps bitmask.
 - [ ] Honor dedup (4096 / 5 min), neighbor (60 s), topology (90 s) lifetimes.

@@ -2,6 +2,7 @@ package core
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -12,6 +13,12 @@ func NewPacketID() PacketID {
 	var id PacketID
 	rand.Read(id[:]) //nolint:errcheck
 	return id
+}
+
+func RandomUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:]) //nolint:errcheck
+	return binary.LittleEndian.Uint32(b[:])
 }
 
 // Packet is the core mesh routing packet. CBOR keys are compact integers.
@@ -29,6 +36,7 @@ type Packet struct {
 	PayloadType PayloadType `cbor:"11,keyasint"`
 	Payload     []byte      `cbor:"12,keyasint"`
 	Seq         uint32      `cbor:"13,keyasint,omitempty"` // for ANNOUNCE
+	TraceMetric []int8      `cbor:"14,keyasint,omitempty"` // TRACE link samples; int8 is metric-specific
 }
 
 var zeroNodeID NodeID

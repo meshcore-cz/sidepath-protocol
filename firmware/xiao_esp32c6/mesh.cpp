@@ -109,6 +109,25 @@ static void emitBstr(std::vector<uint8_t>& o, const uint8_t* d, size_t n) {
   o.insert(o.end(), d, d + n);
 }
 
+static void emitInt(std::vector<uint8_t>& o, int64_t v) {
+  if (v >= 0) {
+    emitUint(o, (uint64_t)v);
+    return;
+  }
+  uint64_t n = (uint64_t)(-1 - v);
+  if (n < 24) {
+    o.push_back(0x20 | (uint8_t)n);
+  } else if (n < 0x100) {
+    o.push_back(0x38); o.push_back((uint8_t)n);
+  } else if (n < 0x10000) {
+    o.push_back(0x39); o.push_back((uint8_t)(n >> 8)); o.push_back((uint8_t)n);
+  } else {
+    o.push_back(0x3a);
+    o.push_back((uint8_t)(n >> 24)); o.push_back((uint8_t)(n >> 16));
+    o.push_back((uint8_t)(n >> 8));  o.push_back((uint8_t)n);
+  }
+}
+
 // Emits a CBOR text string (major type 3). Used for the description field so it
 // decodes into a Go `string` / Kotlin String (a byte string would not).
 static void emitTstr(std::vector<uint8_t>& o, const char* s, size_t n) {
@@ -229,10 +248,43 @@ PacketHeader parseHeader(const uint8_t* pkt, size_t len, const uint8_t selfId[NO
       case KEY_TYPE: h.type = cborSmallUint(pkt + v); break;
       case KEY_MODE: h.mode = cborSmallUint(pkt + v); break;
       case KEY_TTL:  h.ttl  = cborSmallUint(pkt + v); break;
+      case KEY_ROUTE_CURSOR:
+        h.routeCursor = cborSmallUint(pkt + v);
+        break;
+      case KEY_PAYLOAD_TYPE:
+        h.payloadType = cborSmallUint(pkt + v);
+        break;
       case KEY_SOURCE:
         if (pkt[v] == 0x48 && v + 1 + NODE_ID_LEN <= len) {
           memcpy(h.source, pkt + v + 1, NODE_ID_LEN);
           h.hasSource = true;
+        }
+        break;
+      case KEY_DEST:
+        if (pkt[v] == 0x48 && v + 1 + NODE_ID_LEN <= len) {
+          memcpy(h.destination, pkt + v + 1, NODE_ID_LEN);
+          h.hasDestination = true;
+        }
+        break;
+      case KEY_ROUTE:
+        if ((pkt[v] >> 5) == 4) {
+          uint8_t cnt = pkt[v] & 0x1f;
+          size_t ep = v + 1;
+          for (uint8_t e = 0; e < cnt; e++) {
+            if (pkt[ep] == 0x48 && ep + 1 + NODE_ID_LEN <= len) {
+              if (e == h.routeCursor && memcmp(pkt + ep + 1, selfId, NODE_ID_LEN) == 0) {
+                h.routeCurrentIsSelf = true;
+              }
+              if (e == (uint8_t)(h.routeCursor + 1)) {
+                memcpy(h.nextHop, pkt + ep + 1, NODE_ID_LEN);
+                h.hasNextHop = true;
+              }
+            }
+            size_t el = cborItemLen(pkt + ep, len - ep);
+            if (!el) return h;
+            ep += el;
+          }
+          h.routeEndsHere = h.routeCurrentIsSelf && ((uint16_t)h.routeCursor + 1 >= cnt);
         }
         break;
       case KEY_TRACE:
@@ -251,11 +303,37 @@ PacketHeader parseHeader(const uint8_t* pkt, size_t len, const uint8_t selfId[NO
           }
         }
         break;
+      case KEY_PAYLOAD:
+        if ((pkt[v] >> 5) == 2) {
+          uint8_t ai = pkt[v] & 0x1f;
+          size_t head = 1 + cborArgLen(ai);
+          uint64_t arg = cborArgVal(pkt + v, ai);
+          if (v + head + arg <= len) {
+            h.payload = pkt + v + head;
+            h.payloadLen = (size_t)arg;
+          }
+        }
+        break;
     }
     p = v + vl;
   }
   h.ok = true;
   return h;
+}
+
+static void appendMetric(const uint8_t* val, size_t vl, int8_t metric,
+                         std::vector<uint8_t>& out) {
+  bool isArray = (val != nullptr) && ((val[0] >> 5) == 4) && ((val[0] & 0x1f) < 24);
+  uint8_t cnt = isArray ? (val[0] & 0x1f) : 0;
+  uint16_t newCnt = cnt + 1;
+  if (newCnt < 24) {
+    out.push_back(0x80 | (uint8_t)newCnt);
+  } else {
+    out.push_back(0x98);
+    out.push_back((uint8_t)newCnt);
+  }
+  if (isArray) out.insert(out.end(), val + 1, val + vl);
+  emitInt(out, metric);
 }
 
 bool directNeighbor(const PacketHeader& h, uint8_t out[NODE_ID_LEN]) {
@@ -306,6 +384,55 @@ bool buildForward(const uint8_t* pkt, size_t len, const uint8_t selfId[NODE_ID_L
       out.insert(out.end(), pkt + p, pkt + v + vl);  // copy verbatim
     }
     p = v + vl;
+  }
+  return true;
+}
+
+bool buildTraceSourceRouteForward(const uint8_t* pkt, size_t len,
+                                  const uint8_t selfId[NODE_ID_LEN],
+                                  uint8_t newTtl, uint8_t newRouteCursor,
+                                  int8_t metric, std::vector<uint8_t>& out) {
+  out.clear();
+  if (len < 1 || (pkt[0] >> 5) != 5) return false;
+  uint8_t n = pkt[0] & 0x1f;
+  if (n >= 24) return false;
+
+  bool sawMetric = false;
+  size_t mapHead = out.size();
+  out.push_back(pkt[0]);  // fixed after we know whether key 14 exists
+  size_t p = 1;
+  for (uint8_t i = 0; i < n; i++) {
+    if (p >= len) return false;
+    uint8_t key = pkt[p];
+    size_t kl = cborItemLen(pkt + p, len - p);
+    if (!kl) return false;
+    size_t v = p + kl;
+    size_t vl = cborItemLen(pkt + v, len - v);
+    if (!vl) return false;
+    if (key == KEY_TTL) {
+      out.push_back(pkt[p]);
+      emitUint(out, newTtl);
+    } else if (key == KEY_ROUTE_CURSOR) {
+      out.push_back(pkt[p]);
+      emitUint(out, newRouteCursor);
+    } else if (key == KEY_TRACE) {
+      out.push_back(pkt[p]);
+      appendTrace(pkt + v, vl, selfId, out);
+    } else if (key == KEY_TRACE_METRIC) {
+      sawMetric = true;
+      out.push_back(pkt[p]);
+      appendMetric(pkt + v, vl, metric, out);
+    } else {
+      out.insert(out.end(), pkt + p, pkt + v + vl);
+    }
+    p = v + vl;
+  }
+
+  if (!sawMetric) {
+    if (n + 1 >= 24) return false;
+    out.push_back(KEY_TRACE_METRIC);
+    appendMetric(nullptr, 0, metric, out);
+    out[mapHead] = 0xa0 | (uint8_t)(n + 1);
   }
   return true;
 }

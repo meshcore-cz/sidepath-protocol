@@ -20,21 +20,27 @@ format with integer keys.
 - Reassembles incoming frames, decodes the packet, and for **flood** packets:
   drops duplicates / loops / TTL-exhausted, appends itself to the trace, decrements
   TTL, re-fragments, and notifies every connected peer **except** the sender.
+- For **TRACE source-route** packets where its NodeID is the current route hop,
+  appends itself to the trace, appends a trace metric sample, advances
+  `route_cursor`, and notifies only the connected next hop on the selected track.
+  TRACE packets in flood mode are not relayed.
 - Sends a periodic `ANNOUNCE` (every 15 s) advertising `relay` capability **and its
   learned neighbors**, so it appears correctly in other nodes' topology. Neighbors
   are learned from received traffic — the last trace hop (or the source of a fresh
   packet) is the directly-connected peer — which works even though every connection
   is inbound (the phones connect to the relay, not the other way around).
-- Derives a stable 8-byte NodeID from the chip's eFuse MAC (`E5 C6 <6-byte MAC>`).
+- Derives a stable 8-byte NodeID from its persisted Ed25519 public key (`pubkey[:8]`).
+- Accepts encrypted direct-message remote-control commands addressed to its NodeID
+  from configured admin Ed25519 public keys, and replies by encrypted DM.
 
 ## Limitations (intentional, for a "basic" relay)
 
 - **Peripheral/server role only.** It does not scan or initiate connections, so it
   won't link two *other* relays together; it bridges the centrals (phones) that
   connect to it. Adding the central role (scan + GATT client) is the natural next step.
-- **FLOOD packets only.** Source-routed packets are not forwarded (logged and dropped).
-  This is fine in practice — DATA falls back to flood when no route is known, and
-  ANNOUNCEs are always flood.
+- **TRACE-only source routing.** Ordinary source-routed DATA is not forwarded
+  (logged and dropped). TRACE source-route packets are forwarded only when this
+  relay is on the selected track and the next hop is currently connected.
 - **1M PHY.** Matches the mesh default. (The C6 supports Coded PHY; enabling Long
   Range advertising is a future extension.)
 - Default max simultaneous connections is set by NimBLE
@@ -44,10 +50,30 @@ format with integer keys.
 
 1. Install the **arduino-esp32** core **≥ 3.0.0** (Boards Manager → "esp32 by Espressif").
 2. Install **NimBLE-Arduino ≥ 2.1.0** (Library Manager → "NimBLE-Arduino").
-3. Select board **"XIAO_ESP32C6"**.
-4. Open `xiao_esp32c6.ino` (keep `mesh.h` / `mesh.cpp` in the same folder) and Upload.
-5. Open Serial Monitor at **115200 baud** — you'll see the node ID, advertising
+3. Add build-time remote-control admins in `ADMIN_PUBKEYS` near the top of
+   `xiao_esp32c6.ino` as 64-character Ed25519 public-key hex strings.
+4. Select board **"XIAO_ESP32C6"**.
+5. Open `xiao_esp32c6.ino` (keep `mesh.h` / `mesh.cpp` in the same folder) and Upload.
+6. Open Serial Monitor at **115200 baud** — you'll see the node ID, advertising
    status, peer connect/disconnect, and per-packet relay/forward logs.
+
+## Remote control
+
+Send an encrypted direct message to the ESP32 node. The sender public key carried
+inside the chat envelope must be a build-time admin or a runtime admin stored in
+NVS; otherwise the node replies `not authenticated`.
+
+Commands:
+
+- `help` — show supported commands.
+- `sensors` — read the ESP32-C6 internal temperature.
+- `stats` — uptime, peer/neighbor counts, packet/frame counters, command counters,
+  free heap, plus placeholders for metrics that BLE does not expose (`noise_floor`
+  and `air_time`).
+- `admins` or `admin` — list build-time and runtime admin public keys.
+- `admin.add <pubkey>` — add a runtime admin public key to NVS.
+- `admin.remove <pubkey>` — remove a runtime admin public key from NVS. Build-time
+  admins cannot be removed at runtime.
 
 ### arduino-cli
 

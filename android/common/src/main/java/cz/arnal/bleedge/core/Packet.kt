@@ -13,10 +13,16 @@ fun newPacketID(): PacketID {
 }
 
 /** Decode a CBOR array of byte strings into a list of NodeIDs. */
-private fun cborArrayToNodeIDs(obj: CBORObject?): List<NodeID> {
+internal fun cborArrayToNodeIDs(obj: CBORObject?): List<NodeID> {
     if (obj == null || obj.isNull || obj.isUndefined) return emptyList()
     val n = obj.size()
     return (0 until n).map { i -> NodeID(obj[CBORObject.FromObject(i)].GetByteString()) }
+}
+
+internal fun cborArrayToBytes(obj: CBORObject?): List<Byte> {
+    if (obj == null || obj.isNull || obj.isUndefined) return emptyList()
+    val n = obj.size()
+    return (0 until n).map { i -> obj[CBORObject.FromObject(i)].AsInt32().toByte() }
 }
 
 /**
@@ -37,6 +43,7 @@ data class Packet(
     val payloadType: PayloadType = PayloadType.TEXT_TEST,
     val payload: ByteArray = ByteArray(0),
     val seq: Int = 0,
+    val traceMetric: List<Byte> = emptyList(),
 ) {
     fun isBroadcast(): Boolean = destination.isBroadcast()
 
@@ -61,6 +68,11 @@ data class Packet(
         if (seq != 0) {
             map[CBORObject.FromObject(13)] = CBORObject.FromObject(seq)
         }
+        if (traceMetric.isNotEmpty()) {
+            val metricArr = CBORObject.NewArray()
+            traceMetric.forEach { metricArr.Add(CBORObject.FromObject(it.toInt())) }
+            map[CBORObject.FromObject(14)] = metricArr
+        }
         return map.EncodeToBytes()
     }
 
@@ -83,6 +95,7 @@ data class Packet(
             val payload = map[CBORObject.FromObject(12)].GetByteString()
             val seqObj = map[CBORObject.FromObject(13)]
             val seq = if (seqObj != null && !seqObj.isNull) seqObj.AsInt32() else 0
+            val traceMetric = cborArrayToBytes(map[CBORObject.FromObject(14)])
             return Packet(
                 version = version,
                 type = type,
@@ -97,6 +110,7 @@ data class Packet(
                 payloadType = payloadType,
                 payload = payload,
                 seq = seq,
+                traceMetric = traceMetric,
             )
         }
     }

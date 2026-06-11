@@ -77,7 +77,9 @@ enum class PayloadType(val value: Byte) {
     MESH_CORE_RAW(2),
     CHAT_PLAIN(3),       // broadcast channel text (UTF-8)
     CHAT_ENCRYPTED(4),   // direct message: Crypto sealed envelope (CBOR)
-    CHANNEL(5);          // MeshCore-compatible group channel: GRP_TXT payload (ChannelCrypto)
+    CHANNEL(5),          // MeshCore-compatible group channel: GRP_TXT payload (ChannelCrypto)
+    TRACE_REQUEST(6),    // MeshCore-shaped trace request
+    TRACE_RESPONSE(7);   // BLEEdge trace result returned to requester
 
     companion object {
         fun fromValue(v: Byte) = entries.firstOrNull { it.value == v } ?: TEXT_TEST

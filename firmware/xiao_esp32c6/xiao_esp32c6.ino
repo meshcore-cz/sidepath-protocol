@@ -10,15 +10,21 @@
 // Board:     "XIAO_ESP32C6"
 //
 // Limitations (see README.md): peripheral/server role only (it does not scan or
-// initiate connections), FLOOD-mode packets only (no source-route forwarding),
-// and 1M PHY (the default mesh PHY).
+// initiate connections), source-route forwarding only for TRACE packets where
+// this relay is on the selected track, and 1M PHY (the default mesh PHY).
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <esp_random.h>
+#include <mbedtls/gcm.h>
+#include <mbedtls/md.h>
+#include <mbedtls/bignum.h>
+#include <mbedtls/sha512.h>
+#include <mbedtls/version.h>
 
 #include <algorithm>
 #include <array>
+#include <string>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -35,6 +41,11 @@ static const char* PACKETOUT_UUID = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004";
 static const uint8_t  PROTOCOL_VERSION = mesh::PROTOCOL_VERSION;  // 2: Ed25519 + signed ANNOUNCE
 static const uint8_t  RELAY_CAPS = mesh::CAP_SENDER | mesh::CAP_RECEIVER | mesh::CAP_RELAY;
 static const char*    NODE_DESCRIPTION = "esp32-c6";  // diagnostic label in ANNOUNCE/NODE_INFO
+// Build-time remote-control admins. Put 32-byte Ed25519 public keys here as
+// lowercase/uppercase hex. Runtime admins added with admin.add are stored in NVS.
+static const char* ADMIN_PUBKEYS[] = {
+  // "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+};
 
 // Onboard user LED — blinks once per ANNOUNCE (advert) as a heartbeat.
 // XIAO ESP32-C6: user LED is GPIO15 and active-LOW (drive LOW = on).
@@ -69,6 +80,18 @@ static std::map<uint16_t, std::array<uint8_t, mesh::NODE_ID_LEN>> g_connNode;
 static uint32_t g_announceSeq = 0;
 static uint32_t g_lastAnnounceMs = 0;
 static uint32_t g_ledOffMs = 0;  // when to turn the heartbeat LED back off (0 = off)
+static uint32_t g_bootMs = 0;
+
+static std::vector<std::array<uint8_t, mesh::PUBKEY_LEN>> g_builtinAdmins;
+static std::vector<std::array<uint8_t, mesh::PUBKEY_LEN>> g_runtimeAdmins;
+
+static uint32_t g_rxPackets = 0;
+static uint32_t g_txPackets = 0;
+static uint32_t g_txFrames = 0;
+static uint32_t g_floodRelays = 0;
+static uint32_t g_traceRelays = 0;
+static uint32_t g_cmdAccepted = 0;
+static uint32_t g_cmdDenied = 0;
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -101,11 +124,369 @@ static String nodeIdHex() {
   return s;
 }
 
+static String bytesHex(const uint8_t* data, size_t len) {
+  String s;
+  for (size_t i = 0; i < len; i++) {
+    char b[3];
+    snprintf(b, sizeof(b), "%02x", data[i]);
+    s += b;
+  }
+  return s;
+}
+
+static bool hexNibble(char c, uint8_t& out) {
+  if (c >= '0' && c <= '9') { out = c - '0'; return true; }
+  if (c >= 'a' && c <= 'f') { out = c - 'a' + 10; return true; }
+  if (c >= 'A' && c <= 'F') { out = c - 'A' + 10; return true; }
+  return false;
+}
+
+static bool parseHexBytes(const String& hex, uint8_t* out, size_t len) {
+  if (hex.length() != len * 2) return false;
+  for (size_t i = 0; i < len; i++) {
+    uint8_t hi, lo;
+    if (!hexNibble(hex[i * 2], hi) || !hexNibble(hex[i * 2 + 1], lo)) return false;
+    out[i] = (hi << 4) | lo;
+  }
+  return true;
+}
+
+static bool samePub(const std::array<uint8_t, mesh::PUBKEY_LEN>& a, const uint8_t* b) {
+  return memcmp(a.data(), b, mesh::PUBKEY_LEN) == 0;
+}
+
+static bool containsAdmin(const std::vector<std::array<uint8_t, mesh::PUBKEY_LEN>>& admins,
+                          const uint8_t* pub) {
+  for (const auto& a : admins) if (samePub(a, pub)) return true;
+  return false;
+}
+
+static bool isAdminPub(const uint8_t* pub) {
+  return containsAdmin(g_builtinAdmins, pub) || containsAdmin(g_runtimeAdmins, pub);
+}
+
+static void saveRuntimeAdmins() {
+  Preferences prefs;
+  prefs.begin("bleadmin", false);
+  std::vector<uint8_t> blob;
+  blob.reserve(g_runtimeAdmins.size() * mesh::PUBKEY_LEN);
+  for (const auto& a : g_runtimeAdmins) blob.insert(blob.end(), a.begin(), a.end());
+  if (blob.empty()) prefs.remove("pubkeys");
+  else prefs.putBytes("pubkeys", blob.data(), blob.size());
+  prefs.end();
+}
+
+static void loadAdmins() {
+  g_builtinAdmins.clear();
+  g_runtimeAdmins.clear();
+  for (const char* h : ADMIN_PUBKEYS) {
+    if (!h || !*h) continue;
+    std::array<uint8_t, mesh::PUBKEY_LEN> pub{};
+    if (parseHexBytes(String(h), pub.data(), pub.size()) && !containsAdmin(g_builtinAdmins, pub.data())) {
+      g_builtinAdmins.push_back(pub);
+    }
+  }
+  Preferences prefs;
+  prefs.begin("bleadmin", true);
+  size_t n = prefs.getBytesLength("pubkeys");
+  if (n > 0 && n % mesh::PUBKEY_LEN == 0) {
+    std::vector<uint8_t> blob(n);
+    prefs.getBytes("pubkeys", blob.data(), blob.size());
+    for (size_t i = 0; i < blob.size(); i += mesh::PUBKEY_LEN) {
+      std::array<uint8_t, mesh::PUBKEY_LEN> pub{};
+      memcpy(pub.data(), blob.data() + i, mesh::PUBKEY_LEN);
+      if (!containsAdmin(g_builtinAdmins, pub.data()) && !containsAdmin(g_runtimeAdmins, pub.data())) {
+        g_runtimeAdmins.push_back(pub);
+      }
+    }
+  }
+  prefs.end();
+}
+
+static void cborEmitUint(std::vector<uint8_t>& o, uint64_t v) {
+  if (v < 24) {
+    o.push_back((uint8_t)v);
+  } else if (v < 0x100) {
+    o.push_back(0x18); o.push_back((uint8_t)v);
+  } else if (v < 0x10000) {
+    o.push_back(0x19); o.push_back((uint8_t)(v >> 8)); o.push_back((uint8_t)v);
+  } else {
+    o.push_back(0x1a);
+    o.push_back((uint8_t)(v >> 24)); o.push_back((uint8_t)(v >> 16));
+    o.push_back((uint8_t)(v >> 8));  o.push_back((uint8_t)v);
+  }
+}
+
+static void cborEmitBstr(std::vector<uint8_t>& o, const uint8_t* d, size_t n) {
+  if (n < 24) {
+    o.push_back(0x40 | (uint8_t)n);
+  } else if (n < 0x100) {
+    o.push_back(0x58); o.push_back((uint8_t)n);
+  } else {
+    o.push_back(0x59); o.push_back((uint8_t)(n >> 8)); o.push_back((uint8_t)n);
+  }
+  o.insert(o.end(), d, d + n);
+}
+
+static bool cborReadBstr(const uint8_t*& p, const uint8_t* end,
+                         const uint8_t*& data, size_t& len) {
+  if (p >= end || ((*p >> 5) != 2)) return false;
+  uint8_t ai = *p++ & 0x1f;
+  if (ai < 24) {
+    len = ai;
+  } else if (ai == 24 && p < end) {
+    len = *p++;
+  } else if (ai == 25 && p + 1 < end) {
+    len = ((size_t)p[0] << 8) | p[1];
+    p += 2;
+  } else {
+    return false;
+  }
+  if (p + len > end) return false;
+  data = p;
+  p += len;
+  return true;
+}
+
+static bool parseChatEnvelope(const uint8_t* data, size_t len,
+                              const uint8_t*& senderPub, size_t& senderPubLen,
+                              const uint8_t*& iv, size_t& ivLen,
+                              const uint8_t*& ct, size_t& ctLen) {
+  senderPub = nullptr; senderPubLen = 0;
+  iv = nullptr; ivLen = 0;
+  ct = nullptr; ctLen = 0;
+  const uint8_t* p = data;
+  const uint8_t* end = data + len;
+  if (p >= end || ((*p >> 5) != 5)) return false;
+  uint8_t count = *p++ & 0x1f;
+  if (count >= 24) return false;
+  for (uint8_t i = 0; i < count; i++) {
+    if (p >= end || ((*p >> 5) != 0)) return false;
+    uint8_t key = *p++ & 0x1f;
+    const uint8_t* b = nullptr;
+    size_t blen = 0;
+    if (!cborReadBstr(p, end, b, blen)) return false;
+    if (key == 1) { senderPub = b; senderPubLen = blen; }
+    else if (key == 2) { iv = b; ivLen = blen; }
+    else if (key == 3) { ct = b; ctLen = blen; }
+  }
+  return senderPubLen == mesh::PUBKEY_LEN && ivLen == 12 && ctLen >= 16;
+}
+
+static void mpiReadLE(mbedtls_mpi* X, const uint8_t* le, size_t len) {
+  std::vector<uint8_t> be(len);
+  for (size_t i = 0; i < len; i++) be[len - 1 - i] = le[i];
+  mbedtls_mpi_read_binary(X, be.data(), be.size());
+}
+
+static void mpiWriteLE(const mbedtls_mpi* X, uint8_t* le, size_t len) {
+  std::vector<uint8_t> be(len);
+  mbedtls_mpi_write_binary(X, be.data(), be.size());
+  for (size_t i = 0; i < len; i++) le[i] = be[len - 1 - i];
+}
+
+static void curve25519Prime(mbedtls_mpi* P) {
+  mbedtls_mpi_lset(P, 1);
+  mbedtls_mpi_shift_l(P, 255);
+  mbedtls_mpi_sub_int(P, P, 19);
+}
+
+static bool ed25519PubToX25519(const uint8_t edPub[32], uint8_t out[32]) {
+  uint8_t yLE[32];
+  memcpy(yLE, edPub, 32);
+  yLE[31] &= 0x7f;
+
+  mbedtls_mpi P, Y, One, Num, Den, Inv, U;
+  mbedtls_mpi_init(&P); mbedtls_mpi_init(&Y); mbedtls_mpi_init(&One);
+  mbedtls_mpi_init(&Num); mbedtls_mpi_init(&Den); mbedtls_mpi_init(&Inv); mbedtls_mpi_init(&U);
+  bool ok = true;
+  curve25519Prime(&P);
+  mpiReadLE(&Y, yLE, 32);
+  mbedtls_mpi_lset(&One, 1);
+  if (mbedtls_mpi_add_mpi(&Num, &One, &Y) != 0 || mbedtls_mpi_mod_mpi(&Num, &Num, &P) != 0) ok = false;
+  if (mbedtls_mpi_sub_mpi(&Den, &One, &Y) != 0 || mbedtls_mpi_mod_mpi(&Den, &Den, &P) != 0) ok = false;
+  if (ok && mbedtls_mpi_inv_mod(&Inv, &Den, &P) != 0) ok = false;
+  if (ok && (mbedtls_mpi_mul_mpi(&U, &Num, &Inv) != 0 || mbedtls_mpi_mod_mpi(&U, &U, &P) != 0)) ok = false;
+  if (ok) mpiWriteLE(&U, out, 32);
+  mbedtls_mpi_free(&P); mbedtls_mpi_free(&Y); mbedtls_mpi_free(&One);
+  mbedtls_mpi_free(&Num); mbedtls_mpi_free(&Den); mbedtls_mpi_free(&Inv); mbedtls_mpi_free(&U);
+  return ok;
+}
+
+static void ed25519SeedToX25519Priv(const uint8_t seed[32], uint8_t out[32]) {
+  uint8_t hash[64];
+#if MBEDTLS_VERSION_MAJOR >= 3
+  mbedtls_sha512(seed, 32, hash, 0);
+#else
+  mbedtls_sha512_ret(seed, 32, hash, 0);
+#endif
+  memcpy(out, hash, 32);
+  out[0] &= 248;
+  out[31] &= 127;
+  out[31] |= 64;
+}
+
+static void mpiAddMod(mbedtls_mpi* R, const mbedtls_mpi* A, const mbedtls_mpi* B, const mbedtls_mpi* P) {
+  mbedtls_mpi_add_mpi(R, A, B);
+  mbedtls_mpi_mod_mpi(R, R, P);
+}
+
+static void mpiSubMod(mbedtls_mpi* R, const mbedtls_mpi* A, const mbedtls_mpi* B, const mbedtls_mpi* P) {
+  mbedtls_mpi_sub_mpi(R, A, B);
+  mbedtls_mpi_mod_mpi(R, R, P);
+}
+
+static void mpiMulMod(mbedtls_mpi* R, const mbedtls_mpi* A, const mbedtls_mpi* B, const mbedtls_mpi* P) {
+  mbedtls_mpi_mul_mpi(R, A, B);
+  mbedtls_mpi_mod_mpi(R, R, P);
+}
+
+static bool x25519ScalarMult(const uint8_t scalarIn[32], const uint8_t uIn[32], uint8_t out[32]) {
+  uint8_t scalar[32], uMasked[32];
+  memcpy(scalar, scalarIn, 32);
+  scalar[0] &= 248;
+  scalar[31] &= 127;
+  scalar[31] |= 64;
+  memcpy(uMasked, uIn, 32);
+  uMasked[31] &= 0x7f;
+
+  mbedtls_mpi P, K, X1, X2, Z2, X3, Z3, A24, A, AA, B, BB, E, C, D, DA, CB, T1, T2, Inv, Res;
+  mbedtls_mpi* all[] = {&P,&K,&X1,&X2,&Z2,&X3,&Z3,&A24,&A,&AA,&B,&BB,&E,&C,&D,&DA,&CB,&T1,&T2,&Inv,&Res};
+  for (auto m : all) mbedtls_mpi_init(m);
+  curve25519Prime(&P);
+  mpiReadLE(&K, scalar, 32);
+  mpiReadLE(&X1, uMasked, 32);
+  mbedtls_mpi_lset(&X2, 1);
+  mbedtls_mpi_lset(&Z2, 0);
+  mbedtls_mpi_copy(&X3, &X1);
+  mbedtls_mpi_lset(&Z3, 1);
+  mbedtls_mpi_lset(&A24, 121665);
+
+  int swap = 0;
+  for (int t = 254; t >= 0; t--) {
+    int kt = mbedtls_mpi_get_bit(&K, t);
+    swap ^= kt;
+    if (swap) {
+      mbedtls_mpi_swap(&X2, &X3);
+      mbedtls_mpi_swap(&Z2, &Z3);
+    }
+    swap = kt;
+
+    mpiAddMod(&A, &X2, &Z2, &P);
+    mpiMulMod(&AA, &A, &A, &P);
+    mpiSubMod(&B, &X2, &Z2, &P);
+    mpiMulMod(&BB, &B, &B, &P);
+    mpiSubMod(&E, &AA, &BB, &P);
+    mpiAddMod(&C, &X3, &Z3, &P);
+    mpiSubMod(&D, &X3, &Z3, &P);
+    mpiMulMod(&DA, &D, &A, &P);
+    mpiMulMod(&CB, &C, &B, &P);
+    mpiAddMod(&T1, &DA, &CB, &P);
+    mpiMulMod(&X3, &T1, &T1, &P);
+    mpiSubMod(&T2, &DA, &CB, &P);
+    mpiMulMod(&T2, &T2, &T2, &P);
+    mpiMulMod(&Z3, &X1, &T2, &P);
+    mpiMulMod(&X2, &AA, &BB, &P);
+    mpiMulMod(&T1, &A24, &E, &P);
+    mpiAddMod(&T1, &AA, &T1, &P);
+    mpiMulMod(&Z2, &E, &T1, &P);
+  }
+  if (swap) {
+    mbedtls_mpi_swap(&X2, &X3);
+    mbedtls_mpi_swap(&Z2, &Z3);
+  }
+  bool ok = mbedtls_mpi_inv_mod(&Inv, &Z2, &P) == 0 &&
+            mbedtls_mpi_mul_mpi(&Res, &X2, &Inv) == 0 &&
+            mbedtls_mpi_mod_mpi(&Res, &Res, &P) == 0;
+  if (ok) mpiWriteLE(&Res, out, 32);
+  for (auto m : all) mbedtls_mpi_free(m);
+  return ok;
+}
+
+static bool hmacSha256(const uint8_t* key, size_t keyLen, const uint8_t* data, size_t dataLen, uint8_t out[32]) {
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  return info && mbedtls_md_hmac(info, key, keyLen, data, dataLen, out) == 0;
+}
+
+static bool deriveChatKey(const uint8_t secret[32], uint8_t key[32]) {
+  uint8_t salt[32] = {0};
+  uint8_t prk[32];
+  const char info[] = "bleedge-chat-v1";
+  uint8_t expand[sizeof(info)];
+  memcpy(expand, info, sizeof(info) - 1);
+  expand[sizeof(info) - 1] = 0x01;
+  return hmacSha256(salt, sizeof(salt), secret, 32, prk) &&
+         hmacSha256(prk, sizeof(prk), expand, sizeof(expand), key);
+}
+
+static bool chatKeyForPeer(const uint8_t peerEdPub[32], uint8_t key[32]) {
+  uint8_t myPriv[32], peerXPub[32], secret[32];
+  ed25519SeedToX25519Priv(g_seed, myPriv);
+  if (!ed25519PubToX25519(peerEdPub, peerXPub)) return false;
+  if (!x25519ScalarMult(myPriv, peerXPub, secret)) return false;
+  return deriveChatKey(secret, key);
+}
+
+static bool openChat(const uint8_t* envelope, size_t envelopeLen, String& plain,
+                     std::array<uint8_t, mesh::PUBKEY_LEN>& senderPub) {
+  const uint8_t* envSenderPub;
+  const uint8_t* envIV;
+  const uint8_t* envCT;
+  size_t envSenderPubLen, envIVLen, envCTLen;
+  if (!parseChatEnvelope(envelope, envelopeLen, envSenderPub, envSenderPubLen, envIV, envIVLen, envCT, envCTLen)) return false;
+  memcpy(senderPub.data(), envSenderPub, mesh::PUBKEY_LEN);
+  uint8_t key[32];
+  if (!chatKeyForPeer(envSenderPub, key)) return false;
+  size_t msgLen = envCTLen - 16;
+  const uint8_t* tag = envCT + msgLen;
+  std::vector<uint8_t> pt(msgLen);
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  bool ok = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256) == 0 &&
+            mbedtls_gcm_auth_decrypt(&gcm, msgLen, envIV, envIVLen, nullptr, 0,
+                                     tag, 16, envCT, pt.data()) == 0;
+  mbedtls_gcm_free(&gcm);
+  if (!ok) return false;
+  plain = "";
+  for (uint8_t b : pt) plain += (char)b;
+  return true;
+}
+
+static bool sealChat(const String& plain, const uint8_t recipientPub[32], std::vector<uint8_t>& envelope) {
+  uint8_t key[32];
+  if (!chatKeyForPeer(recipientPub, key)) return false;
+  uint8_t iv[12];
+  esp_fill_random(iv, sizeof(iv));
+  std::vector<uint8_t> ct(plain.length());
+  uint8_t tag[16];
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  bool ok = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256) == 0 &&
+            mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, plain.length(),
+                                      iv, sizeof(iv), nullptr, 0,
+                                      (const uint8_t*)plain.c_str(), ct.data(),
+                                      sizeof(tag), tag) == 0;
+  mbedtls_gcm_free(&gcm);
+  if (!ok) return false;
+
+  std::vector<uint8_t> ctTag;
+  ctTag.reserve(ct.size() + sizeof(tag));
+  ctTag.insert(ctTag.end(), ct.begin(), ct.end());
+  ctTag.insert(ctTag.end(), tag, tag + sizeof(tag));
+  envelope.clear();
+  envelope.push_back(0xa3);
+  envelope.push_back(1); cborEmitBstr(envelope, g_pubKey, mesh::PUBKEY_LEN);
+  envelope.push_back(2); cborEmitBstr(envelope, iv, sizeof(iv));
+  envelope.push_back(3); cborEmitBstr(envelope, ctTag.data(), ctTag.size());
+  return true;
+}
+
 // Sends all frames of `pkt` to every connected peer except `exclude`.
 static void floodToPeers(const std::vector<uint8_t>& pkt, const uint8_t pid[mesh::PACKET_ID_LEN],
                          uint16_t exclude) {
   std::vector<std::vector<uint8_t>> frames;
   mesh::fragment(pkt.data(), pkt.size(), FRAGMENT_MTU, pid, frames);
+  g_txPackets++;
 
   std::vector<uint16_t> targets;
   {
@@ -116,8 +497,199 @@ static void floodToPeers(const std::vector<uint8_t>& pkt, const uint8_t pid[mesh
     if (h == exclude) continue;
     for (const auto& f : frames) {
       g_packetOut->notify(f.data(), f.size(), h);
+      g_txFrames++;
     }
   }
+}
+
+static bool sendToNode(const std::vector<uint8_t>& pkt, const uint8_t pid[mesh::PACKET_ID_LEN],
+                       const uint8_t nodeId[mesh::NODE_ID_LEN]) {
+  uint16_t target = 0xFFFF;
+  {
+    std::lock_guard<std::mutex> lk(g_peersMu);
+    for (auto& kv : g_connNode) {
+      if (memcmp(kv.second.data(), nodeId, mesh::NODE_ID_LEN) == 0) {
+        target = kv.first;
+        break;
+      }
+    }
+  }
+  if (target == 0xFFFF) return false;
+
+  std::vector<std::vector<uint8_t>> frames;
+  mesh::fragment(pkt.data(), pkt.size(), FRAGMENT_MTU, pid, frames);
+  g_txPackets++;
+  for (const auto& f : frames) {
+    g_packetOut->notify(f.data(), f.size(), target);
+    g_txFrames++;
+  }
+  return true;
+}
+
+static bool isTracePayload(uint8_t payloadType) {
+  return payloadType == mesh::PAYLOAD_TRACE_REQUEST ||
+         payloadType == mesh::PAYLOAD_TRACE_RESPONSE;
+}
+
+static void sendPacketToConn(const std::vector<uint8_t>& pkt, const uint8_t pid[mesh::PACKET_ID_LEN],
+                             uint16_t conn) {
+  std::vector<std::vector<uint8_t>> frames;
+  mesh::fragment(pkt.data(), pkt.size(), FRAGMENT_MTU, pid, frames);
+  g_txPackets++;
+  for (const auto& f : frames) {
+    g_packetOut->notify(f.data(), f.size(), conn);
+    g_txFrames++;
+  }
+}
+
+static void buildEncryptedReplyPacket(const uint8_t destNode[mesh::NODE_ID_LEN],
+                                      const std::vector<uint8_t>& envelope,
+                                      const uint8_t pid[mesh::PACKET_ID_LEN],
+                                      std::vector<uint8_t>& pkt) {
+  pkt.clear();
+  pkt.push_back(0xac);  // map(12), keys 1..12
+  pkt.push_back(mesh::KEY_VERSION);      cborEmitUint(pkt, mesh::PROTOCOL_VERSION);
+  pkt.push_back(mesh::KEY_TYPE);         cborEmitUint(pkt, mesh::TYPE_DATA);
+  pkt.push_back(mesh::KEY_ID);           cborEmitBstr(pkt, pid, mesh::PACKET_ID_LEN);
+  pkt.push_back(mesh::KEY_SOURCE);       cborEmitBstr(pkt, g_nodeId, mesh::NODE_ID_LEN);
+  pkt.push_back(mesh::KEY_DEST);         cborEmitBstr(pkt, destNode, mesh::NODE_ID_LEN);
+  pkt.push_back(mesh::KEY_MODE);         cborEmitUint(pkt, mesh::MODE_FLOOD);
+  pkt.push_back(mesh::KEY_TTL);          cborEmitUint(pkt, 3);
+  pkt.push_back(mesh::KEY_ROUTE_CURSOR); cborEmitUint(pkt, 0);
+  pkt.push_back(mesh::KEY_ROUTE);        pkt.push_back(0xf6);  // null
+  pkt.push_back(mesh::KEY_TRACE);        pkt.push_back(0xf6);  // null
+  pkt.push_back(mesh::KEY_PAYLOAD_TYPE); cborEmitUint(pkt, mesh::PAYLOAD_CHAT_ENCRYPTED);
+  pkt.push_back(mesh::KEY_PAYLOAD);      cborEmitBstr(pkt, envelope.data(), envelope.size());
+}
+
+static void sendEncryptedReply(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN],
+                               const uint8_t recipientPub[mesh::PUBKEY_LEN], const String& text) {
+  std::vector<uint8_t> envelope;
+  if (!sealChat(text, recipientPub, envelope)) {
+    Serial.println("[cmd] failed to seal reply");
+    return;
+  }
+  uint8_t pid[mesh::PACKET_ID_LEN];
+  esp_fill_random(pid, sizeof(pid));
+  std::vector<uint8_t> pkt;
+  buildEncryptedReplyPacket(destNode, envelope, pid, pkt);
+  g_dedup.seenOrAdd(pid);
+  sendPacketToConn(pkt, pid, conn);
+}
+
+static String adminsText() {
+  String out = "admins:\n";
+  for (size_t i = 0; i < g_builtinAdmins.size(); i++) {
+    out += "built-in ";
+    out += bytesHex(g_builtinAdmins[i].data(), mesh::PUBKEY_LEN);
+    out += "\n";
+  }
+  for (size_t i = 0; i < g_runtimeAdmins.size(); i++) {
+    out += "runtime  ";
+    out += bytesHex(g_runtimeAdmins[i].data(), mesh::PUBKEY_LEN);
+    out += "\n";
+  }
+  if (g_builtinAdmins.empty() && g_runtimeAdmins.empty()) out += "(none)\n";
+  return out;
+}
+
+static String statsText() {
+  uint32_t neighbors = 0;
+  uint32_t peers = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_peersMu);
+    neighbors = g_connNode.size();
+    peers = g_peers.size();
+  }
+  String out;
+  out += "stats\n";
+  out += "uptime_s=" + String((millis() - g_bootMs) / 1000) + "\n";
+  out += "peers=" + String(peers) + "\n";
+  out += "neighbors=" + String(neighbors) + "\n";
+  out += "rx_packets=" + String(g_rxPackets) + "\n";
+  out += "tx_packets=" + String(g_txPackets) + "\n";
+  out += "tx_frames=" + String(g_txFrames) + "\n";
+  out += "flood_relays=" + String(g_floodRelays) + "\n";
+  out += "trace_relays=" + String(g_traceRelays) + "\n";
+  out += "announces=" + String(g_announceSeq) + "\n";
+  out += "cmd_accepted=" + String(g_cmdAccepted) + "\n";
+  out += "cmd_denied=" + String(g_cmdDenied) + "\n";
+  out += "free_heap=" + String(ESP.getFreeHeap()) + "\n";
+  out += "noise_floor=n/a\n";
+  out += "air_time=n/a";
+  return out;
+}
+
+static String handleAdminCommand(const String& cmd) {
+  if (cmd == "help" || cmd == "?") {
+    return "commands: help, sensors, stats, admins, admin.add <pubkey>, admin.remove <pubkey>";
+  }
+  if (cmd == "sensors") {
+    return "temperature_c=" + String(temperatureRead(), 2);
+  }
+  if (cmd == "stats") {
+    return statsText();
+  }
+  if (cmd == "admins" || cmd == "admin") {
+    return adminsText();
+  }
+  if (cmd.startsWith("admin.add ")) {
+    String hex = cmd.substring(strlen("admin.add "));
+    hex.trim();
+    std::array<uint8_t, mesh::PUBKEY_LEN> pub{};
+    if (!parseHexBytes(hex, pub.data(), pub.size())) return "error: expected 32-byte public key hex";
+    if (isAdminPub(pub.data())) return "ok: admin already present";
+    g_runtimeAdmins.push_back(pub);
+    saveRuntimeAdmins();
+    return "ok: admin added";
+  }
+  if (cmd.startsWith("admin.remove ")) {
+    String hex = cmd.substring(strlen("admin.remove "));
+    hex.trim();
+    std::array<uint8_t, mesh::PUBKEY_LEN> pub{};
+    if (!parseHexBytes(hex, pub.data(), pub.size())) return "error: expected 32-byte public key hex";
+    if (containsAdmin(g_builtinAdmins, pub.data())) return "error: built-in admin cannot be removed at runtime";
+    size_t before = g_runtimeAdmins.size();
+    g_runtimeAdmins.erase(std::remove_if(g_runtimeAdmins.begin(), g_runtimeAdmins.end(),
+                                         [&](const auto& a) { return samePub(a, pub.data()); }),
+                          g_runtimeAdmins.end());
+    if (g_runtimeAdmins.size() == before) return "error: admin not found";
+    saveRuntimeAdmins();
+    return "ok: admin removed";
+  }
+  return "error: unknown command; try help";
+}
+
+static bool handleRemoteCommand(const mesh::PacketHeader& h, uint16_t sender) {
+  if (h.type != mesh::TYPE_DATA || h.payloadType != mesh::PAYLOAD_CHAT_ENCRYPTED ||
+      !h.hasDestination || memcmp(h.destination, g_nodeId, mesh::NODE_ID_LEN) != 0 ||
+      h.payload == nullptr || h.payloadLen == 0) {
+    return false;
+  }
+  const uint8_t* envSenderPub;
+  const uint8_t* envIV;
+  const uint8_t* envCT;
+  size_t envSenderPubLen, envIVLen, envCTLen;
+  if (!parseChatEnvelope(h.payload, h.payloadLen, envSenderPub, envSenderPubLen, envIV, envIVLen, envCT, envCTLen)) return true;
+
+  if (!isAdminPub(envSenderPub)) {
+    g_cmdDenied++;
+    sendEncryptedReply(sender, h.source, envSenderPub, "not authenticated");
+    return true;
+  }
+
+  std::array<uint8_t, mesh::PUBKEY_LEN> senderPub{};
+  String cmd;
+  if (!openChat(h.payload, h.payloadLen, cmd, senderPub)) {
+    sendEncryptedReply(sender, h.source, envSenderPub, "bad encrypted message");
+    return true;
+  }
+  cmd.trim();
+  g_cmdAccepted++;
+  String reply = handleAdminCommand(cmd);
+  sendEncryptedReply(sender, h.source, envSenderPub, reply);
+  Serial.printf("[cmd] admin=%s cmd=%s\n", bytesHex(envSenderPub, 4).c_str(), cmd.c_str());
+  return true;
 }
 
 // Called for each reassembled packet arriving on PACKET_IN from `sender`.
@@ -127,6 +699,7 @@ static void onPacket(const std::vector<uint8_t>& pkt, uint16_t sender) {
     Serial.println("[relay] drop: malformed packet");
     return;
   }
+  g_rxPackets++;
   // Learn the directly-connected peer (last trace hop, or source if fresh) so we
   // advertise it as a neighbor. Done before dedup so duplicates still teach us.
   uint8_t nb[mesh::NODE_ID_LEN];
@@ -136,10 +709,6 @@ static void onPacket(const std::vector<uint8_t>& pkt, uint16_t sender) {
     std::lock_guard<std::mutex> lk(g_peersMu);
     g_connNode[sender] = id;
   }
-  if (h.mode != mesh::MODE_FLOOD) {
-    Serial.println("[relay] drop: non-flood packet (source-route not supported)");
-    return;
-  }
   if (g_dedup.seenOrAdd(h.id)) {
     return;  // duplicate — silently drop (this is the common, expected case)
   }
@@ -147,19 +716,69 @@ static void onPacket(const std::vector<uint8_t>& pkt, uint16_t sender) {
     Serial.println("[relay] drop: loop (self already in trace)");
     return;
   }
-  if (h.ttl < 2) {
+  if (h.ttl == 0) {
     Serial.println("[relay] drop: ttl exhausted");
     return;
   }
-
-  std::vector<uint8_t> fwd;
-  if (!mesh::buildForward(pkt.data(), pkt.size(), g_nodeId, h.ttl - 1, fwd)) {
-    Serial.println("[relay] drop: build-forward failed");
+  if (handleRemoteCommand(h, sender)) {
     return;
   }
-  Serial.printf("[relay] forward type=%u ttl=%u->%u size=%u\n", h.type, h.ttl, h.ttl - 1,
-                (unsigned)fwd.size());
-  floodToPeers(fwd, h.id, sender);
+  if (h.mode == mesh::MODE_FLOOD) {
+    if (isTracePayload(h.payloadType)) {
+      Serial.println("[relay] drop: TRACE flood is not relayed");
+      return;
+    }
+    if (h.ttl < 2) {
+      Serial.println("[relay] drop: ttl exhausted");
+      return;
+    }
+    std::vector<uint8_t> fwd;
+    if (!mesh::buildForward(pkt.data(), pkt.size(), g_nodeId, h.ttl - 1, fwd)) {
+      Serial.println("[relay] drop: build-forward failed");
+      return;
+    }
+    Serial.printf("[relay] flood type=%u ttl=%u->%u size=%u\n", h.type, h.ttl, h.ttl - 1,
+                  (unsigned)fwd.size());
+    g_floodRelays++;
+    floodToPeers(fwd, h.id, sender);
+    return;
+  }
+
+  if (h.mode == mesh::MODE_SOURCE_ROUTE) {
+    if (!isTracePayload(h.payloadType)) {
+      Serial.println("[relay] drop: non-TRACE source-route not supported");
+      return;
+    }
+    if (!h.routeCurrentIsSelf) {
+      Serial.println("[relay] drop: source-route not addressed to this relay");
+      return;
+    }
+    if (h.routeEndsHere || !h.hasNextHop) {
+      Serial.println("[relay] drop: TRACE route ends at firmware relay (endpoint not supported)");
+      return;
+    }
+    if (h.ttl < 2) {
+      Serial.println("[relay] drop: ttl exhausted");
+      return;
+    }
+    std::vector<uint8_t> fwd;
+    if (!mesh::buildTraceSourceRouteForward(pkt.data(), pkt.size(), g_nodeId,
+                                            h.ttl - 1, h.routeCursor + 1,
+                                            0, fwd)) {
+      Serial.println("[relay] drop: trace source-route forward failed");
+      return;
+    }
+    if (!sendToNode(fwd, h.id, h.nextHop)) {
+      Serial.println("[relay] drop: trace next-hop not connected");
+      return;
+    }
+    Serial.printf("[relay] trace source-route ttl=%u->%u cursor=%u->%u size=%u\n",
+                  h.ttl, h.ttl - 1, h.routeCursor, h.routeCursor + 1, (unsigned)fwd.size());
+    g_traceRelays++;
+    return;
+  }
+
+  Serial.println("[relay] drop: unsupported routing mode");
 }
 
 static void sendAnnounce() {
@@ -241,10 +860,14 @@ class PacketInCallbacks : public NimBLECharacteristicCallbacks {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  g_bootMs = millis();
   pinMode(LED_PIN, OUTPUT);
   ledSet(false);
   loadOrCreateIdentity();
+  loadAdmins();
   Serial.printf("\nBLEEdge relay  node=%s  phy=1m\n", nodeIdHex().c_str());
+  Serial.printf("[cmd] admins built-in=%u runtime=%u\n",
+                (unsigned)g_builtinAdmins.size(), (unsigned)g_runtimeAdmins.size());
 
   NimBLEDevice::init("BLEEdge");
   NimBLEDevice::setMTU(247);

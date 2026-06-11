@@ -2,8 +2,11 @@ package core
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 // ---- helpers ----------------------------------------------------------------
@@ -1096,6 +1099,195 @@ func TestBuildAnnounce(t *testing.T) {
 	}
 	if NodeIDFromPubKey(ap.PublicKey) != ap.NodeID {
 		t.Errorf("nodeID not bound to pubkey")
+	}
+}
+
+func TestTracePayloadRoundTrip(t *testing.T) {
+	route := []NodeID{nodeID(1), nodeID(2)}
+	routeData, err := TraceRouteData(route, TraceHashWidth8)
+	if err != nil {
+		t.Fatalf("TraceRouteData: %v", err)
+	}
+	flags, err := TraceFlagsForHashWidth(TraceHashWidth8)
+	if err != nil {
+		t.Fatalf("TraceFlagsForHashWidth: %v", err)
+	}
+	payload := EncodeTracePayload(TracePayload{
+		Tag:       0x11223344,
+		AuthCode:  0xaabbccdd,
+		Flags:     flags,
+		RouteData: routeData,
+	})
+	got, err := DecodeTracePayload(payload)
+	if err != nil {
+		t.Fatalf("DecodeTracePayload: %v", err)
+	}
+	if got.Tag != 0x11223344 || got.AuthCode != 0xaabbccdd {
+		t.Fatalf("unexpected trace header: tag=%08x auth=%08x", got.Tag, got.AuthCode)
+	}
+	if got.HashWidth() != TraceHashWidth8 {
+		t.Fatalf("hash width got %d", got.HashWidth())
+	}
+	hashes := got.RouteHashes()
+	if len(hashes) != len(route) {
+		t.Fatalf("hash count got %d want %d", len(hashes), len(route))
+	}
+	for i := range route {
+		if !bytes.Equal(hashes[i], route[i][:]) {
+			t.Fatalf("hash %d got %x want %x", i, hashes[i], route[i])
+		}
+	}
+}
+
+func TestTraceResultDecodesSignedWireTag(t *testing.T) {
+	payload, err := hex.DecodeString("a6013a694890a802000381486453f60892fe16b90481486453f60892fe16b90581382e086472737369")
+	if err != nil {
+		t.Fatalf("DecodeString: %v", err)
+	}
+	got, err := DecodeTraceResult(payload)
+	if err != nil {
+		t.Fatalf("DecodeTraceResult: %v", err)
+	}
+	if got.Tag != 0x96b76f57 {
+		t.Fatalf("tag got %08x want 96b76f57", got.Tag)
+	}
+	if got.AuthCode != 0 {
+		t.Fatalf("auth got %08x want 00000000", got.AuthCode)
+	}
+	if got.Metric != TraceMetricRSSI {
+		t.Fatalf("metric got %q want %q", got.Metric, TraceMetricRSSI)
+	}
+	if len(got.ForwardNodes) != 1 || got.ForwardNodes[0] != mustNodeID("6453f60892fe16b9") {
+		t.Fatalf("forward nodes got %v", got.ForwardNodes)
+	}
+	if len(got.ForwardSamples) != 1 || got.ForwardSamples[0] != -47 {
+		t.Fatalf("forward samples got %v", got.ForwardSamples)
+	}
+}
+
+func TestTraceResultRoundTripHighTag(t *testing.T) {
+	in := TraceResult{
+		Tag:            0x96b76f57,
+		AuthCode:       0xaabbccdd,
+		Route:          []NodeID{nodeID(1), nodeID(2)},
+		ForwardNodes:   []NodeID{nodeID(2)},
+		ForwardSamples: []int8{-47},
+		ReturnNodes:    []NodeID{nodeID(1)},
+		ReturnSamples:  []int8{-42},
+		Metric:         TraceMetricRSSI,
+	}
+	payload, err := in.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := DecodeTraceResult(payload)
+	if err != nil {
+		t.Fatalf("DecodeTraceResult: %v", err)
+	}
+	if got.Tag != in.Tag || got.AuthCode != in.AuthCode || got.Metric != in.Metric {
+		t.Fatalf("unexpected result header: %+v", got)
+	}
+	if !bytes.Equal(got.Route[0][:], in.Route[0][:]) || got.ForwardSamples[0] != -47 || got.ReturnSamples[0] != -42 {
+		t.Fatalf("unexpected result body: %+v", got)
+	}
+}
+
+func TestTraceResultDecodesPositiveWireTag(t *testing.T) {
+	type positiveWire struct {
+		Tag            uint32   `cbor:"1,keyasint"`
+		AuthCode       uint32   `cbor:"2,keyasint"`
+		Route          []NodeID `cbor:"3,keyasint"`
+		ForwardNodes   []NodeID `cbor:"4,keyasint"`
+		ForwardSamples []int8   `cbor:"5,keyasint"`
+		Metric         string   `cbor:"8,keyasint"`
+	}
+	payload, err := cbor.Marshal(positiveWire{
+		Tag:            0x96b76f57,
+		AuthCode:       0xaabbccdd,
+		Route:          []NodeID{nodeID(1)},
+		ForwardNodes:   []NodeID{nodeID(1)},
+		ForwardSamples: []int8{-47},
+		Metric:         TraceMetricRSSI,
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	got, err := DecodeTraceResult(payload)
+	if err != nil {
+		t.Fatalf("DecodeTraceResult: %v", err)
+	}
+	if got.Tag != 0x96b76f57 || got.AuthCode != 0xaabbccdd {
+		t.Fatalf("unexpected result header: %+v", got)
+	}
+}
+
+func TestTraceRequestDoesNotEmitGenericAck(t *testing.T) {
+	alice := nodeID(1)
+	bob := nodeID(2)
+	r := NewRouter(bob)
+	pkt := makeDataPacket(alice, bob, 4, RoutingModeSourceRoute)
+	pkt.Route = []NodeID{bob}
+	pkt.PayloadType = PayloadTypeTraceRequest
+	pkt.Payload = EncodeTracePayload(TracePayload{Tag: 1, Flags: 3, RouteData: bob[:]})
+
+	actions := r.HandlePacket(pkt, nil)
+	var delivered, acked bool
+	for _, a := range actions {
+		if a.Type == ActionDeliverLocal {
+			delivered = true
+		}
+		if a.Type == ActionSendAck {
+			acked = true
+		}
+	}
+	if !delivered {
+		t.Fatal("expected trace request to deliver locally")
+	}
+	if acked {
+		t.Fatal("trace request should return a trace response, not a generic ACK")
+	}
+}
+
+func TestTraceResponseDoesNotEmitGenericAck(t *testing.T) {
+	alice := nodeID(1)
+	bob := nodeID(2)
+	r := NewRouter(bob)
+	pkt := makeDataPacket(alice, bob, 4, RoutingModeSourceRoute)
+	pkt.Route = []NodeID{bob}
+	pkt.PayloadType = PayloadTypeTraceResponse
+
+	actions := r.HandlePacket(pkt, nil)
+	var delivered, acked bool
+	for _, a := range actions {
+		if a.Type == ActionDeliverLocal {
+			delivered = true
+		}
+		if a.Type == ActionSendAck {
+			acked = true
+		}
+	}
+	if !delivered {
+		t.Fatal("expected trace response to deliver locally")
+	}
+	if acked {
+		t.Fatal("trace response should not emit a generic ACK")
+	}
+}
+
+func TestTraceRequestFloodDoesNotRelay(t *testing.T) {
+	alice := nodeID(1)
+	bob := nodeID(2)
+	carol := nodeID(3)
+	r := NewRouter(bob)
+	pkt := makeDataPacket(alice, carol, 4, RoutingModeFlood)
+	pkt.PayloadType = PayloadTypeTraceRequest
+	pkt.Payload = EncodeTracePayload(TracePayload{Tag: 1, Flags: 3, RouteData: carol[:]})
+
+	actions := r.HandlePacket(pkt, &alice)
+	for _, a := range actions {
+		if a.Type == ActionRelayFlood {
+			t.Fatal("trace request in flood mode must not be relayed")
+		}
 	}
 }
 

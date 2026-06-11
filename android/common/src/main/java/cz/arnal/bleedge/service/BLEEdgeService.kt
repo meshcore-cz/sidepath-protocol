@@ -36,8 +36,17 @@ import cz.arnal.bleedge.core.PROTOCOL_VERSION
 import cz.arnal.bleedge.core.Reassembler
 import cz.arnal.bleedge.core.Router
 import cz.arnal.bleedge.core.RoutingMode
+import cz.arnal.bleedge.core.TRACE_HASH_WIDTH_8
+import cz.arnal.bleedge.core.TRACE_METRIC_RSSI
+import cz.arnal.bleedge.core.TracePayload
+import cz.arnal.bleedge.core.TraceResult
+import cz.arnal.bleedge.core.decodeTracePayload
+import cz.arnal.bleedge.core.encodeTracePayload
 import cz.arnal.bleedge.core.fragmentPacket
 import cz.arnal.bleedge.core.newPacketID
+import cz.arnal.bleedge.core.randomTraceTag
+import cz.arnal.bleedge.core.traceFlagsForHashWidth
+import cz.arnal.bleedge.core.traceRouteData
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -406,7 +415,7 @@ class BLEEdgeService : Service() {
             return
         } ?: return // incomplete
 
-        val pkt = runCatching { Packet.decode(data) }.getOrElse {
+        var pkt = runCatching { Packet.decode(data) }.getOrElse {
             log("decode packet error: ${it.message}")
             return
         }
@@ -440,6 +449,7 @@ class BLEEdgeService : Service() {
             it.peerId.toHexString() == pkt.source.toHexString()
         }?.peerId ?: serverPeers[addrHex]
 
+        pkt = recordTraceMetric(pkt, incomingPeer)
         val actions = router.handlePacket(pkt, incomingPeer)
         executeActions(actions)
     }
@@ -499,25 +509,92 @@ class BLEEdgeService : Service() {
             log("ANNOUNCE delivered locally from=${pkt.source.toHexString()}", LogTag.ROUTER)
             return
         }
+        if (pkt.payloadType == PayloadType.TRACE_REQUEST) {
+            returnTrace(pkt)
+            return
+        }
+        val deliveredPkt = if (pkt.payloadType == PayloadType.TRACE_RESPONSE) {
+            runCatching {
+                val result = TraceResult.decode(pkt.payload).copy(
+                    returnNodes = pkt.trace,
+                    returnSamples = pkt.traceMetric,
+                )
+                pkt.copy(payload = result.encode())
+            }.getOrDefault(pkt)
+        } else {
+            pkt
+        }
         // Decode chat payloads to text. Encrypted DMs are opened with our identity;
         // an undecryptable envelope (not for us / corrupt) yields null text.
-        val text: String? = when (pkt.payloadType) {
-            PayloadType.CHAT_ENCRYPTED -> identity?.let { Crypto.openChat(pkt.payload, it) }
+        val text: String? = when (deliveredPkt.payloadType) {
+            PayloadType.CHAT_ENCRYPTED -> identity?.let { Crypto.openChat(deliveredPkt.payload, it) }
             PayloadType.CHAT_PLAIN, PayloadType.TEXT_TEST ->
-                runCatching { String(pkt.payload, Charsets.UTF_8) }.getOrNull()
+                runCatching { String(deliveredPkt.payload, Charsets.UTF_8) }.getOrNull()
             else -> null
         }
-        log("MSG delivered from=${pkt.source.toHexString()} type=${pkt.payloadType} len=${pkt.payload.size} hops=${pkt.trace.size} trace=${pkt.trace.map { it.toHexString().take(8) }}", LogTag.MSG)
+        log("MSG delivered from=${deliveredPkt.source.toHexString()} type=${deliveredPkt.payloadType} len=${deliveredPkt.payload.size} hops=${deliveredPkt.trace.size} trace=${deliveredPkt.trace.map { it.toHexString().take(8) }}", LogTag.MSG)
         appendMessage(
             ReceivedMessage(
-                fromNodeId = pkt.source,
-                payload = pkt.payload,
-                payloadType = pkt.payloadType,
-                trace = pkt.trace,
+                fromNodeId = deliveredPkt.source,
+                payload = deliveredPkt.payload,
+                payloadType = deliveredPkt.payloadType,
+                trace = deliveredPkt.trace,
                 text = text,
-                packetId = pkt.id,
+                packetId = deliveredPkt.id,
             )
         )
+    }
+
+    private fun recordTraceMetric(pkt: Packet, incomingPeer: NodeID?): Packet {
+        if (pkt.type != PacketType.DATA) return pkt
+        if (pkt.payloadType != PayloadType.TRACE_REQUEST && pkt.payloadType != PayloadType.TRACE_RESPONSE) return pkt
+        return pkt.copy(traceMetric = pkt.traceMetric + rssiForPeer(incomingPeer).coerceIn(-128, 127).toByte())
+    }
+
+    private fun rssiForPeer(id: NodeID?): Int {
+        val hex = id?.toHexString() ?: return 0
+        peers.values.firstOrNull { it.peerId.toHexString() == hex }?.let { return it.rssi }
+        neighborTable.value.firstOrNull { it.nodeId.toHexString() == hex }?.let {
+            return if (it.rssi == RSSI_UNKNOWN) 0 else it.rssi
+        }
+        return 0
+    }
+
+    private fun returnTrace(req: Packet) {
+        val tracePayload = runCatching { decodeTracePayload(req.payload) }.getOrElse {
+            log("trace response error: ${it.message}", LogTag.ROUTER)
+            return
+        }
+        val result = TraceResult(
+            tag = tracePayload.tag,
+            authCode = tracePayload.authCode,
+            route = req.route,
+            forwardNodes = req.trace,
+            forwardSamples = req.traceMetric,
+            metric = TRACE_METRIC_RSSI,
+        )
+        val route = reverseTraceRoute(req.trace, req.source)
+        val pkt = Packet(
+            version = PROTOCOL_VERSION,
+            type = PacketType.DATA,
+            id = newPacketID(),
+            source = _nodeId.value,
+            destination = req.source,
+            mode = RoutingMode.SOURCE_ROUTE,
+            ttl = (route.size + 1).toByte(),
+            route = route,
+            payloadType = PayloadType.TRACE_RESPONSE,
+            payload = result.encode(),
+        )
+        router.markOriginated(pkt.id)
+        transmitToRoute(pkt)
+    }
+
+    private fun reverseTraceRoute(trace: List<NodeID>, dst: NodeID): List<NodeID> {
+        val hops = if (trace.isNotEmpty()) trace.dropLast(1) else emptyList()
+        val route = hops.reversed().toMutableList()
+        if (route.lastOrNull()?.toHexString() != dst.toHexString()) route += dst
+        return route
     }
 
     // Send frames to all connected peers (both outgoing and server-side), optionally
@@ -635,6 +712,44 @@ class BLEEdgeService : Service() {
     fun sendChannelMessage(payload: ByteArray, ttl: Byte = 4): ByteArray =
         sendData(payload, PayloadType.CHANNEL, NodeID.BROADCAST, ttl)
 
+    /** Sends a source-routed trace request. Returns the trace tag, or null if no route is known. */
+    fun sendTrace(destination: NodeID, explicitRoute: List<NodeID> = emptyList()): Int? {
+        val route = if (explicitRoute.isNotEmpty()) {
+            val r = explicitRoute.toMutableList()
+            if (r.lastOrNull()?.toHexString() != destination.toHexString()) r += destination
+            r
+        } else {
+            val (selected, found) = router.selectRoute(destination)
+            if (!found) return null
+            selected ?: listOf(destination)
+        }
+        val tag = randomTraceTag()
+        val payload = encodeTracePayload(
+            TracePayload(
+                tag = tag,
+                authCode = 0,
+                flags = traceFlagsForHashWidth(TRACE_HASH_WIDTH_8),
+                routeData = traceRouteData(route, TRACE_HASH_WIDTH_8),
+            )
+        )
+        val pkt = Packet(
+            version = PROTOCOL_VERSION,
+            type = PacketType.DATA,
+            id = newPacketID(),
+            source = _nodeId.value,
+            destination = destination,
+            mode = RoutingMode.SOURCE_ROUTE,
+            ttl = (route.size + 2).toByte(),
+            route = route,
+            routeCursor = 0,
+            payloadType = PayloadType.TRACE_REQUEST,
+            payload = payload,
+        )
+        router.markOriginated(pkt.id)
+        transmitToRoute(pkt)
+        return tag
+    }
+
     /** Updates this node's diagnostic description and re-announces it immediately. */
     fun setDescription(description: String) {
         if (!::router.isInitialized) return
@@ -687,6 +802,17 @@ class BLEEdgeService : Service() {
         }
         log("MSG sent dst=${destination.toHexString()} mode=${pkt.mode} type=$payloadType len=${payload.size}", LogTag.MSG)
         return pkt.id
+    }
+
+    private fun transmitToRoute(pkt: Packet) {
+        val data = runCatching { pkt.encode() }.getOrElse { return }
+        val frames = fragmentPacket(data, 512, pkt.id)
+        val firstHop = pkt.route.firstOrNull()
+        if (firstHop != null) {
+            if (!sendFramesToPeer(frames, firstHop)) {
+                log("trace/source-route: first hop ${firstHop.toHexString()} not connected — dropping", LogTag.ROUTER)
+            }
+        }
     }
 
     fun clearData() {

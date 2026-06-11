@@ -35,9 +35,10 @@ int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr,
             "usage: %s <packet-hex> <selfid-hex>\n"
+            "       %s --trace-fwd <packet-hex> <selfid-hex>\n"
             "       %s --crc  <hex>\n"
             "       %s --frag <hex> <mtu> <packetid-hex>\n",
-            argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0]);
     return 2;
   }
 
@@ -81,6 +82,23 @@ int main(int argc, char** argv) {
     mesh::buildAnnounce(pub /* selfId = pubkey[:8] */, caps, seq, 1700000000, pid,
                         neighbors.data(), nCount, pub, sig, "esp32-c6", out);
     printHex(out);
+    return 0;
+  }
+  if (std::string(argv[1]) == "--trace-fwd") {
+    std::vector<uint8_t> pkt = fromHex(argv[2]);
+    std::vector<uint8_t> self = fromHex(argv[3]);
+    mesh::PacketHeader h = mesh::parseHeader(pkt.data(), pkt.size(), self.data());
+    if (!h.ok) {
+      fprintf(stderr, "PARSE_FAILED\n");
+      return 1;
+    }
+    std::vector<uint8_t> fwd;
+    if (!mesh::buildTraceSourceRouteForward(pkt.data(), pkt.size(), self.data(),
+                                            h.ttl - 1, h.routeCursor + 1, 0, fwd)) {
+      fprintf(stderr, "BUILD_TRACE_FAILED\n");
+      return 1;
+    }
+    printHex(fwd);
     return 0;
   }
 

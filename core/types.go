@@ -60,6 +60,8 @@ const (
 	PayloadTypeChatPlain     PayloadType = 3 // broadcast channel text (UTF-8)
 	PayloadTypeChatEncrypted PayloadType = 4 // direct message: Crypto sealed envelope (CBOR)
 	PayloadTypeChannel       PayloadType = 5 // MeshCore-compatible group channel: GRP_TXT payload (see channel.go)
+	PayloadTypeTraceRequest  PayloadType = 6 // MeshCore-shaped trace request
+	PayloadTypeTraceResponse PayloadType = 7 // BLEEdge trace result returned to requester
 )
 
 type PHY uint8
@@ -97,8 +99,8 @@ const (
 type Capabilities uint8
 
 func (c Capabilities) Has(cap Capability) bool { return uint8(c)&uint8(cap) != 0 }
-func (c Capabilities) IsRelay() bool            { return c.Has(CapRelay) }
-func (c Capabilities) IsGateway() bool          { return c.Has(CapGateway) }
+func (c Capabilities) IsRelay() bool           { return c.Has(CapRelay) }
+func (c Capabilities) IsGateway() bool         { return c.Has(CapGateway) }
 
 // String renders the capability flags as a pipe-joined list (mirrors the Kotlin side).
 func (c Capabilities) String() string {

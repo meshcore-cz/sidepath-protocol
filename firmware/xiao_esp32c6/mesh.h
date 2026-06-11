@@ -20,12 +20,16 @@ constexpr uint8_t PROTOCOL_VERSION = 2;  // v2 = Ed25519 identities + signed ANN
 enum : uint8_t {
   KEY_VERSION = 1, KEY_TYPE = 2, KEY_ID = 3, KEY_SOURCE = 4, KEY_DEST = 5,
   KEY_MODE = 6, KEY_TTL = 7, KEY_ROUTE_CURSOR = 8, KEY_ROUTE = 9, KEY_TRACE = 10,
-  KEY_PAYLOAD_TYPE = 11, KEY_PAYLOAD = 12, KEY_SEQ = 13,
+  KEY_PAYLOAD_TYPE = 11, KEY_PAYLOAD = 12, KEY_SEQ = 13, KEY_TRACE_METRIC = 14,
 };
 
 enum : uint8_t { TYPE_DATA = 1, TYPE_ANNOUNCE = 2, TYPE_ACK = 3 };
 enum : uint8_t { MODE_FLOOD = 1, MODE_SOURCE_ROUTE = 2 };
-enum : uint8_t { PAYLOAD_TEXT = 1, PAYLOAD_MESH_CORE_RAW = 2 };
+enum : uint8_t {
+  PAYLOAD_TEXT = 1, PAYLOAD_MESH_CORE_RAW = 2, PAYLOAD_CHAT_PLAIN = 3,
+  PAYLOAD_CHAT_ENCRYPTED = 4, PAYLOAD_CHANNEL = 5, PAYLOAD_TRACE_REQUEST = 6,
+  PAYLOAD_TRACE_RESPONSE = 7,
+};
 
 // Capability bits (see core/types.go).
 enum : uint8_t {
@@ -80,11 +84,21 @@ struct PacketHeader {
   uint8_t type = 0;
   uint8_t mode = 0;
   uint8_t ttl = 0;
+  uint8_t payloadType = 0;
+  uint8_t routeCursor = 0;
   bool traceContainsSelf = false;
   uint8_t source[NODE_ID_LEN];   // packet origin (key 4)
   bool hasSource = false;
+  uint8_t destination[NODE_ID_LEN];  // packet destination (key 5)
+  bool hasDestination = false;
   uint8_t lastHop[NODE_ID_LEN];  // last trace entry — the peer that sent us this frame
   bool hasLastHop = false;
+  uint8_t nextHop[NODE_ID_LEN];  // route[route_cursor + 1] after this relay
+  bool hasNextHop = false;
+  bool routeCurrentIsSelf = false;
+  bool routeEndsHere = false;
+  const uint8_t* payload = nullptr;  // byte string content for key 12
+  size_t payloadLen = 0;
 };
 
 // The directly-connected peer that sent us a packet: the last trace hop, or the
@@ -101,6 +115,14 @@ PacketHeader parseHeader(const uint8_t* pkt, size_t len, const uint8_t selfId[NO
 // Returns false on malformed input.
 bool buildForward(const uint8_t* pkt, size_t len, const uint8_t selfId[NODE_ID_LEN],
                   uint8_t newTtl, std::vector<uint8_t>& out);
+
+// Produces a forwardable TRACE source-route packet. Requires parseHeader() to
+// have confirmed routeCurrentIsSelf and hasNextHop. Rewrites TTL, route_cursor,
+// trace, and trace_metric; copies all other fields verbatim.
+bool buildTraceSourceRouteForward(const uint8_t* pkt, size_t len,
+                                  const uint8_t selfId[NODE_ID_LEN],
+                                  uint8_t newTtl, uint8_t newRouteCursor,
+                                  int8_t metric, std::vector<uint8_t>& out);
 
 // Builds the canonical byte string that an ANNOUNCE signature covers. Fixed
 // explicit layout (must match core.AnnounceSignedMessage in Go and the Kotlin
