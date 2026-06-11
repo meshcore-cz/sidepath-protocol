@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Casino
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Public
@@ -34,8 +35,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -45,7 +44,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -57,6 +55,8 @@ import cz.arnal.bleedge.chat.MeshCoreUri
 import cz.arnal.bleedge.chat.data.ChannelKind
 import cz.arnal.bleedge.chat.data.channelPeerId
 import cz.arnal.bleedge.chat.isHex32
+import cz.arnal.bleedge.chat.toHex
+import java.security.SecureRandom
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -64,6 +64,7 @@ fun ChannelsScreen(
     vm: ChatViewModel,
     onOpenChannel: (String) -> Unit,
     onOpenProfile: (String) -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val channels by vm.channelConversations.collectAsState()
     val joined by vm.channels.collectAsState()
@@ -82,19 +83,7 @@ fun ChannelsScreen(
             TopAppBar(
                 title = {
                     if (searching) {
-                        TextField(
-                            value = query,
-                            onValueChange = { query = it },
-                            singleLine = true,
-                            placeholder = { Text("Search channels") },
-                            colors = TextFieldDefaults.colors(
-                                focusedContainerColor = Color.Transparent,
-                                unfocusedContainerColor = Color.Transparent,
-                                focusedIndicatorColor = Color.Transparent,
-                                unfocusedIndicatorColor = Color.Transparent,
-                            ),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                        SearchField(query, { query = it }, "Search channels")
                     } else {
                         Text("Channels")
                     }
@@ -110,6 +99,7 @@ fun ChannelsScreen(
                             contentDescription = if (searching) "Close search" else "Search",
                         )
                     }
+                    OverflowMenu(onOpenSettings = onOpenSettings)
                 },
             )
         },
@@ -120,7 +110,9 @@ fun ChannelsScreen(
         },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
-        if (visible.isEmpty()) {
+        if (searching && query.isBlank()) {
+            SearchHint("Start typing to search channels…", Modifier.fillMaxSize().padding(padding))
+        } else if (visible.isEmpty()) {
             Column(
                 Modifier.fillMaxSize().padding(padding),
                 verticalArrangement = Arrangement.Center,
@@ -264,6 +256,11 @@ private fun JoinChannelSheet(
                 label = { Text("Channel name") },
                 prefix = { Text("#") },
                 singleLine = true,
+                trailingIcon = {
+                    IconButton(onClick = { namedName = randomChannelName() }) {
+                        Icon(Icons.Default.Casino, contentDescription = "Suggest a name")
+                    }
+                },
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedButton(
@@ -286,6 +283,11 @@ private fun JoinChannelSheet(
                 onValueChange = { secretName = it },
                 label = { Text("Channel name") },
                 singleLine = true,
+                trailingIcon = {
+                    IconButton(onClick = { secretName = randomChannelName() }) {
+                        Icon(Icons.Default.Casino, contentDescription = "Suggest a name")
+                    }
+                },
                 modifier = Modifier.fillMaxWidth(),
             )
             val secretValid = isHex32(secretValue)
@@ -297,12 +299,19 @@ private fun JoinChannelSheet(
                 isError = secretValue.isNotEmpty() && !secretValid,
                 leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
                 trailingIcon = {
-                    IconButton(onClick = { launchScan() }) {
-                        Icon(Icons.Default.QrCodeScanner, contentDescription = "Scan QR")
+                    Row {
+                        // Generate a fresh random key — tap again for another.
+                        IconButton(onClick = { secretValue = randomSecretHex() }) {
+                            Icon(Icons.Default.Casino, contentDescription = "Generate random secret")
+                        }
+                        IconButton(onClick = { launchScan() }) {
+                            Icon(Icons.Default.QrCodeScanner, contentDescription = "Scan QR")
+                        }
                     }
                 },
                 supportingText = {
                     if (secretValue.isNotEmpty() && !secretValid) Text("Must be exactly 32 hexadecimal characters.")
+                    else Text("Tap the dice to generate a new random key.")
                 },
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -314,3 +323,16 @@ private fun JoinChannelSheet(
         }
     }
 }
+
+// Friendly word pool for suggesting channel names (three hyphenated words, e.g. "amber-river-fox").
+private val nameWords = listOf(
+    "amber", "river", "fox", "echo", "delta", "north", "ember", "lunar", "cedar", "quartz",
+    "harbor", "pixel", "cobalt", "maple", "raven", "summit", "tundra", "violet", "willow", "zephyr",
+    "comet", "drift", "flint", "glade", "haze", "ivory", "jade", "kelp", "lark", "moss",
+    "nova", "onyx", "pine", "reef", "sage", "thorn", "umber", "vapor", "wren", "yarrow",
+)
+
+private fun randomChannelName(): String = (1..3).map { nameWords.random() }.joinToString("-")
+
+private fun randomSecretHex(): String =
+    ByteArray(16).also { SecureRandom().nextBytes(it) }.toHex()

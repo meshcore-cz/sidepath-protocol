@@ -20,20 +20,28 @@ import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Route
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -49,6 +57,53 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/**
+ * A borderless search field for a TopAppBar title. Requests focus and pops the keyboard as soon
+ * as it appears so the user can start typing immediately.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SearchField(value: String, onValueChange: (String) -> Unit, placeholder: String) {
+    val focus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(Unit) {
+        focus.requestFocus()
+        keyboard?.show()
+    }
+    TextField(
+        value = value,
+        onValueChange = onValueChange,
+        singleLine = true,
+        placeholder = { Text(placeholder) },
+        colors = TextFieldDefaults.colors(
+            focusedContainerColor = Color.Transparent,
+            unfocusedContainerColor = Color.Transparent,
+            focusedIndicatorColor = Color.Transparent,
+            unfocusedIndicatorColor = Color.Transparent,
+        ),
+        modifier = Modifier.fillMaxWidth().focusRequester(focus),
+    )
+}
+
+/** Centered placeholder shown while a search is active but the query is still empty. */
+@Composable
+fun SearchHint(text: String, modifier: Modifier = Modifier) {
+    Column(
+        modifier,
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(
+            Icons.Default.Search,
+            contentDescription = null,
+            modifier = Modifier.size(48.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.size(12.dp))
+        Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
 private val avatarColors = listOf(
     Color(0xFF6750A4), Color(0xFF1565C0), Color(0xFF2E7D32), Color(0xFFB71C1C),
     Color(0xFFEF6C00), Color(0xFF00838F), Color(0xFFAD1457), Color(0xFF4527A0),
@@ -57,12 +112,17 @@ private val avatarColors = listOf(
 /** How avatars are drawn app-wide; provided at the root from the user's setting. */
 val LocalAvatarStyle = staticCompositionLocalOf { AvatarStyle.IDENTICON }
 
+/**
+ * Avatar for a contact/channel. When the identicon style is on AND an [identiconKey] is given
+ * (a contact's public key), draws a deterministic identicon from that key; otherwise a colored
+ * initials circle. Channels (no public key) always fall back to initials.
+ */
 @Composable
-fun Avatar(seed: String, label: String, size: Int = 44, onClick: (() -> Unit)? = null) {
+fun Avatar(seed: String, label: String, size: Int = 44, identiconKey: String? = null, onClick: (() -> Unit)? = null) {
     val base = Modifier.size(size.dp).clip(CircleShape)
         .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-    if (LocalAvatarStyle.current == AvatarStyle.IDENTICON) {
-        Identicon(seed, base)
+    if (LocalAvatarStyle.current == AvatarStyle.IDENTICON && !identiconKey.isNullOrBlank()) {
+        Identicon(identiconKey, base)
     } else {
         val color = avatarColors[(seed.hashCode().ushr(1)) % avatarColors.size]
         val initials = label.trim().take(2).uppercase().ifBlank { "?" }
@@ -72,15 +132,27 @@ fun Avatar(seed: String, label: String, size: Int = 44, onClick: (() -> Unit)? =
     }
 }
 
-/** A deterministic GitHub-style identicon: a 5×5 left-right-mirrored grid hashed from [seed]. */
+// A spread of distinct, vivid identicon colours across the whole hue wheel — picking from these
+// gives far more visible variety than a low-saturation HSV sweep (which read as muted blues).
+private val identiconColors = listOf(
+    Color(0xFFE53935), Color(0xFFD81B60), Color(0xFF8E24AA), Color(0xFF5E35B1),
+    Color(0xFF3949AB), Color(0xFF1E88E5), Color(0xFF00ACC1), Color(0xFF00897B),
+    Color(0xFF43A047), Color(0xFF7CB342), Color(0xFFC0CA33), Color(0xFFFDD835),
+    Color(0xFFFFB300), Color(0xFFFB8C00), Color(0xFFF4511E), Color(0xFF6D4C41),
+)
+
+/** A deterministic GitHub-style identicon (5×5 mirrored grid hashed from [key]). */
 @Composable
-private fun Identicon(seed: String, modifier: Modifier) {
-    val digest = remember(seed) { java.security.MessageDigest.getInstance("MD5").digest(seed.toByteArray()) }
-    val fg = remember(seed) {
-        val hue = (digest[0].toInt() and 0xFF) / 255f * 360f
-        Color.hsv(hue, 0.55f, 0.85f)
+private fun Identicon(key: String, modifier: Modifier) {
+    // Same vivid foreground in both themes; only the backdrop swaps to stay legible in dark mode.
+    val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+    val digest = remember(key) { java.security.MessageDigest.getInstance("MD5").digest(key.toByteArray()) }
+    // Colour from one hash byte, grid pattern from the others, so similar keys still diverge.
+    val fg = remember(key) {
+        val idx = ((digest[5].toInt() and 0xFF) xor (digest[11].toInt() and 0xFF)) % identiconColors.size
+        identiconColors[idx]
     }
-    val bg = Color(0xFFEDEDED)
+    val bg = if (dark) Color(0xFF26262A) else Color(0xFFEDEDED)
     Canvas(modifier.background(bg)) {
         val cell = size.minDimension / 5f
         for (row in 0 until 5) {
@@ -88,11 +160,7 @@ private fun Identicon(seed: String, modifier: Modifier) {
                 val on = (digest[row * 3 + col].toInt() and 1) == 0
                 if (!on) continue
                 for (c in intArrayOf(col, 4 - col)) {
-                    drawRect(
-                        color = fg,
-                        topLeft = Offset(c * cell, row * cell),
-                        size = Size(cell, cell),
-                    )
+                    drawRect(color = fg, topLeft = Offset(c * cell, row * cell), size = Size(cell, cell))
                 }
             }
         }
@@ -168,6 +236,7 @@ fun DeliveryTick(status: Int) {
 
 private val timeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
 private val dayFmt = SimpleDateFormat("MMM d", Locale.getDefault())
+private val fullDayFmt = SimpleDateFormat("EEEE, MMM d", Locale.getDefault())
 
 fun formatClock(ts: Long): String = timeFmt.format(Date(ts))
 
@@ -176,6 +245,41 @@ fun formatRelative(ts: Long): String {
     val sameDay = dayFmt.format(Date(ts)) == dayFmt.format(Date(now))
     return if (sameDay) timeFmt.format(Date(ts)) else dayFmt.format(Date(ts))
 }
+
+/**
+ * Per-message timestamp: "now" (<5s), "Ns ago" (<1m), "Nm ago" (<1h), else the clock time.
+ * Recomputed on recomposition (not a live ticker).
+ */
+fun formatMessageTime(ts: Long): String {
+    val diff = System.currentTimeMillis() - ts
+    return when {
+        diff < 0 -> timeFmt.format(Date(ts))
+        diff < 5_000 -> "now"
+        diff < 60_000 -> "${diff / 1000}s ago"
+        diff < 3_600_000 -> "${diff / 60_000}m ago"
+        else -> timeFmt.format(Date(ts))
+    }
+}
+
+private fun isSameDay(a: Long, b: Long): Boolean {
+    val ca = java.util.Calendar.getInstance().apply { timeInMillis = a }
+    val cb = java.util.Calendar.getInstance().apply { timeInMillis = b }
+    return ca.get(java.util.Calendar.YEAR) == cb.get(java.util.Calendar.YEAR) &&
+        ca.get(java.util.Calendar.DAY_OF_YEAR) == cb.get(java.util.Calendar.DAY_OF_YEAR)
+}
+
+/** A day separator label: "Today", "Yesterday", or e.g. "Monday, Jun 9". */
+fun dateLabel(ts: Long): String {
+    val now = System.currentTimeMillis()
+    return when {
+        isSameDay(ts, now) -> "Today"
+        isSameDay(ts, now - 86_400_000L) -> "Yesterday"
+        else -> fullDayFmt.format(Date(ts))
+    }
+}
+
+/** True when [a] and [b] fall on different calendar days (used to insert date separators). */
+fun differentDay(a: Long, b: Long): Boolean = !isSameDay(a, b)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

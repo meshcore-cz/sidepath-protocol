@@ -31,8 +31,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -42,7 +40,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -86,19 +83,7 @@ fun ChatsScreen(
                 },
                 title = {
                     if (searching) {
-                        TextField(
-                            value = query,
-                            onValueChange = { query = it },
-                            singleLine = true,
-                            placeholder = { Text("Search chats") },
-                            colors = TextFieldDefaults.colors(
-                                focusedContainerColor = Color.Transparent,
-                                unfocusedContainerColor = Color.Transparent,
-                                focusedIndicatorColor = Color.Transparent,
-                                unfocusedIndicatorColor = Color.Transparent,
-                            ),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                        SearchField(query, { query = it }, "Search chats")
                     } else {
                         Text("BLEEdge")
                     }
@@ -138,10 +123,12 @@ fun ChatsScreen(
         // Root scaffold reserves the bottom-nav space; TopAppBar handles the status bar.
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
-        if (visible.isEmpty()) {
-            EmptyState(Modifier.fillMaxSize().padding(padding), searching = searching)
-        } else {
-            LazyColumn(Modifier.fillMaxSize().padding(padding)) {
+        when {
+            searching && query.isBlank() ->
+                SearchHint("Start typing to search chats…", Modifier.fillMaxSize().padding(padding))
+            visible.isEmpty() ->
+                EmptyState(Modifier.fillMaxSize().padding(padding), searching = searching)
+            else -> LazyColumn(Modifier.fillMaxSize().padding(padding)) {
                 items(visible, key = { it.peerHex }) { conv ->
                     ConversationRow(
                         conv,
@@ -172,7 +159,7 @@ private fun ConversationRow(conv: ConversationSummary, onClick: () -> Unit, onAv
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = conv.peerHex, label = conv.title, onClick = onAvatarClick)
+        Avatar(seed = conv.peerHex, label = conv.title, identiconKey = conv.pubKeyHex, onClick = onAvatarClick)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(conv.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -260,7 +247,7 @@ private fun NewChatSheet(vm: ChatViewModel, onPick: (AdvertisedNode) -> Unit, on
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         val label = node.description.ifBlank { node.nodeHex }
-                        Avatar(seed = node.nodeHex, label = label)
+                        Avatar(seed = node.nodeHex, label = label, identiconKey = node.pubKeyHex)
                         Spacer(Modifier.width(12.dp))
                         Column {
                             Text(label, fontWeight = FontWeight.Medium)

@@ -3,7 +3,9 @@ package cz.arnal.bleedge.chat.ui
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,7 +19,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.Route
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -53,6 +57,7 @@ fun ProfileScreen(
     peerHex: String,
     onBack: () -> Unit,
     onOpenConversation: (String) -> Unit,
+    onTrace: (String) -> Unit,
 ) {
     val profile by remember(peerHex) { vm.profileFor(peerHex) }.collectAsState()
     var renaming by remember { mutableStateOf(false) }
@@ -84,8 +89,14 @@ fun ProfileScreen(
                 .padding(horizontal = 24.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // Big centered avatar.
-            Avatar(seed = peerHex, label = profile.name, size = 120)
+            // Big centered avatar. Identicons are keyed on a contact's public key; channels
+            // (and contacts without a known key) fall back to initials.
+            Avatar(
+                seed = peerHex,
+                label = profile.name,
+                size = 120,
+                identiconKey = if (!profile.isChannel) profile.pubKeyHex else null,
+            )
             Spacer(Modifier.size(16.dp))
             Text(
                 if (profile.isChannel) channelLabel(profile.name, profile.channelKind) else profile.name,
@@ -104,18 +115,29 @@ fun ProfileScreen(
                 )
             }
 
-            Spacer(Modifier.size(24.dp))
-
-            // Information block.
-            if (profile.isChannel) {
-                ChannelInfo(profile)
-            } else {
-                UserInfo(profile)
+            // Direct messages to a contact are end-to-end encrypted.
+            if (!profile.isChannel) {
+                Spacer(Modifier.size(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Lock,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.size(4.dp))
+                    Text(
+                        "End-to-end encrypted",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
 
-            Spacer(Modifier.size(28.dp))
+            Spacer(Modifier.size(20.dp))
 
-            // Actions.
+            // Actions, kept compact and up near the hero. Primary action is full-width; the
+            // rest are a row of small icon-over-label buttons.
             Button(
                 onClick = { onOpenConversation(peerHex) },
                 modifier = Modifier.fillMaxWidth(),
@@ -125,32 +147,28 @@ fun ProfileScreen(
                 Text(if (profile.isChannel) "Open channel" else "Message")
             }
             Spacer(Modifier.size(8.dp))
-            OutlinedButton(onClick = { renaming = true }, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Default.Edit, contentDescription = null)
-                Spacer(Modifier.size(8.dp))
-                Text("Rename")
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                CompactAction(Icons.Default.Edit, "Rename") { renaming = true }
+                if (!profile.isChannel) {
+                    CompactAction(Icons.Default.Route, "Trace") { onTrace(peerHex) }
+                }
+                if (profile.isChannel) {
+                    CompactAction(Icons.Default.Logout, "Leave") { confirmDelete = true }
+                } else if (profile.isContact) {
+                    CompactAction(Icons.Default.Delete, "Delete") { confirmDelete = true }
+                }
             }
 
+            Spacer(Modifier.size(28.dp))
+
+            // Information block.
             if (profile.isChannel) {
-                Spacer(Modifier.size(8.dp))
-                OutlinedButton(
-                    onClick = { confirmDelete = true },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Default.Logout, contentDescription = null)
-                    Spacer(Modifier.size(8.dp))
-                    Text("Leave channel")
-                }
-            } else if (profile.isContact) {
-                Spacer(Modifier.size(8.dp))
-                OutlinedButton(
-                    onClick = { confirmDelete = true },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Default.Delete, contentDescription = null)
-                    Spacer(Modifier.size(8.dp))
-                    Text("Delete from contacts")
-                }
+                ChannelInfo(profile)
+            } else {
+                UserInfo(profile)
             }
 
             // Share QR — a MeshCore URI other apps can scan to add this contact/channel.
@@ -211,6 +229,26 @@ fun ProfileScreen(
                 TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
             },
         )
+    }
+}
+
+/** A small icon-over-label outlined button that shares a row evenly with its siblings. */
+@Composable
+private fun RowScope.CompactAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier.weight(1f),
+        contentPadding = PaddingValues(vertical = 10.dp, horizontal = 4.dp),
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.size(4.dp))
+            Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+        }
     }
 }
 

@@ -183,7 +183,7 @@ cross-language compactness. Field order is irrelevant; keys are authoritative.
 | 8 | `route_cursor` | uint8 | index into `route` (source-route) |
 | 9 | `route` | array of 8-byte | ordered next-hops (source-route) |
 | 10 | `trace` | array of 8-byte | hops visited so far (appended per hop) |
-| 11 | `payload_type` | uint8 | 1=TEXT_TEST, 2=MESHCORE_RAW, 3=CHAT_PLAIN, 4=CHAT_ENCRYPTED, 5=CHANNEL, 6=TRACE_REQ, 7=TRACE_RESP |
+| 11 | `payload_type` | uint8 | 1=TEXT_TEST, 2=MESHCORE_RAW, 3=CHAT_PLAIN, 4=CHAT_ENCRYPTED, 5=CHANNEL, 6=TRACE_REQ, 7=TRACE_RESP, 8=TYPING |
 | 12 | `payload` | bytes | opaque |
 | 13 | `seq` | uint32 | ANNOUNCE sequence; omitted when 0 |
 | 14 | `trace_metric` | array of int8 | optional TRACE link samples; metric meaning is payload-specific |
@@ -278,6 +278,17 @@ mesh treats both as opaque `payload` and routes them like any other DATA packet
   key, otherwise the node replies with `not authenticated`. Commands are firmware
   local behavior (`help`, `sensors`, `stats`, `admins`, `admin.add`, `admin.remove`)
   and are not interpreted by the routing layer.
+
+- **`TYPING` (8)** — ephemeral "peer is typing" hint. A unicast DATA packet with an
+  **empty** `payload`, addressed to the conversation peer. It is a pure client-side
+  affordance and carries no content: the routing layer treats it like any other DATA
+  packet for relaying, but it is **never ACKed** (routers skip ACK generation for
+  `TYPING`, alongside `TRACE_*`). The sender re-emits it every ~10 s while the user is
+  actively typing and stops on send / idle / leaving the chat. The receiver shows it
+  transiently and drops it on a timeout (~13 s) or immediately when a real message
+  arrives from that peer. The ESP32 relay emits one before replying to an admin command
+  so the sender sees activity during the slow key verification. No persistence, no
+  retransmit guarantees — drops are harmless.
 
 ### 4.4 Channels — MeshCore-compatible (`CHANNEL`, payload_type 5)
 
@@ -377,7 +388,7 @@ given an incoming packet and the peer it arrived from, it returns a list of
 4. Append `LocalID` to `trace`.
 5. **Deliver locally** if broadcast or `destination == LocalID`. For a *unicast*
    DATA packet addressed to us, also emit an ACK (section 5.4), except
-   `TRACE_REQ`, which returns a `TRACE_RESP` instead.
+   `TRACE_REQ` (which returns a `TRACE_RESP` instead) and `TYPING` (never ACKed).
 6. **Relay** if `ttl > 1` and (broadcast or not addressed to us): decrement TTL
    and re-flood. The incoming peer is excluded from the relay set (split-horizon).
    TRACE packets are never re-flooded.
@@ -396,7 +407,7 @@ Apply **flood jitter** of a random 10–100 ms before relaying to reduce collisi
 ### 5.4 ACK (`type == 3`)
 
 ACKs are generated automatically for **unicast DATA** that is delivered locally,
-except `TRACE_REQ` packets:
+except `TRACE_REQ` and `TYPING` packets (both opt out of ACK):
 
 - `destination = original.source`, `ttl = len(trace)+1`.
 - If the inbound `trace` had >1 hop, the ACK is sent **SOURCE_ROUTE** along the
@@ -410,7 +421,8 @@ except `TRACE_REQ` packets:
 - The ACK `payload` (key 12) carries the 16-byte `id` of the DATA packet being
   acked, so an originator can match a delivery confirmation to a specific outgoing
   message. (Additive; relays/nodes that don't track per-message delivery ignore it.
-  Implemented in the Android router; Go/firmware leave the ACK payload empty.)
+  Implemented in the Android router; the ESP32 relay also sets it when ACKing a DM
+  addressed to it. Go nodes currently leave the ACK payload empty.)
 
 ### 5.5 Route selection
 

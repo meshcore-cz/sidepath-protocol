@@ -13,12 +13,14 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -27,6 +29,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Mood
 import androidx.compose.material.icons.filled.MoreVert
@@ -45,10 +48,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -57,18 +59,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.ChatViewModel
+import kotlinx.coroutines.delay
 import cz.arnal.bleedge.chat.MeshCoreUri
+import cz.arnal.bleedge.chat.ProfileInfo
 import cz.arnal.bleedge.chat.data.Message
 import cz.arnal.bleedge.chat.data.channelPskHexOf
 import cz.arnal.bleedge.chat.data.isChannelPeer
@@ -84,7 +90,7 @@ fun ConversationScreen(
     val isChannel = isChannelPeer(peerHex)
     val messages by remember(peerHex) { vm.messagesFor(peerHex) }.collectAsState()
     val profile by remember(peerHex) { vm.profileFor(peerHex) }.collectAsState()
-    var draft by remember { mutableStateOf("") }
+    var draft by remember { mutableStateOf(TextFieldValue("")) }
     var detailsFor by remember { mutableStateOf<Message?>(null) }
     var searching by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
@@ -94,6 +100,24 @@ fun ConversationScreen(
     var confirmLeave by remember { mutableStateOf(false) }
 
     LaunchedEffect(peerHex, messages.size) { vm.markRead(peerHex) }
+
+    // Whether the remote peer is currently typing (DMs only).
+    val typingPeers by vm.typingPeers.collectAsState()
+    val peerTyping = !isChannel && peerHex in typingPeers
+
+    // Drive outgoing typing hints: each keystroke (re)arms this; after ~5s of no change we
+    // consider the user stopped. An empty field stops immediately, as does leaving the screen.
+    LaunchedEffect(draft.text, peerHex, isChannel) {
+        if (isChannel) return@LaunchedEffect
+        if (draft.text.isBlank()) {
+            vm.stopTyping(peerHex)
+            return@LaunchedEffect
+        }
+        vm.onUserTyping(peerHex)
+        delay(5_000)
+        vm.stopTyping(peerHex)
+    }
+    DisposableEffect(peerHex) { onDispose { vm.stopTyping(peerHex) } }
 
     // Channel participants (name → node id) learned from the channel's messages; used to
     // resolve a tapped @mention to a profile, and to power the @-autocomplete.
@@ -105,7 +129,7 @@ fun ConversationScreen(
         mentionTargets[name]?.let { hex -> onOpenProfile?.invoke(hex) }
     }
 
-    val mentionQuery = if (isChannel) mentionQueryOf(draft) else null
+    val mentionQuery = if (isChannel) mentionQueryOf(draft.text) else null
     val suggestions = if (mentionQuery != null) {
         mentionTargets.keys.filter { it.contains(mentionQuery, ignoreCase = true) }.sorted().take(6)
     } else emptyList()
@@ -133,29 +157,24 @@ fun ConversationScreen(
                 },
                 title = {
                     if (searching) {
-                        TextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            singleLine = true,
-                            placeholder = { Text("Search messages") },
-                            colors = TextFieldDefaults.colors(
-                                focusedContainerColor = Color.Transparent,
-                                unfocusedContainerColor = Color.Transparent,
-                                focusedIndicatorColor = Color.Transparent,
-                                unfocusedIndicatorColor = Color.Transparent,
-                            ),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                        SearchField(searchQuery, { searchQuery = it }, "Search messages")
                     } else {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = if (onOpenProfile != null) Modifier.clickable { onOpenProfile(peerHex) } else Modifier,
                         ) {
-                            Avatar(seed = peerHex, label = profile.name, size = 36)
+                            Avatar(
+                                seed = peerHex,
+                                label = profile.name,
+                                size = 36,
+                                identiconKey = if (!isChannel) profile.pubKeyHex else null,
+                            )
                             Spacer(Modifier.width(10.dp))
                             Column {
                                 Text(profile.name, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                val showKey = !isChannel && !peerTyping && profile.pubKeyHex.isNotBlank()
                                 val subtitle = when {
+                                    peerTyping -> "typing…"
                                     isChannel -> "Channel · shared-key encrypted"
                                     profile.pubKeyHex.isNotBlank() -> formatPubKey(profile.pubKeyHex)
                                     else -> "End-to-end encrypted"
@@ -163,8 +182,8 @@ fun ConversationScreen(
                                 Text(
                                     subtitle,
                                     style = MaterialTheme.typography.labelSmall,
-                                    fontFamily = if (!isChannel && profile.pubKeyHex.isNotBlank()) FontFamily.Monospace else FontFamily.Default,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontFamily = if (showKey) FontFamily.Monospace else FontFamily.Default,
+                                    color = if (peerTyping) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
                         }
@@ -211,18 +230,22 @@ fun ConversationScreen(
         bottomBar = {
             Column {
                 if (suggestions.isNotEmpty()) {
-                    MentionSuggestions(suggestions) { name -> draft = insertMention(draft, name) }
+                    MentionSuggestions(suggestions) { name ->
+                        val t = insertMention(draft.text, name)
+                        draft = TextFieldValue(t, TextRange(t.length))
+                    }
                 }
                 MessageInput(
-                    draft = draft,
+                    value = draft,
                     onChange = { draft = it },
                     fullScreen = onBack != null,
                     onEmoji = { showEmoji = true },
                     onSend = {
-                        if (draft.isNotBlank()) {
-                            if (isChannel) vm.sendChannelMessage(channelPskHexOf(peerHex), draft)
-                            else vm.sendChat(peerHex, draft)
-                            draft = ""
+                        val text = draft.text
+                        if (text.isNotBlank()) {
+                            if (isChannel) vm.sendChannelMessage(channelPskHexOf(peerHex), text)
+                            else vm.sendChat(peerHex, text)
+                            draft = TextFieldValue("")
                         }
                     },
                 )
@@ -231,6 +254,10 @@ fun ConversationScreen(
         // TopAppBar + composer handle their own system-bar/ime insets.
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
+        if (searching && searchQuery.isBlank()) {
+            SearchHint("Start typing to search messages…", Modifier.fillMaxSize().padding(padding))
+            return@Scaffold
+        }
         val listState = rememberLazyListState()
         // Jump straight to the newest message on first load (no visible scroll-down), then
         // animate to the bottom only for messages arriving while the chat is open. Skipped
@@ -238,17 +265,18 @@ fun ConversationScreen(
         var positioned by remember(peerHex) { mutableStateOf(false) }
         LaunchedEffect(messages.size) {
             if (searching || messages.isEmpty()) return@LaunchedEffect
+            // +1 for the header panel item that precedes the messages.
             if (!positioned) {
-                listState.scrollToItem(messages.size - 1)
+                listState.scrollToItem(messages.size)
                 positioned = true
             } else {
-                listState.animateScrollToItem(messages.size - 1)
+                listState.animateScrollToItem(messages.size)
             }
         }
         val imeVisible = WindowInsets.isImeVisible
         LaunchedEffect(imeVisible) {
             if (!searching && imeVisible && messages.isNotEmpty() && !listState.canScrollForward) {
-                listState.animateScrollToItem(messages.size - 1)
+                listState.animateScrollToItem(messages.size)
             }
         }
         LazyColumn(
@@ -258,10 +286,26 @@ fun ConversationScreen(
             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            items(shown, key = { it.id }) { msg ->
+            // A header panel with a big avatar + basic details; also fills the empty space of a
+            // brand-new conversation. Hidden while searching so results aren't pushed down.
+            if (!searching) {
+                item(key = "__header__") {
+                    ConversationHeaderPanel(profile, isChannel, onClick = { onOpenProfile?.invoke(peerHex) })
+                }
+            }
+            itemsIndexed(shown, key = { _, m -> m.id }) { i, msg ->
                 val sender = if (isChannel) msg.senderName.ifBlank { vm.nameForHex(msg.senderHex) }
                 else vm.nameForHex(msg.senderHex)
-                MessageBubble(msg, isChannel, sender, onMentionClick) { detailsFor = msg }
+                Column {
+                    // Date separator whenever the day changes (first message always gets one).
+                    if (!searching) {
+                        val prev = shown.getOrNull(i - 1)
+                        if (prev == null || differentDay(prev.timestampMs, msg.timestampMs)) {
+                            DateSeparator(dateLabel(msg.timestampMs))
+                        }
+                    }
+                    MessageBubble(msg, isChannel, sender, onMentionClick) { detailsFor = msg }
+                }
             }
         }
     }
@@ -278,7 +322,15 @@ fun ConversationScreen(
         )
     }
     if (showEmoji) {
-        EmojiPickerSheet(onPick = { draft += it }, onDismiss = { showEmoji = false })
+        EmojiPickerSheet(
+            onPick = { emoji ->
+                // Append the emoji, drop the cursor at the end, and close the picker.
+                val t = draft.text + emoji
+                draft = TextFieldValue(t, TextRange(t.length))
+                showEmoji = false
+            },
+            onDismiss = { showEmoji = false },
+        )
     }
     if (confirmLeave) {
         AlertDialog(
@@ -329,7 +381,7 @@ private fun MessageBubble(
                 Spacer(Modifier.size(2.dp))
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
-                        formatClock(msg.timestampMs),
+                        formatMessageTime(msg.timestampMs),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -343,8 +395,8 @@ private fun MessageBubble(
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 private fun MessageInput(
-    draft: String,
-    onChange: (String) -> Unit,
+    value: TextFieldValue,
+    onChange: (TextFieldValue) -> Unit,
     fullScreen: Boolean,
     onEmoji: () -> Unit,
     onSend: () -> Unit,
@@ -362,12 +414,17 @@ private fun MessageInput(
                 Icon(Icons.Default.Mood, contentDescription = "Emoji")
             }
             OutlinedTextField(
-                value = draft,
+                value = value,
                 onValueChange = onChange,
                 modifier = Modifier.weight(1f).onPreviewKeyEvent { e ->
-                    // Enter sends; Ctrl+Enter inserts a newline (handy on hardware keyboards).
+                    // Enter sends; Shift+Enter inserts a newline at the cursor.
                     if (e.type == KeyEventType.KeyDown && e.key == Key.Enter) {
-                        if (e.isCtrlPressed) { onChange(draft + "\n"); true } else { onSend(); true }
+                        if (e.isShiftPressed) {
+                            val sel = value.selection
+                            val text = value.text.substring(0, sel.start) + "\n" + value.text.substring(sel.end)
+                            onChange(TextFieldValue(text, TextRange(sel.start + 1)))
+                            true
+                        } else { onSend(); true }
                     } else false
                 },
                 placeholder = { Text("Message") },
@@ -376,7 +433,7 @@ private fun MessageInput(
                 visualTransformation = mentionInputTransformation(accent),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
             )
-            IconButton(onClick = onSend, enabled = draft.isNotBlank()) {
+            IconButton(onClick = onSend, enabled = value.text.isNotBlank()) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
             }
         }
@@ -393,6 +450,85 @@ private fun MentionSuggestions(names: List<String>, onPick: (String) -> Unit) {
         ) {
             items(names, key = { it }) { name ->
                 AssistChip(onClick = { onPick(name) }, label = { Text("@$name") })
+            }
+        }
+    }
+}
+
+/** Centered day separator ("Today" / "Yesterday" / date) between message groups. */
+@Composable
+private fun DateSeparator(label: String) {
+    Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+        Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(12.dp)) {
+            Text(
+                label,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * Header at the top of the message stream: a large avatar and a few basic details. Doubles as
+ * the filler for a brand-new, empty conversation.
+ */
+@Composable
+private fun ConversationHeaderPanel(profile: ProfileInfo, isChannel: Boolean, onClick: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Avatar(
+            seed = profile.peerHex,
+            label = profile.name,
+            size = 88,
+            identiconKey = if (!isChannel) profile.pubKeyHex else null,
+        )
+        Spacer(Modifier.size(10.dp))
+        Text(
+            if (isChannel) channelLabel(profile.name, profile.channelKind) else profile.name,
+            style = MaterialTheme.typography.titleLarge,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.size(4.dp))
+        if (isChannel) {
+            Text(
+                "Group channel · 0x%02x".format(profile.channelHash),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.size(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    "Shared-key encrypted",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            if (profile.pubKeyHex.isNotBlank()) {
+                Text(
+                    formatPubKey(profile.pubKeyHex),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.size(4.dp))
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    "End-to-end encrypted",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

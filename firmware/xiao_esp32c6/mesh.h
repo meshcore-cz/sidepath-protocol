@@ -29,6 +29,7 @@ enum : uint8_t {
   PAYLOAD_TEXT = 1, PAYLOAD_MESH_CORE_RAW = 2, PAYLOAD_CHAT_PLAIN = 3,
   PAYLOAD_CHAT_ENCRYPTED = 4, PAYLOAD_CHANNEL = 5, PAYLOAD_TRACE_REQUEST = 6,
   PAYLOAD_TRACE_RESPONSE = 7,
+  PAYLOAD_TYPING = 8,  // ephemeral "peer is typing" hint — never ACKed, empty payload
 };
 
 // Capability bits (see core/types.go).

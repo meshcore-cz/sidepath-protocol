@@ -41,6 +41,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.ChatViewModel
+import cz.arnal.bleedge.chat.ThemeMode
 import cz.arnal.bleedge.chat.hexToBytes
 import cz.arnal.bleedge.chat.toHex
 import cz.arnal.bleedge.core.Identity
@@ -53,6 +54,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
     val description by vm.description.collectAsState()
     val phyMode by vm.phyMode.collectAsState()
     val avatarStyle by vm.avatarStyle.collectAsState()
+    val themeMode by vm.themeMode.collectAsState()
 
     val pubKeyHex = remember(seedHex) {
         runCatching { Identity.fromSeed(seedHex.hexToBytes()).publicKey.toHex() }.getOrDefault("")
@@ -139,6 +141,27 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                             onClick = { if (!vm.applySeed(seedDraft)) seedError = true },
                             enabled = seedDraft != seedHex,
                         ) { Text("Apply") }
+                    }
+                }
+            }
+
+            // Appearance (theme)
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Appearance", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Auto follows the system dark-mode setting.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ThemeMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = themeMode == mode,
+                                onClick = { vm.setThemeMode(mode) },
+                                label = { Text(mode.value.replaceFirstChar { it.uppercase() }) },
+                            )
+                        }
                     }
                 }
             }

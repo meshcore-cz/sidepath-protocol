@@ -14,7 +14,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import cz.arnal.bleedge.chat.ui.ChatRoot
 
 class ChatActivity : ComponentActivity() {
@@ -44,7 +48,21 @@ class ChatActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            val colors = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+            val themeMode by viewModel.themeMode.collectAsState()
+            val dark = when (themeMode) {
+                ThemeMode.AUTO -> isSystemInDarkTheme()
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+            }
+            val colors = if (dark) darkColorScheme() else lightColorScheme()
+            // Match the status/navigation bar icon colour to the theme — otherwise a light theme
+            // leaves white system icons (clock, signal) on a white bar, invisible.
+            SideEffect {
+                WindowCompat.getInsetsController(window, window.decorView).apply {
+                    isAppearanceLightStatusBars = !dark
+                    isAppearanceLightNavigationBars = !dark
+                }
+            }
             MaterialTheme(colorScheme = colors) {
                 Surface {
                     LaunchedEffect(Unit) {

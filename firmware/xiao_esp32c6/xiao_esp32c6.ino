@@ -219,6 +219,28 @@ static void cborEmitUint(std::vector<uint8_t>& o, uint64_t v) {
   }
 }
 
+// Emits a signed CBOR integer (major type 0 for >=0, major type 1 for negative). Needed so a
+// negative trace tag round-trips to Kotlin's CBORObject.AsInt32() (an unsigned encoding of a
+// value > 2^31 would throw there).
+static void cborEmitInt(std::vector<uint8_t>& o, int32_t v) {
+  if (v >= 0) {
+    cborEmitUint(o, (uint64_t)v);
+    return;
+  }
+  uint32_t n = (uint32_t)(-(int64_t)v - 1);  // CBOR negative: encodes -(n+1)
+  if (n < 24) {
+    o.push_back(0x20 | (uint8_t)n);
+  } else if (n < 0x100) {
+    o.push_back(0x38); o.push_back((uint8_t)n);
+  } else if (n < 0x10000) {
+    o.push_back(0x39); o.push_back((uint8_t)(n >> 8)); o.push_back((uint8_t)n);
+  } else {
+    o.push_back(0x3a);
+    o.push_back((uint8_t)(n >> 24)); o.push_back((uint8_t)(n >> 16));
+    o.push_back((uint8_t)(n >> 8));  o.push_back((uint8_t)n);
+  }
+}
+
 static void cborEmitBstr(std::vector<uint8_t>& o, const uint8_t* d, size_t n) {
   if (n < 24) {
     o.push_back(0x40 | (uint8_t)n);
@@ -544,14 +566,17 @@ static void sendPacketToConn(const std::vector<uint8_t>& pkt, const uint8_t pid[
   }
 }
 
-static void buildEncryptedReplyPacket(const uint8_t destNode[mesh::NODE_ID_LEN],
-                                      const std::vector<uint8_t>& envelope,
-                                      const uint8_t pid[mesh::PACKET_ID_LEN],
-                                      std::vector<uint8_t>& pkt) {
+// Builds a 12-key CBOR packet this relay originates back to a node (FLOOD, ttl 3, no route/
+// trace). Used for encrypted replies, ACKs, and typing hints.
+static void buildSelfPacket(uint8_t pktType, uint8_t payloadType,
+                            const uint8_t destNode[mesh::NODE_ID_LEN],
+                            const uint8_t* payload, size_t payloadLen,
+                            const uint8_t pid[mesh::PACKET_ID_LEN],
+                            std::vector<uint8_t>& pkt) {
   pkt.clear();
   pkt.push_back(0xac);  // map(12), keys 1..12
   pkt.push_back(mesh::KEY_VERSION);      cborEmitUint(pkt, mesh::PROTOCOL_VERSION);
-  pkt.push_back(mesh::KEY_TYPE);         cborEmitUint(pkt, mesh::TYPE_DATA);
+  pkt.push_back(mesh::KEY_TYPE);         cborEmitUint(pkt, pktType);
   pkt.push_back(mesh::KEY_ID);           cborEmitBstr(pkt, pid, mesh::PACKET_ID_LEN);
   pkt.push_back(mesh::KEY_SOURCE);       cborEmitBstr(pkt, g_nodeId, mesh::NODE_ID_LEN);
   pkt.push_back(mesh::KEY_DEST);         cborEmitBstr(pkt, destNode, mesh::NODE_ID_LEN);
@@ -560,8 +585,8 @@ static void buildEncryptedReplyPacket(const uint8_t destNode[mesh::NODE_ID_LEN],
   pkt.push_back(mesh::KEY_ROUTE_CURSOR); cborEmitUint(pkt, 0);
   pkt.push_back(mesh::KEY_ROUTE);        pkt.push_back(0xf6);  // null
   pkt.push_back(mesh::KEY_TRACE);        pkt.push_back(0xf6);  // null
-  pkt.push_back(mesh::KEY_PAYLOAD_TYPE); cborEmitUint(pkt, mesh::PAYLOAD_CHAT_ENCRYPTED);
-  pkt.push_back(mesh::KEY_PAYLOAD);      cborEmitBstr(pkt, envelope.data(), envelope.size());
+  pkt.push_back(mesh::KEY_PAYLOAD_TYPE); cborEmitUint(pkt, payloadType);
+  pkt.push_back(mesh::KEY_PAYLOAD);      cborEmitBstr(pkt, payload, payloadLen);
 }
 
 static void sendEncryptedReply(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN],
@@ -574,9 +599,70 @@ static void sendEncryptedReply(uint16_t conn, const uint8_t destNode[mesh::NODE_
   uint8_t pid[mesh::PACKET_ID_LEN];
   esp_fill_random(pid, sizeof(pid));
   std::vector<uint8_t> pkt;
-  buildEncryptedReplyPacket(destNode, envelope, pid, pkt);
+  buildSelfPacket(mesh::TYPE_DATA, mesh::PAYLOAD_CHAT_ENCRYPTED, destNode,
+                  envelope.data(), envelope.size(), pid, pkt);
   g_dedup.seenOrAdd(pid);
   sendPacketToConn(pkt, pid, conn);
+}
+
+// ACKs a received DATA message back to its source. The ACK payload is the acked packet's id
+// (matches core.Router.buildAck), so the sender flips the message to "delivered".
+static void sendAckFor(uint16_t conn, const uint8_t source[mesh::NODE_ID_LEN],
+                       const uint8_t ackedId[mesh::PACKET_ID_LEN]) {
+  uint8_t pid[mesh::PACKET_ID_LEN];
+  esp_fill_random(pid, sizeof(pid));
+  std::vector<uint8_t> pkt;
+  // payload_type mirrors the Kotlin/Go ACK default (TEXT).
+  buildSelfPacket(mesh::TYPE_ACK, mesh::PAYLOAD_TEXT, source, ackedId, mesh::PACKET_ID_LEN, pid, pkt);
+  g_dedup.seenOrAdd(pid);
+  sendPacketToConn(pkt, pid, conn);
+}
+
+// Sends an ephemeral "typing" hint so the sender sees activity while we do the slow
+// X25519/verify before replying. Empty payload, never ACKed.
+static void sendTypingHint(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN]) {
+  uint8_t pid[mesh::PACKET_ID_LEN];
+  esp_fill_random(pid, sizeof(pid));
+  uint8_t dummy = 0;  // valid pointer for a zero-length CBOR byte string
+  std::vector<uint8_t> pkt;
+  buildSelfPacket(mesh::TYPE_DATA, mesh::PAYLOAD_TYPING, destNode, &dummy, 0, pid, pkt);
+  g_dedup.seenOrAdd(pid);
+  sendPacketToConn(pkt, pid, conn);
+}
+
+// Answers a TRACE_REQUEST whose source-route ends at this relay (we're the traced node). Builds
+// a minimal TraceResult ({1:tag, 2:auth, 4:[ourNodeId], 8:"rssi"}) and floods it back to the
+// originator so the requester's trace completes (and its RTT timer stops) instead of hanging.
+// The trace tag/auth are the first 8 bytes (LE) of the request payload (MeshCore TRACE prefix).
+static void sendTraceResponse(uint16_t conn, const mesh::PacketHeader& h) {
+  if (!h.hasSource || h.payload == nullptr || h.payloadLen < 8) {
+    return;
+  }
+  int32_t tag = (int32_t)((uint32_t)h.payload[0] | ((uint32_t)h.payload[1] << 8) |
+                          ((uint32_t)h.payload[2] << 16) | ((uint32_t)h.payload[3] << 24));
+  int32_t auth = (int32_t)((uint32_t)h.payload[4] | ((uint32_t)h.payload[5] << 8) |
+                           ((uint32_t)h.payload[6] << 16) | ((uint32_t)h.payload[7] << 24));
+
+  std::vector<uint8_t> result;
+  result.push_back(0xa4);                                            // map(4): keys 1,2,4,8
+  result.push_back(1); cborEmitInt(result, tag);                    // tag (signed)
+  result.push_back(2); cborEmitInt(result, auth);                   // auth_code
+  result.push_back(4);                                              // forward_nodes
+  result.push_back(0x81);                                           // array(1)
+  cborEmitBstr(result, g_nodeId, mesh::NODE_ID_LEN);
+  result.push_back(8);                                              // metric = "rssi"
+  const char metric[] = "rssi";
+  result.push_back(0x60 | 4);
+  result.insert(result.end(), metric, metric + 4);
+
+  uint8_t pid[mesh::PACKET_ID_LEN];
+  esp_fill_random(pid, sizeof(pid));
+  std::vector<uint8_t> pkt;
+  buildSelfPacket(mesh::TYPE_DATA, mesh::PAYLOAD_TRACE_RESPONSE, h.source,
+                  result.data(), result.size(), pid, pkt);
+  g_dedup.seenOrAdd(pid);
+  sendPacketToConn(pkt, pid, conn);
+  Serial.println("[relay] trace endpoint: responded");
 }
 
 static String adminsText() {
@@ -668,6 +754,13 @@ static bool handleRemoteCommand(const mesh::PacketHeader& h, uint16_t sender) {
       h.payload == nullptr || h.payloadLen == 0) {
     return false;
   }
+  // It's a DM addressed to us. Acknowledge delivery right away (so the sender's message flips
+  // to "delivered"), then send a typing hint — verifying the key + X25519 below is slow, so
+  // this tells the sender something is happening before the reply lands.
+  if (h.hasSource) {
+    sendAckFor(sender, h.source, h.id);
+    sendTypingHint(sender, h.source);
+  }
   const uint8_t* envSenderPub;
   const uint8_t* envIV;
   const uint8_t* envCT;
@@ -756,7 +849,9 @@ static void onPacket(const std::vector<uint8_t>& pkt, uint16_t sender) {
       return;
     }
     if (h.routeEndsHere || !h.hasNextHop) {
-      Serial.println("[relay] drop: TRACE route ends at firmware relay (endpoint not supported)");
+      // The trace was addressed to us (we're the final hop): answer it instead of dropping,
+      // so the requester's trace doesn't hang forever.
+      sendTraceResponse(sender, h);
       return;
     }
     if (h.ttl < 2) {

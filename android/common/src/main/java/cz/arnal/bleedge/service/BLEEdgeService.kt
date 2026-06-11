@@ -19,6 +19,7 @@ import cz.arnal.bleedge.ble.BLEManager
 import cz.arnal.bleedge.ble.BLEPeerLink
 import cz.arnal.bleedge.core.Action
 import cz.arnal.bleedge.core.ActionType
+import cz.arnal.bleedge.core.DropReason
 import cz.arnal.bleedge.core.AnnouncePayload
 import cz.arnal.bleedge.core.ANDROID_CAPABILITIES
 import cz.arnal.bleedge.core.Capabilities
@@ -56,6 +57,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
@@ -114,6 +116,16 @@ data class TopologyEntry(
     val lastAnnounceMs: Long = 0L, // wall-clock time the last ANNOUNCE from this node was seen
     val description: String = "",
     val publicKey: ByteArray = ByteArray(0), // 32-byte Ed25519 key (for chat encryption)
+)
+
+/** Running mesh activity counters, surfaced on the Network page. */
+data class MeshStats(
+    val packetsReceived: Int = 0,
+    val packetsSent: Int = 0,
+    val floodRelays: Int = 0,
+    val acksSent: Int = 0,
+    val tracesSent: Int = 0,
+    val duplicatesDropped: Int = 0,
 )
 
 // ---- Service ----------------------------------------------------------------
@@ -183,6 +195,9 @@ class BLEEdgeService : Service() {
 
     private val _knownTopology = MutableStateFlow<List<TopologyEntry>>(emptyList())
     val knownTopology: StateFlow<List<TopologyEntry>> = _knownTopology.asStateFlow()
+
+    private val _stats = MutableStateFlow(MeshStats())
+    val stats: StateFlow<MeshStats> = _stats.asStateFlow()
 
     private var allowlist = mutableSetOf<String>() // hex NodeID strings
 
@@ -451,6 +466,13 @@ class BLEEdgeService : Service() {
 
         pkt = recordTraceMetric(pkt, incomingPeer)
         val actions = router.handlePacket(pkt, incomingPeer)
+        _stats.update { s ->
+            s.copy(
+                packetsReceived = s.packetsReceived + 1,
+                duplicatesDropped = s.duplicatesDropped +
+                    actions.count { it.type == ActionType.DROP && it.reason == DropReason.DUPLICATE },
+            )
+        }
         executeActions(actions)
     }
 
@@ -636,6 +658,7 @@ class BLEEdgeService : Service() {
         val data = runCatching { action.packet.encode() }.getOrElse { return }
         val frames = fragmentPacket(data, 512, action.packet.id)
         sendFramesToAll(frames, exclude = action.nextHop)
+        _stats.update { it.copy(floodRelays = it.floodRelays + 1) }
     }
 
     private fun relayNextHop(action: Action) {
@@ -658,6 +681,7 @@ class BLEEdgeService : Service() {
             sendFramesToAll(frames)
         }
         log("send ACK to=${nh.toHexString().take(8)} route=${action.packet.route.map { it.toHexString().take(8) }}", LogTag.MSG)
+        _stats.update { it.copy(acksSent = it.acksSent + 1) }
     }
 
     private fun sendAnnounce() {
@@ -712,6 +736,16 @@ class BLEEdgeService : Service() {
     fun sendChannelMessage(payload: ByteArray, ttl: Byte = 4): ByteArray =
         sendData(payload, PayloadType.CHANNEL, NodeID.BROADCAST, ttl)
 
+    /**
+     * Sends an ephemeral "I'm typing" hint to [destination]. Carries no payload and is never
+     * ACKed (the router skips ACK for [PayloadType.TYPING]); the recipient shows it transiently
+     * and drops it on a timeout or when a real message arrives. Best-effort — fire and forget.
+     */
+    fun sendTyping(destination: NodeID) {
+        if (destination.isBroadcast()) return
+        sendData(ByteArray(0), PayloadType.TYPING, destination, ttl = 4)
+    }
+
     /** Sends a source-routed trace request. Returns the trace tag, or null if no route is known. */
     fun sendTrace(destination: NodeID, explicitRoute: List<NodeID> = emptyList()): Int? {
         val route = if (explicitRoute.isNotEmpty()) {
@@ -747,6 +781,7 @@ class BLEEdgeService : Service() {
         )
         router.markOriginated(pkt.id)
         transmitToRoute(pkt)
+        _stats.update { it.copy(tracesSent = it.tracesSent + 1) }
         return tag
     }
 
@@ -801,6 +836,7 @@ class BLEEdgeService : Service() {
             sendFramesToAll(frames)
         }
         log("MSG sent dst=${destination.toHexString()} mode=${pkt.mode} type=$payloadType len=${payload.size}", LogTag.MSG)
+        _stats.update { it.copy(packetsSent = it.packetsSent + 1) }
         return pkt.id
     }
 

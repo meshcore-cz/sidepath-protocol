@@ -112,7 +112,7 @@ class Router(val identity: Identity) {
 
         if (withTrace.isBroadcast() || withTrace.destination.toHexString() == localHex) {
             actions += Action(ActionType.DELIVER_LOCAL, packet = withTrace)
-            if (withTrace.type == PacketType.DATA && !withTrace.isBroadcast() && !withTrace.payloadType.isTracePayload()) {
+            if (withTrace.type == PacketType.DATA && !withTrace.isBroadcast() && !withTrace.payloadType.noAck()) {
                 actions += buildAck(withTrace)
             }
         }
@@ -156,7 +156,7 @@ class Router(val identity: Identity) {
         if (newCursor >= updated.route.size) {
             // We are the final destination
             val actions = mutableListOf(Action(ActionType.DELIVER_LOCAL, packet = updated))
-            if (updated.type == PacketType.DATA && !updated.payloadType.isTracePayload()) {
+            if (updated.type == PacketType.DATA && !updated.payloadType.noAck()) {
                 actions += buildAck(updated)
             }
             return actions
@@ -274,4 +274,7 @@ class Router(val identity: Identity) {
 
     private fun PayloadType.isTracePayload(): Boolean =
         this == PayloadType.TRACE_REQUEST || this == PayloadType.TRACE_RESPONSE
+
+    /** Payloads that are never ACKed: trace (own response path) and ephemeral typing hints. */
+    private fun PayloadType.noAck(): Boolean = isTracePayload() || this == PayloadType.TYPING
 }

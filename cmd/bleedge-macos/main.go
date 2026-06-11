@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,6 +20,26 @@ import (
 	"github.com/bleedge/bleedge/core"
 	blenode "github.com/bleedge/bleedge/macos"
 )
+
+// stdoutIsTTY reports whether stdout is an interactive terminal (so we can run the
+// full-screen TUI). When it isn't — piped, nohup, systemd — bot mode stays headless.
+func stdoutIsTTY() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
+// lineWriter forwards a subprocess's output to a per-line sink (the TUI log), so Bun's
+// stderr doesn't corrupt the alternate-screen TUI when the bot runs in the foreground.
+type lineWriter struct{ emit func(string) }
+
+func (w lineWriter) Write(p []byte) (int, error) {
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		if line != "" {
+			w.emit("[bun] " + line)
+		}
+	}
+	return len(p), nil
+}
 
 func main() {
 	// Parse a minimal set of flags manually so we don't depend on flag pkg order
@@ -124,8 +145,10 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// In bot mode, the bridge (set below) consumes incoming messages; otherwise we
-	// print them interactively, decrypting encrypted DMs with our identity.
+	// In bot mode, the bridge (set below) consumes incoming messages and, when a TTY is
+	// present, the interactive TUI still runs in front (bot in the background). Without a
+	// TTY (piped/daemon), bot mode stays fully headless.
+	headless := botScript != "" && !stdoutIsTTY()
 	var theBot *bot
 	var node *blenode.Node
 	uiEvents := make(chan uiEvent, 128)
@@ -146,7 +169,7 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 			return
 		}
 		line := fmt.Sprintf("%s  %s", time.Now().Format("15:04:05"), msg)
-		if botScript != "" {
+		if headless {
 			fmt.Fprintln(os.Stderr, line)
 			return
 		}
@@ -160,8 +183,11 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		Verbose:     verbose,
 		LogFn:       logFn,
 		OnMessage: func(from core.NodeID, ptype core.PayloadType, payload []byte) {
+			// The bot consumes every message; the TUI (when present) also shows it.
 			if theBot != nil {
 				theBot.onIncoming(from, ptype, payload)
+			}
+			if headless {
 				return
 			}
 			ts := time.Now().Format("15:04:05")
@@ -187,24 +213,32 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	errCh := make(chan error, 1)
 	go func() { errCh <- node.Run(ctx) }()
 
-	// Bot mode: start the Bun bridge and run headless until interrupted.
+	// Bot mode: start the Bun bridge. Headless (no TTY) runs until interrupted; with a TTY
+	// the bot runs in the background and we fall through to the interactive TUI in front.
 	if botScript != "" {
 		channels := parseChannelList(botChannels)
-		b, err := startBot(ctx, node, bunPath, botScript, channels)
+		var botStderr io.Writer = os.Stderr
+		if !headless {
+			botStderr = lineWriter{emit: emitLog} // keep Bun's stderr out of the TUI screen
+		}
+		b, err := startBot(ctx, node, bunPath, botScript, channels, botStderr)
 		if err != nil {
 			fatalf("cannot start bot: %v", err)
 		}
 		theBot = b
-		fmt.Fprintf(os.Stderr, "BLEEdge macOS bot  node=%s  script=%s  channels=%v\n",
-			identity.NodeID(), botScript, channels)
-		select {
-		case err := <-errCh:
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "node error: %v\n", err)
+		if headless {
+			fmt.Fprintf(os.Stderr, "BLEEdge macOS bot  node=%s  script=%s  channels=%v\n",
+				identity.NodeID(), botScript, channels)
+			select {
+			case err := <-errCh:
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "node error: %v\n", err)
+				}
+			case <-ctx.Done():
 			}
-		case <-ctx.Done():
+			return
 		}
-		return
+		emitUI(fmt.Sprintf("bot running in background: %s  channels=%v", botScript, channels))
 	}
 
 	// Plain lines are sent to the current channel; defaults to MeshCore's Public channel.

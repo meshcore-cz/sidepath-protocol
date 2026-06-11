@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- BLEEdge Chat launcher foreground: a four-petal pinwheel (teal / light-blue / orange / cream).
+     One asymmetric teardrop petal rotated in 90° steps around the centre gives the swirl. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <group android:pivotX="54" android:pivotY="54" android:rotation="0">
+        <path
+            android:fillColor="#2EA7A0"
+            android:pathData="M54,53 C47,42 45,27 60,20 C72,28 68,44 54,53 Z" />
+    </group>
+    <group android:pivotX="54" android:pivotY="54" android:rotation="90">
+        <path
+            android:fillColor="#AEDCE1"
+            android:pathData="M54,53 C47,42 45,27 60,20 C72,28 68,44 54,53 Z" />
+    </group>
+    <group android:pivotX="54" android:pivotY="54" android:rotation="180">
+        <path
+            android:fillColor="#F3A85B"
+            android:pathData="M54,53 C47,42 45,27 60,20 C72,28 68,44 54,53 Z" />
+    </group>
+    <group android:pivotX="54" android:pivotY="54" android:rotation="270">
+        <path
+            android:fillColor="#E7DECA"
+            android:pathData="M54,53 C47,42 45,27 60,20 C72,28 68,44 54,53 Z" />
+    </group>
+</vector>

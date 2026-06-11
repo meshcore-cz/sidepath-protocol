@@ -62,6 +62,7 @@ const (
 	PayloadTypeChannel       PayloadType = 5 // MeshCore-compatible group channel: GRP_TXT payload (see channel.go)
 	PayloadTypeTraceRequest  PayloadType = 6 // MeshCore-shaped trace request
 	PayloadTypeTraceResponse PayloadType = 7 // BLEEdge trace result returned to requester
+	PayloadTypeTyping        PayloadType = 8 // ephemeral "peer is typing" hint — never ACKed, empty payload
 )
 
 type PHY uint8

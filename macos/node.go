@@ -558,10 +558,14 @@ func (n *Node) executeActions(actions []core.Action) {
 				time.Sleep(core.FloodJitter())
 				n.relayFlood(a)
 			}(a)
+		// ACK and next-hop relay both notify a subscribed central (CoreBluetooth
+		// UpdateValue). executeActions runs inside the PACKET_IN write callback — a
+		// CoreBluetooth delegate callback — and re-entering CoreBluetooth from there
+		// crashes (cgo SIGSEGV). Dispatch off the callback goroutine, like RelayFlood.
 		case core.ActionRelayNextHop:
-			n.relayNextHop(a)
+			go n.relayNextHop(a)
 		case core.ActionSendAck:
-			n.sendAck(a)
+			go n.sendAck(a)
 		case core.ActionDrop:
 			n.logf("drop reason=%s", a.Reason)
 		}
@@ -633,7 +637,15 @@ func (n *Node) returnTrace(req core.Packet) error {
 		pkt.TTL = 3
 	}
 	n.router.MarkOriginated(pkt.ID)
-	return n.transmitToRoute(pkt)
+	// returnTrace runs inside the inbound PACKET_IN write callback (a CoreBluetooth
+	// delegate callback); notifying the central from there re-enters CoreBluetooth and
+	// crashes. Send the response from a separate goroutine.
+	go func() {
+		if err := n.transmitToRoute(pkt); err != nil {
+			n.logf("trace response send error: %v", err)
+		}
+	}()
+	return nil
 }
 
 func reverseTraceRoute(trace []core.NodeID, dst core.NodeID) []core.NodeID {

@@ -9,40 +9,98 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ListAlt
+import androidx.compose.material.icons.filled.Route
+import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.ChatViewModel
+import cz.arnal.bleedge.chat.ConnState
+import cz.arnal.bleedge.chat.toHex
+import cz.arnal.bleedge.service.MeshStats
 import cz.arnal.bleedge.service.PeerInfo
 import cz.arnal.bleedge.service.RSSI_UNKNOWN
 import cz.arnal.bleedge.service.TopologyEntry
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NetworkScreen(vm: ChatViewModel, onOpenProfile: (String) -> Unit) {
+fun NetworkScreen(
+    vm: ChatViewModel,
+    onOpenProfile: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenTrace: (String) -> Unit,
+    onOpenRxLog: () -> Unit,
+) {
     val peers by vm.connectedPeers.collectAsState()
     val topology by vm.topology.collectAsState()
     val myNode by vm.nodeId.collectAsState()
+    val status by vm.connectionStatus.collectAsState()
+    val stats by vm.stats.collectAsState()
     val myHex = myNode.toHexString()
 
+    // Identicons are drawn from a node's 32-byte public key; learn it from the live topology.
+    val pubKeys = remember(topology) {
+        topology.filter { it.publicKey.size == 32 }
+            .associate { it.nodeId.toHexString() to it.publicKey.toHex() }
+    }
+    // A direct peer is always reachable, so the Trace button targets the first one.
+    val traceTarget = peers.firstOrNull()?.nodeId?.toHexString()
+
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Network") }) },
+        topBar = {
+            TopAppBar(
+                title = { Text("Network") },
+                actions = { OverflowMenu(onOpenSettings = onOpenSettings) },
+            )
+        },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
+        val others = topology.filter { it.nodeId.toHexString() != myHex }
         LazyColumn(Modifier.fillMaxSize().padding(padding)) {
+            item { ConnectionBanner(status, peers.size, others.size) }
+
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    FilledTonalButton(
+                        onClick = { traceTarget?.let(onOpenTrace) },
+                        enabled = traceTarget != null,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Default.Route, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Trace")
+                    }
+                    OutlinedButton(onClick = onOpenRxLog, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Rx Log")
+                    }
+                }
+            }
+
             item { SectionHeader("Connected peers (${peers.size})") }
             if (peers.isEmpty()) {
                 item { EmptyLine("No peers connected.") }
@@ -50,22 +108,74 @@ fun NetworkScreen(vm: ChatViewModel, onOpenProfile: (String) -> Unit) {
                 // Keys must be unique across the whole list; a peer is usually also in the
                 // topology below, so namespace the keys to avoid a collision crash.
                 items(peers, key = { "peer:${it.nodeId.toHexString()}" }) { peer ->
-                    PeerRow(peer) { onOpenProfile(peer.nodeId.toHexString()) }
+                    PeerRow(peer, pubKeys[peer.nodeId.toHexString()]) { onOpenProfile(peer.nodeId.toHexString()) }
                 }
             }
 
             item { HorizontalDivider(Modifier.padding(vertical = 8.dp)) }
 
-            val others = topology.filter { it.nodeId.toHexString() != myHex }
             item { SectionHeader("Known topology (${others.size})") }
             if (others.isEmpty()) {
                 item { EmptyLine("No nodes learned yet.") }
             } else {
                 items(others, key = { "topo:${it.nodeId.toHexString()}" }) { node ->
-                    TopologyRow(node) { onOpenProfile(node.nodeId.toHexString()) }
+                    TopologyRow(node, node.publicKey.takeIf { it.size == 32 }?.toHex()) { onOpenProfile(node.nodeId.toHexString()) }
                 }
             }
+
+            item { HorizontalDivider(Modifier.padding(vertical = 8.dp)) }
+            item { StatsCard(stats) }
         }
+    }
+}
+
+@Composable
+private fun ConnectionBanner(status: ConnState, peers: Int, knownNodes: Int) {
+    val label = when (status) {
+        ConnState.CONNECTED -> "Connected"
+        ConnState.NO_PEERS -> "No peers in range"
+        ConnState.OFFLINE -> "Offline"
+        ConnState.ERROR -> "Permissions needed"
+    }
+    Card(Modifier.fillMaxWidth().padding(16.dp)) {
+        Row(
+            Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ConnectionDot(status, size = 16)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(label, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "$peers connected · $knownNodes known node${if (knownNodes == 1) "" else "s"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatsCard(s: MeshStats) {
+    Card(Modifier.fillMaxWidth().padding(16.dp)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Counters", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+            StatLine("Packets received", s.packetsReceived)
+            StatLine("Packets sent", s.packetsSent)
+            StatLine("Flood relays", s.floodRelays)
+            StatLine("ACKs sent", s.acksSent)
+            StatLine("Traces sent", s.tracesSent)
+            StatLine("Duplicates dropped", s.duplicatesDropped)
+        }
+    }
+}
+
+@Composable
+private fun StatLine(label: String, value: Int) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+        Text("$value", fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -90,13 +200,13 @@ private fun EmptyLine(text: String) {
 }
 
 @Composable
-private fun PeerRow(peer: PeerInfo, onClick: () -> Unit) {
+private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
     val label = peer.description.ifBlank { peer.nodeId.toHexString() }
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = peer.nodeId.toHexString(), label = label, onClick = onClick)
+        Avatar(seed = peer.nodeId.toHexString(), label = label, identiconKey = pubKeyHex, onClick = onClick)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(label, fontWeight = FontWeight.SemiBold, maxLines = 1)
@@ -116,13 +226,13 @@ private fun PeerRow(peer: PeerInfo, onClick: () -> Unit) {
 }
 
 @Composable
-private fun TopologyRow(node: TopologyEntry, onClick: () -> Unit) {
+private fun TopologyRow(node: TopologyEntry, pubKeyHex: String?, onClick: () -> Unit) {
     val label = node.description.ifBlank { node.nodeId.toHexString() }
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = node.nodeId.toHexString(), label = label, size = 36, onClick = onClick)
+        Avatar(seed = node.nodeId.toHexString(), label = label, size = 36, identiconKey = pubKeyHex, onClick = onClick)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(label, fontWeight = FontWeight.Medium, maxLines = 1)

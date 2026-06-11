@@ -31,6 +31,8 @@ import cz.arnal.bleedge.core.PHYMode
 import cz.arnal.bleedge.core.PayloadType
 import cz.arnal.bleedge.core.SEED_SIZE
 import cz.arnal.bleedge.service.BLEEdgeService
+import cz.arnal.bleedge.service.LogEntry
+import cz.arnal.bleedge.service.MeshStats
 import cz.arnal.bleedge.service.PeerInfo
 import cz.arnal.bleedge.service.ReceivedMessage
 import cz.arnal.bleedge.service.TopologyEntry
@@ -43,7 +45,10 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.security.SecureRandom
 
@@ -53,16 +58,37 @@ private val DESC_KEY = stringPreferencesKey("description")
 private val PHY_MODE_KEY = stringPreferencesKey("phy_mode")
 private val AVATAR_STYLE_KEY = stringPreferencesKey("avatar_style")
 private val PUBLIC_SEEDED_KEY = booleanPreferencesKey("public_seeded")
+private val THEME_KEY = stringPreferencesKey("theme_mode")
 
 /** How contact/channel avatars are drawn. */
 enum class AvatarStyle(val value: String) {
-    IDENTICON("identicon"), // default: a deterministic identicon from the seed
+    IDENTICON("identicon"), // default: a deterministic identicon from the public key
     INITIALS("initials");   // colored circle with initials
 
     companion object {
         fun fromValue(v: String?) = entries.firstOrNull { it.value == v } ?: IDENTICON
     }
 }
+
+/** App theme preference. */
+enum class ThemeMode(val value: String) {
+    AUTO("auto"), LIGHT("light"), DARK("dark");
+
+    companion object {
+        fun fromValue(v: String?) = entries.firstOrNull { it.value == v } ?: AUTO
+    }
+}
+
+/** Live state of an in-progress / completed trace, shown on the trace page. */
+data class TraceUi(
+    val peerHex: String,
+    val running: Boolean,
+    val tag: Int? = null,
+    val startedAtMs: Long = 0L,
+    val rttMs: Long? = null, // round-trip time once the response arrives
+    val result: cz.arnal.bleedge.core.TraceResult? = null,
+    val error: String? = null,
+)
 
 /** A row in the Chats list. */
 data class ConversationSummary(
@@ -135,6 +161,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _avatarStyle = MutableStateFlow(AvatarStyle.IDENTICON)
     val avatarStyle: StateFlow<AvatarStyle> = _avatarStyle.asStateFlow()
 
+    private val _themeMode = MutableStateFlow(ThemeMode.AUTO)
+    val themeMode: StateFlow<ThemeMode> = _themeMode.asStateFlow()
+
+    private val _trace = MutableStateFlow<TraceUi?>(null)
+    val trace: StateFlow<TraceUi?> = _trace.asStateFlow()
+
+    // Peers (hex) currently shown as "typing…". Each entry has a removal job that expires it
+    // if no fresh typing hint arrives; a real incoming message clears it immediately.
+    private val _typingPeers = MutableStateFlow<Set<String>>(emptySet())
+    val typingPeers: StateFlow<Set<String>> = _typingPeers.asStateFlow()
+    private val typingExpiry = mutableMapOf<String, Job>()
+
+    // Outgoing typing: a single loop re-sends a hint every 10s for the peer we're typing to.
+    private var outgoingTypingJob: Job? = null
+    private var outgoingTypingPeer: String? = null
+
     val nodeId: StateFlow<NodeID> = _service.flatMapLatest {
         it?.nodeId ?: flowOf(NodeID(ByteArray(8)))
     }.stateIn(viewModelScope, SharingStarted.Eagerly, NodeID(ByteArray(8)))
@@ -154,6 +196,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val isRunning: StateFlow<Boolean> = _service.flatMapLatest {
         it?.isRunning ?: flowOf(false)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    val stats: StateFlow<MeshStats> = _service.flatMapLatest {
+        it?.stats ?: flowOf(MeshStats())
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, MeshStats())
+
+    /** Routing/SYS log entries, newest first — backs the Rx Log screen. */
+    val routingLog: StateFlow<List<LogEntry>> = _service.flatMapLatest {
+        it?.routingLog ?: flowOf(emptyList())
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /** Overall connection health, surfaced as the status dot in the Chats header. */
     val connectionStatus: StateFlow<ConnState> =
@@ -283,6 +334,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _seedHex.value = seedHex
         _description.value = desc
         _avatarStyle.value = AvatarStyle.fromValue(pref[AVATAR_STYLE_KEY])
+        _themeMode.value = ThemeMode.fromValue(pref[THEME_KEY])
 
         val identity = Identity.fromSeed(seedHex.hexToBytes())
         service.initialize(identity, phy, emptySet(), desc)
@@ -310,10 +362,52 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    init {
+        // Load display preferences early so the theme/avatars are right before the service binds.
+        viewModelScope.launch {
+            val pref = getApplication<Application>().dataStore.data.first()
+            _avatarStyle.value = AvatarStyle.fromValue(pref[AVATAR_STYLE_KEY])
+            _themeMode.value = ThemeMode.fromValue(pref[THEME_KEY])
+        }
+    }
+
     fun setAvatarStyle(style: AvatarStyle) {
         viewModelScope.launch {
             getApplication<Application>().dataStore.edit { it[AVATAR_STYLE_KEY] = style.value }
             _avatarStyle.value = style
+        }
+    }
+
+    fun setThemeMode(mode: ThemeMode) {
+        viewModelScope.launch {
+            getApplication<Application>().dataStore.edit { it[THEME_KEY] = mode.value }
+            _themeMode.value = mode
+        }
+    }
+
+    /** Starts a source-routed trace to a node; results arrive via [trace]. */
+    fun startTrace(peerHex: String) {
+        val service = _service.value
+        if (service == null) {
+            _trace.value = TraceUi(peerHex, running = false, error = "Mesh service not ready yet.")
+            return
+        }
+        val tag = service.sendTrace(NodeID.fromHex(peerHex))
+        _trace.value = if (tag == null) {
+            TraceUi(peerHex, running = false, error = "No route to this node yet — try again once it's in the network.")
+        } else {
+            TraceUi(peerHex, running = true, tag = tag, startedAtMs = System.currentTimeMillis())
+        }
+    }
+
+    fun clearTrace() { _trace.value = null }
+
+    private fun handleTraceResponse(msg: ReceivedMessage) {
+        val result = runCatching { cz.arnal.bleedge.core.TraceResult.decode(msg.payload) }.getOrNull() ?: return
+        val cur = _trace.value ?: return
+        if (cur.tag == result.tag) {
+            val rtt = (System.currentTimeMillis() - cur.startedAtMs).coerceAtLeast(0)
+            _trace.value = cur.copy(running = false, rttMs = rtt, result = result)
         }
     }
 
@@ -336,13 +430,33 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         when (msg.payloadType) {
             PayloadType.CHAT_ENCRYPTED -> handleIncomingDm(msg)
             PayloadType.CHANNEL -> handleIncomingChannel(msg)
+            PayloadType.TRACE_RESPONSE -> handleTraceResponse(msg)
+            PayloadType.TYPING -> showTyping(msg.fromNodeId.toHexString())
             else -> return // TEXT_TEST / CHAT_PLAIN / other: not part of the chat model
         }
+    }
+
+    /** Marks [peerHex] as typing and (re)arms a timer to clear it if no fresh hint arrives. */
+    private fun showTyping(peerHex: String) {
+        _typingPeers.value = _typingPeers.value + peerHex
+        typingExpiry.remove(peerHex)?.cancel()
+        // A bit longer than the sender's 10s resend so a steady typist stays "typing".
+        typingExpiry[peerHex] = viewModelScope.launch {
+            delay(13_000)
+            clearTyping(peerHex)
+        }
+    }
+
+    private fun clearTyping(peerHex: String) {
+        typingExpiry.remove(peerHex)?.cancel()
+        if (peerHex in _typingPeers.value) _typingPeers.value = _typingPeers.value - peerHex
     }
 
     private suspend fun handleIncomingDm(msg: ReceivedMessage) {
         if (!processed.add(msg.packetId.toHex())) return
         val peer = msg.fromNodeId.toHexString()
+        // A real message means they're no longer typing — drop the indicator at once.
+        clearTyping(peer)
         dao.insertMessage(
             Message(
                 id = msg.packetId.toHex().ifEmpty { newId() },
@@ -457,11 +571,40 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Signals that the local user is actively typing in the DM with [peerHex]. Starts a loop
+     * that emits a typing hint immediately and re-sends every 10s until [stopTyping]. No-op for
+     * channels (broadcast typing would just spam the mesh).
+     */
+    fun onUserTyping(peerHex: String) {
+        if (isChannelPeer(peerHex)) return
+        if (outgoingTypingPeer == peerHex && outgoingTypingJob?.isActive == true) return
+        outgoingTypingJob?.cancel()
+        outgoingTypingPeer = peerHex
+        outgoingTypingJob = viewModelScope.launch {
+            val dst = NodeID.fromHex(peerHex)
+            while (isActive) {
+                _service.value?.sendTyping(dst)
+                delay(10_000)
+            }
+        }
+    }
+
+    /** Stops re-sending typing hints for [peerHex] (user cleared the field, sent, or left). */
+    fun stopTyping(peerHex: String) {
+        if (outgoingTypingPeer == peerHex) {
+            outgoingTypingJob?.cancel()
+            outgoingTypingJob = null
+            outgoingTypingPeer = null
+        }
+    }
+
     /** Sends an encrypted direct message to a node conversation. */
     fun sendChat(peerHex: String, text: String) {
         val body = text.trim()
         if (body.isEmpty()) return
         val service = _service.value ?: return
+        stopTyping(peerHex)
         viewModelScope.launch {
             val dst = NodeID.fromHex(peerHex)
             // Resolve the recipient's key from the saved contact (learned from a received DM

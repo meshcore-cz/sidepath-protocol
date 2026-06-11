@@ -38,23 +38,29 @@ import cz.arnal.bleedge.chat.ChatViewModel
 private sealed class Dest(val depth: Int) {
     data object Tabs : Dest(0)
     data object Settings : Dest(1)
+    data object RxLog : Dest(1)
     data class Conversation(val peer: String) : Dest(1)
     data class Profile(val peer: String) : Dest(2)
+    data class Trace(val peer: String) : Dest(3)
 }
 
 @Composable
 fun ChatRoot(vm: ChatViewModel) {
     var openPeer by rememberSaveable { mutableStateOf<String?>(null) }
     var openProfile by rememberSaveable { mutableStateOf<String?>(null) }
+    var openTrace by rememberSaveable { mutableStateOf<String?>(null) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
+    var showRxLog by rememberSaveable { mutableStateOf(false) }
     var tab by rememberSaveable { mutableStateOf(0) }
 
-    // The top-most destination, recomputed from the navigation flags. Profile sits above a
-    // conversation, which sits above the tabs — so closing a profile opened from a chat
-    // returns to that chat.
+    // The top-most destination, recomputed from the navigation flags. Trace sits above a
+    // profile, which sits above a conversation, which sits above the tabs — so backing out
+    // unwinds in that order.
     val top: Dest = when {
+        openTrace != null -> Dest.Trace(openTrace!!)
         openProfile != null -> Dest.Profile(openProfile!!)
         openPeer != null -> Dest.Conversation(openPeer!!)
+        showRxLog -> Dest.RxLog
         showSettings -> Dest.Settings
         else -> Dest.Tabs
     }
@@ -75,10 +81,12 @@ fun ChatRoot(vm: ChatViewModel) {
         label = "nav",
     ) { dest ->
         when (dest) {
+            is Dest.Trace -> TraceScreen(vm, dest.peer, onBack = { openTrace = null })
             is Dest.Profile -> ProfileScreen(
                 vm, dest.peer,
                 onBack = { openProfile = null },
                 onOpenConversation = { openProfile = null; openPeer = it },
+                onTrace = { openTrace = it },
             )
             is Dest.Conversation -> ConversationScreen(
                 vm, dest.peer,
@@ -86,6 +94,7 @@ fun ChatRoot(vm: ChatViewModel) {
                 onOpenProfile = { openProfile = it },
             )
             Dest.Settings -> SettingsScreen(vm, onBack = { showSettings = false })
+            Dest.RxLog -> RxLogScreen(vm, onBack = { showRxLog = false })
             Dest.Tabs -> TabsScaffold(
                 vm,
                 tab = tab,
@@ -93,6 +102,8 @@ fun ChatRoot(vm: ChatViewModel) {
                 onOpenConversation = { openPeer = it },
                 onOpenProfile = { openProfile = it },
                 onOpenSettings = { showSettings = true },
+                onOpenTrace = { openTrace = it },
+                onOpenRxLog = { showRxLog = true },
             )
         }
     }
@@ -107,6 +118,8 @@ private fun TabsScaffold(
     onOpenConversation: (String) -> Unit,
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenTrace: (String) -> Unit,
+    onOpenRxLog: () -> Unit,
 ) {
     val conversations by vm.conversations.collectAsState()
     val unread = remember(conversations) { conversations.sumOf { it.unread } }
@@ -157,8 +170,15 @@ private fun TabsScaffold(
                     vm,
                     onOpenChannel = onOpenConversation,
                     onOpenProfile = onOpenProfile,
+                    onOpenSettings = onOpenSettings,
                 )
-                else -> NetworkScreen(vm, onOpenProfile = onOpenProfile)
+                else -> NetworkScreen(
+                    vm,
+                    onOpenProfile = onOpenProfile,
+                    onOpenSettings = onOpenSettings,
+                    onOpenTrace = onOpenTrace,
+                    onOpenRxLog = onOpenRxLog,
+                )
             }
         }
     }

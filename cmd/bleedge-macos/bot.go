@@ -43,7 +43,7 @@ type bot struct {
 	channels  []*blenode.Channel     // channels this bot listens/broadcasts on; channels[0] is the default
 }
 
-func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, channelNames []string) (*bot, error) {
+func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, channelNames []string, stderr io.Writer) (*bot, error) {
 	cmd := exec.CommandContext(ctx, bunPath, "run", script)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -53,7 +53,7 @@ func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, c
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start bun (%s): %w", bunPath, err)
 	}

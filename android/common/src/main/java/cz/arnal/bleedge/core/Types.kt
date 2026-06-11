@@ -79,7 +79,8 @@ enum class PayloadType(val value: Byte) {
     CHAT_ENCRYPTED(4),   // direct message: Crypto sealed envelope (CBOR)
     CHANNEL(5),          // MeshCore-compatible group channel: GRP_TXT payload (ChannelCrypto)
     TRACE_REQUEST(6),    // MeshCore-shaped trace request
-    TRACE_RESPONSE(7);   // BLEEdge trace result returned to requester
+    TRACE_RESPONSE(7),   // BLEEdge trace result returned to requester
+    TYPING(8);           // ephemeral "peer is typing" hint — never ACKed, empty payload
 
     companion object {
         fun fromValue(v: Byte) = entries.firstOrNull { it.value == v } ?: TEXT_TEST

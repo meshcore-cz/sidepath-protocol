@@ -142,7 +142,7 @@ func (r *Router) handleFlood(pkt Packet, incomingPeer *NodeID) []Action {
 	if pkt.IsBroadcast() || pkt.Destination == r.LocalID {
 		actions = append(actions, Action{Type: ActionDeliverLocal, Packet: pkt})
 		// ACK for unicast DATA. TRACE has its own request/response exchange.
-		if pkt.Type == PacketTypeData && !pkt.IsBroadcast() && !isTracePayload(pkt.PayloadType) {
+		if pkt.Type == PacketTypeData && !pkt.IsBroadcast() && !noAck(pkt.PayloadType) {
 			actions = append(actions, r.buildAck(pkt))
 		}
 	}
@@ -167,6 +167,12 @@ func (r *Router) handleFlood(pkt Packet, incomingPeer *NodeID) []Action {
 
 func isTracePayload(pt PayloadType) bool {
 	return pt == PayloadTypeTraceRequest || pt == PayloadTypeTraceResponse
+}
+
+// noAck reports payloads that are never ACKed: trace (own request/response
+// exchange) and ephemeral typing hints.
+func noAck(pt PayloadType) bool {
+	return isTracePayload(pt) || pt == PayloadTypeTyping
 }
 
 func (r *Router) handleSourceRoute(pkt Packet, incomingPeer *NodeID) []Action {
@@ -195,7 +201,7 @@ func (r *Router) handleSourceRoute(pkt Packet, incomingPeer *NodeID) []Action {
 	if int(pkt.RouteCursor) >= len(pkt.Route) {
 		// We are the destination
 		actions := []Action{{Type: ActionDeliverLocal, Packet: pkt}}
-		if pkt.Type == PacketTypeData && !isTracePayload(pkt.PayloadType) {
+		if pkt.Type == PacketTypeData && !noAck(pkt.PayloadType) {
 			actions = append(actions, r.buildAck(pkt))
 		}
 		return actions
