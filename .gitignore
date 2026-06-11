@@ -14,3 +14,4 @@
 # macOS
 .DS_Store
 screenshot*
+bin

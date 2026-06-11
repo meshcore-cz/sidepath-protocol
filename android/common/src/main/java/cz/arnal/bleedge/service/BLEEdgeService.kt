@@ -608,12 +608,14 @@ class BLEEdgeService : Service() {
      * caller can match the later delivery ACK, or null if it couldn't be sent (e.g. an
      * encrypted DM to a node whose public key we haven't learned yet).
      */
-    fun sendChat(text: String, destination: NodeID, ttl: Byte = 4): ByteArray? {
+    fun sendChat(text: String, destination: NodeID, recipientPub: ByteArray? = null, ttl: Byte = 4): ByteArray? {
         if (destination.isBroadcast()) {
             return sendData(text.toByteArray(Charsets.UTF_8), PayloadType.CHAT_PLAIN, destination, ttl)
         }
         val id = identity ?: return null
-        val pub = router.topology.getNode(destination)?.publicKey
+        // Prefer an explicitly supplied key (e.g. learned from a received DM envelope or a
+        // saved contact); fall back to the key from the peer's signed ANNOUNCE (topology).
+        val pub = recipientPub?.takeIf { it.size == 32 } ?: router.topology.getNode(destination)?.publicKey
         if (pub == null || pub.size != 32) {
             log("sendChat: no public key known for ${destination.toHexString()} — cannot encrypt", LogTag.MSG)
             return null

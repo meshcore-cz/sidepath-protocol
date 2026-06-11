@@ -18,6 +18,7 @@ import cz.arnal.bleedge.chat.data.ChatDatabase
 import cz.arnal.bleedge.chat.data.Contact
 import cz.arnal.bleedge.chat.data.Message
 import cz.arnal.bleedge.chat.data.MsgStatus
+import cz.arnal.bleedge.core.Crypto
 import cz.arnal.bleedge.core.Identity
 import cz.arnal.bleedge.core.NodeID
 import cz.arnal.bleedge.core.PHYMode
@@ -136,19 +137,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 .sortedByDescending { it.lastTimestampMs }
         }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    /** Advertised nodes we can start an encrypted chat with (have a known public key). */
+    /**
+     * Every node we can start an encrypted chat with — i.e. whose public key we know,
+     * whether from the live topology (signed ANNOUNCE) or a saved contact (learned from a
+     * received DM or a previous chat).
+     */
     val advertisedNodes: StateFlow<List<AdvertisedNode>> =
-        combine(topology, nodeId) { topo, me ->
+        combine(topology, contacts, nodeId) { topo, contacts, me ->
             val meHex = me.toHexString()
-            topo.filter { it.publicKey.size == 32 && it.nodeId.toHexString() != meHex }
-                .map {
-                    AdvertisedNode(
-                        nodeHex = it.nodeId.toHexString(),
-                        description = it.description,
-                        pubKeyHex = it.publicKey.toHex(),
-                    )
+            val byHex = LinkedHashMap<String, AdvertisedNode>()
+            contacts.forEach { c ->
+                if (c.nodeHex != meHex && c.pubKeyHex.length == 64) {
+                    byHex[c.nodeHex] = AdvertisedNode(c.nodeHex, c.description, c.pubKeyHex)
                 }
-                .sortedBy { it.description.ifBlank { it.nodeHex } }
+            }
+            topo.forEach { t ->
+                val hex = t.nodeId.toHexString()
+                if (hex != meHex && t.publicKey.size == 32) {
+                    val desc = t.description.ifBlank { byHex[hex]?.description ?: "" }
+                    byHex[hex] = AdvertisedNode(hex, desc, t.publicKey.toHex())
+                }
+            }
+            byHex.values.sortedBy { it.description.ifBlank { it.nodeHex } }
         }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     fun messagesFor(peerHex: String): StateFlow<List<Message>> =
@@ -240,14 +250,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 read = false,
             )
         )
-        // Remember the sender as a contact (pubkey/description from its ANNOUNCE).
-        upsertContactFromTopology(msg.fromNodeId.toHexString())
+        if (!isChannel) {
+            // Learn the sender's public key from the DM envelope itself, so we can reply
+            // even if the node isn't (yet) in our topology.
+            val envPub = Crypto.envelopeSenderPubKey(msg.payload)
+            learnContact(msg.fromNodeId.toHexString(), envPub)
+        }
     }
 
-    private suspend fun upsertContactFromTopology(nodeHex: String) {
-        val t = topology.value.firstOrNull { it.nodeId.toHexString() == nodeHex } ?: return
-        if (t.publicKey.size != 32) return
-        dao.upsertContact(Contact(nodeHex, t.publicKey.toHex(), t.description))
+    /** Saves/updates a contact's public key. Prefers an explicit key, else the topology key. */
+    private suspend fun learnContact(nodeHex: String, pub: ByteArray?) {
+        val topo = topology.value.firstOrNull { it.nodeId.toHexString() == nodeHex }
+        val key = pub?.takeIf { it.size == 32 } ?: topo?.publicKey?.takeIf { it.size == 32 } ?: return
+        val desc = topo?.description ?: dao.contactByNode(nodeHex)?.description ?: ""
+        dao.upsertContact(Contact(nodeHex, key.toHex(), desc))
     }
 
     // ---- actions -------------------------------------------------------------
@@ -265,7 +281,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val service = _service.value ?: return
         viewModelScope.launch {
             val dst = if (peerHex == CHANNEL_PEER) NodeID.BROADCAST else NodeID.fromHex(peerHex)
-            val id = service.sendChat(body, dst)
+            // Resolve the recipient's key from the saved contact (learned from a received DM
+            // or the picker), falling back to topology inside the service.
+            val pub = if (peerHex == CHANNEL_PEER) null
+            else dao.contactByNode(peerHex)?.pubKeyHex?.takeIf { it.length == 64 }?.hexToBytes()
+            val id = service.sendChat(body, dst, pub)
             dao.insertMessage(
                 Message(
                     id = id?.toHex() ?: newId(),
