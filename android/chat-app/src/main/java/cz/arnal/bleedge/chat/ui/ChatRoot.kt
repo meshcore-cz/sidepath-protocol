@@ -132,6 +132,7 @@ fun ChatRoot(vm: ChatViewModel) {
             openTrace = { openTrace = it },
             openRxLog = { showRxLog = true },
             openMeshCoreLog = { showMeshCoreLog = true },
+            openProfile = { openProfile = it },
         ),
     ) {
     AnimatedContent(

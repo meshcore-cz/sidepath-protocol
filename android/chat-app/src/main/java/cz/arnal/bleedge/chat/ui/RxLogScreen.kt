@@ -52,6 +52,7 @@ import cz.arnal.bleedge.chatproto.ChatKind
 import cz.arnal.bleedge.protocol.ControlKind
 import cz.arnal.bleedge.protocol.PayloadProtocol
 import cz.arnal.bleedge.service.PeerInfo
+import cz.arnal.bleedge.service.RSSI_UNKNOWN
 import cz.arnal.bleedge.service.RxPacket
 import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
@@ -118,7 +119,6 @@ fun RxLogScreen(
                     PacketRow(
                         p = p,
                         vm = vm,
-                        peers = peers,
                         myNodeHex = myNode.toHex(),
                         nowMs = nowMs,
                     ) { detail = p }
@@ -148,7 +148,6 @@ private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 private fun PacketRow(
     p: RxPacket,
     vm: ChatViewModel,
-    peers: List<PeerInfo>,
     myNodeHex: String,
     nowMs: Long,
     onClick: () -> Unit,
@@ -157,7 +156,6 @@ private fun PacketRow(
     val freshAlpha = ((7_000L - ageMs).coerceIn(0L, 7_000L).toFloat() / 7_000f) * 0.13f
     val typeColor = packetColor(p)
     val isMine = p.source.toHex() == myNodeHex
-    val direct = directPeerFor(p, peers)
     val bg = typeColor.copy(alpha = freshAlpha)
     BoxWithConstraints(
         Modifier
@@ -184,7 +182,7 @@ private fun PacketRow(
                     maxLines = 1,
                     modifier = Modifier.weight(1f),
                 )
-                SignalLabel(direct?.rssi, "rssi", style = MaterialTheme.typography.labelSmall)
+                SignalLabel(p.rssi, "rssi", style = MaterialTheme.typography.labelSmall)
                 Text(packetMeta(p), style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
@@ -209,7 +207,7 @@ private fun PacketRow(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.weight(1f),
                     )
-                    SignalLabel(direct?.rssi, "rssi", style = MaterialTheme.typography.labelSmall)
+                    SignalLabel(p.rssi, "rssi", style = MaterialTheme.typography.labelSmall)
                 }
             }
         }
@@ -338,11 +336,6 @@ private fun packetMeta(p: RxPacket): String =
     "${routingLabel(p)} · ttl ${p.ttl} · ${p.payloadSize}B" +
         if (p.path.isNotEmpty()) " · ${p.path.size} hop${if (p.path.size == 1) "" else "s"}" else ""
 
-private fun directPeerFor(p: RxPacket, peers: List<PeerInfo>): PeerInfo? {
-    val directHex = (p.path.lastOrNull() ?: p.source).toHex()
-    return peers.firstOrNull { it.nodeId.toHex() == directHex }
-}
-
 private fun destLabel(p: RxPacket, vm: ChatViewModel): String =
     if (p.destination.isBroadcast()) "broadcast" else vm.nameForHex(p.destination.toHex())
 
@@ -375,6 +368,7 @@ private fun PacketDetailDialog(
                 Field("Destination", if (p.destination.isBroadcast()) "broadcast" else
                     "${vm.nameForHex(p.destination.toHex())}\n${p.destination.toHex()}")
                 Field("Routing", "${routingLabel(p)} · ttl ${p.ttl} · ${if (p.forUs) "for us" else "overheard"}")
+                Field("Signal", if (p.rssi == RSSI_UNKNOWN) "n/a (inbound link)" else "${p.rssi} dBm (at receipt)")
                 p.droppedReason?.let { Field("Dropped", it) }
                 Field("Flags", if (p.ackRequested) "ACK_REQUESTED" else if (p.flags == 0) "none" else "0x%04x".format(p.flags))
                 if (p.route.isNotEmpty()) Field("Route", p.route.joinToString(" → ") { "${vm.nameForHex(it.toHex())} (${it.toHex().take(20)})" })

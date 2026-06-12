@@ -353,6 +353,17 @@ fun dateLabel(ts: Long): String {
 /** True when [a] and [b] fall on different calendar days (used to insert date separators). */
 fun differentDay(a: Long, b: Long): Boolean = !isSameDay(a, b)
 
+/** Compact elapsed-duration label, e.g. "9s", "4m", "2h", "3d". Used for peer connection uptime. */
+fun shortDuration(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return when {
+        s < 60 -> "${s}s"
+        s < 3_600 -> "${s / 60}m"
+        s < 86_400 -> "${s / 3_600}h"
+        else -> "${s / 86_400}d"
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MessageDetailsSheet(

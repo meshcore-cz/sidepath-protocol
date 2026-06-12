@@ -4,6 +4,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ListAlt
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Route
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -47,6 +49,7 @@ data class MeshNav(
     val openTrace: (String) -> Unit = {},
     val openRxLog: () -> Unit = {},
     val openMeshCoreLog: () -> Unit = {},
+    val openProfile: (String) -> Unit = {},
 )
 
 val LocalMeshNav = staticCompositionLocalOf { MeshNav() }
@@ -135,24 +138,35 @@ private fun ConnectionStatusSheet(
                 StatRow("Topology links", "$links")
             }
 
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val traceTarget = peers.firstOrNull { !it.degraded }?.nodeId?.toHex()
                 FilledTonalButton(
                     onClick = { traceTarget?.let { onDismiss(); nav.openTrace(it) } },
                     enabled = traceTarget != null,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     modifier = Modifier.weight(1f),
                 ) {
                     Icon(Icons.Default.Route, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(6.dp))
                     Text("Trace")
                 }
                 OutlinedButton(
                     onClick = { onDismiss(); nav.openRxLog() },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     modifier = Modifier.weight(1f),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(6.dp))
                     Text("Rx Log")
+                }
+                OutlinedButton(
+                    onClick = { onDismiss(); nav.openMeshCoreLog() },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(Icons.Default.Hub, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("MeshCore")
                 }
             }
 
@@ -163,24 +177,33 @@ private fun ConnectionStatusSheet(
                 Text("None right now.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 peers.forEach { p ->
-                    val name = vm.nameForHex(p.nodeId.toHex())
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(seed = p.nodeId.toHex(), label = name, size = 32)
+                    val hex = p.nodeId.toHex()
+                    val name = vm.nameForHex(hex)
+                    val platform = vm.platformForHex(hex)
+                    val link = if (p.degraded) "degraded" else if (p.incoming) "inbound" else "outbound"
+                    val sub = listOfNotNull(
+                        link,
+                        p.txPhy.toString(),
+                        platform.takeIf { it.isNotBlank() },
+                        p.connectedSinceMs.takeIf { it > 0 }?.let { "for ${shortDuration(System.currentTimeMillis() - it)}" },
+                    ).joinToString(" · ")
+                    Row(
+                        Modifier.fillMaxWidth().clickable { onDismiss(); nav.openProfile(hex) },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Avatar(seed = hex, label = name, size = 32, identiconKey = vm.pubKeyForHex(hex).ifBlank { null })
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
                             Text(name, fontWeight = FontWeight.Medium, maxLines = 1)
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                SignalDot(p.rssi, "rssi")
-                                Text(
-                                    listOf(
-                                        if (p.degraded) "degraded" else if (p.incoming) "inbound" else "outbound",
-                                        p.txPhy.toString(),
-                                    ).joinToString(" · "),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
+                            Text(
+                                sub,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                            )
                         }
+                        Spacer(Modifier.width(8.dp))
+                        SignalLabel(p.rssi, "rssi", style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }

@@ -151,7 +151,7 @@ fun NetworkScreen(
                 // Keys must be unique across the whole list; a peer is usually also in the
                 // topology below, so namespace the keys to avoid a collision crash.
                 items(peers, key = { "peer:${it.nodeId.toHex()}" }) { peer ->
-                    PeerRow(peer, pubKeys[peer.nodeId.toHex()]) { onOpenProfile(peer.nodeId.toHex()) }
+                    PeerRow(vm, peer, pubKeys[peer.nodeId.toHex()]) { onOpenProfile(peer.nodeId.toHex()) }
                 }
             }
 
@@ -263,30 +263,33 @@ fun lastPacketLabel(atMs: Long?): String {
 }
 
 @Composable
-private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
-    // Prefer the name the peer advertises on the wire; fall back to the derived default.
-    val label = peer.name.ifBlank { nameFromPubKey(pubKeyHex ?: "") }
-        .ifBlank { peer.nodeId.toHex().take(16) }
+private fun PeerRow(vm: ChatViewModel, peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
+    val hex = peer.nodeId.toHex()
+    // Resolve to the same display name used everywhere (contact alias → wire name → derived).
+    val label = vm.nameForHex(hex).ifBlank { nameFromPubKey(pubKeyHex ?: "") }.ifBlank { hex.take(16) }
+    val platform = vm.platformForHex(hex)
+    val linkLabel = if (peer.degraded) "degraded" else if (peer.incoming) "inbound" else "outbound"
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = peer.nodeId.toHex(), label = label, identiconKey = pubKeyHex, onClick = onClick)
+        Avatar(seed = hex, label = label, identiconKey = pubKeyHex, onClick = onClick)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(label, fontWeight = FontWeight.SemiBold, maxLines = 1)
             Text(
-                peer.nodeId.toHex().take(20),
+                listOfNotNull(hex.take(16), platform.takeIf { it.isNotBlank() }).joinToString(" · "),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
             )
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                SignalDot(peer.rssi, "rssi")
+                SignalLabel(peer.rssi, "rssi", style = MaterialTheme.typography.bodySmall)
                 Text(
-                    listOf(
-                        if (peer.degraded) "degraded" else if (peer.incoming) "inbound" else "outbound",
+                    listOfNotNull(
+                        linkLabel,
                         peer.txPhy.toString(),
-                        peer.caps.toString(),
+                        peer.connectedSinceMs.takeIf { it > 0 }?.let { "for ${shortDuration(System.currentTimeMillis() - it)}" },
                     ).joinToString(" · "),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

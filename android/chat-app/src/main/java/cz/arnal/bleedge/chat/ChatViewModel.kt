@@ -1274,6 +1274,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun nameForHex(hex: String): String =
         displayName(hex, contacts.value.associateBy { it.nodeHex }, topology.value)
 
+    /** Resolves a node id (hex) to its OS/device platform string (from its ANNOUNCE), or "". */
+    fun platformForHex(hex: String): String = nodePlatform(hex, topology.value)
+
     /** Resolves a node id (hex) to its 32-byte public key (hex), for identicon avatars, or "". */
     fun pubKeyForHex(hex: String): String =
         if (hex == nodeId.value.toHex()) myPubKeyHex.value

@@ -98,6 +98,7 @@ data class PeerInfo(
     val degraded: Boolean = false,
     val name: String = "",
     val publicKey: ByteArray = ByteArray(0),
+    val connectedSinceMs: Long = 0L, // when this peer first appeared connected (for an uptime label)
 )
 
 /**
@@ -155,6 +156,9 @@ data class RxPacket(
     val payloadSize: Int,
     val raw: ByteArray,
     val forUs: Boolean,
+    // RSSI of the direct link that delivered this packet, captured at receipt (BLE gives no
+    // per-notification RSSI, so this is the connection's last-read value frozen for this row).
+    val rssi: Int = RSSI_UNKNOWN,
     val droppedReason: String? = null, // non-null if the router dropped it (e.g. "duplicate", "loop")
 )
 
@@ -248,6 +252,10 @@ class BLEEdgeService : Service() {
 
     // Outgoing connections (we are GATT client): BLE MAC hex -> link.
     private val peers = ConcurrentHashMap<String, BLEPeerLink>()
+
+    // First time each peer (by node-id hex) was seen connected, for the "connected for N" label.
+    // Entries are pruned in updatePeersState once a peer is no longer present.
+    private val connectedSince = ConcurrentHashMap<String, Long>()
     // Incoming connections (peer is client to our server): BLE MAC hex -> direct peer NodeId (or null).
     private val serverPeers = ConcurrentHashMap<String, NodeId?>()
     private val serverPeerDevices = ConcurrentHashMap<String, BluetoothDevice>()
@@ -720,6 +728,7 @@ class BLEEdgeService : Service() {
                 sourceRouted = dg.isSourceRouted, routeCursor = dg.routeCursor, ttl = dg.ttl,
                 flags = dg.flags, ackRequested = dg.ackRequested(),
                 path = dg.path, route = dg.route, payloadSize = dg.payload.size, raw = data, forUs = forUs,
+                rssi = peers[addrHex]?.rssi ?: RSSI_UNKNOWN,
                 droppedReason = droppedReason,
             )) + it).take(maxRxPackets)
         }
@@ -1304,18 +1313,21 @@ class BLEEdgeService : Service() {
     private fun updatePeersState() {
         val seen = mutableSetOf<String>()
         val list = mutableListOf<PeerInfo>()
+        val now = System.currentTimeMillis()
+        fun since(hex: String): Long = connectedSince.getOrPut(hex) { now }
         for (link in peers.values) {
             val pid = link.peerId ?: continue
             if (!link.isUsable) {
                 if (!seen.add(pid.toHex())) continue
                 router.neighbors.remove(pid)
                 list += PeerInfo(pid, link.rssi, link.txPhy, link.rxPhy, link.caps, degraded = true,
-                    name = router.nameFor(pid), publicKey = link.publicKey)
+                    name = router.nameFor(pid), publicKey = link.publicKey, connectedSinceMs = since(pid.toHex()))
                 continue
             }
             if (!seen.add(pid.toHex())) continue
             router.neighbors.upsert(ProtoNeighbor(id = pid, publicKey = link.publicKey, rssi = link.rssi, provisionalCaps = link.caps))
-            list += PeerInfo(pid, link.rssi, link.txPhy, link.rxPhy, link.caps, name = router.nameFor(pid), publicKey = link.publicKey)
+            list += PeerInfo(pid, link.rssi, link.txPhy, link.rxPhy, link.caps, name = router.nameFor(pid),
+                publicKey = link.publicKey, connectedSinceMs = since(pid.toHex()))
         }
         for (nid in serverPeers.values) {
             if (nid == null || nid.isBroadcast()) continue
@@ -1323,8 +1335,10 @@ class BLEEdgeService : Service() {
             val nb = router.neighbors.get(nid)
             val caps = nb?.provisionalCaps ?: router.topology.getNode(nid)?.caps ?: Capabilities(0)
             list += PeerInfo(nid, nb?.rssi ?: RSSI_UNKNOWN, PHY.UNKNOWN, PHY.UNKNOWN, caps, incoming = true,
-                name = router.nameFor(nid), publicKey = router.publicKeyFor(nid) ?: ByteArray(0))
+                name = router.nameFor(nid), publicKey = router.publicKeyFor(nid) ?: ByteArray(0),
+                connectedSinceMs = since(nid.toHex()))
         }
+        connectedSince.keys.retainAll(seen)
         _connectedPeers.value = list
     }
 
