@@ -49,6 +49,7 @@ data class MeshNav(
     val openTrace: (String) -> Unit = {},
     val openRxLog: () -> Unit = {},
     val openMeshCoreLog: () -> Unit = {},
+    val openTopology: () -> Unit = {},
     val openProfile: (String) -> Unit = {},
 )
 

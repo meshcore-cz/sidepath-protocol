@@ -28,6 +28,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.Lifecycle
@@ -46,10 +47,24 @@ private sealed class Dest(val depth: Int) {
     data object Settings : Dest(1)
     data object RxLog : Dest(1)
     data object MeshCoreLog : Dest(1)
+    data object Topology : Dest(1)
     data object About : Dest(2)
     data class Conversation(val peer: String) : Dest(1)
     data class Profile(val peer: String) : Dest(2)
     data class Trace(val peer: String) : Dest(3)
+
+    /**
+     * Stable key for the saveable-state holder, so each screen's `rememberSaveable` state
+     * (e.g. a LazyColumn's scroll position) is restored when we navigate back to it. Peer-keyed
+     * screens namespace by peer so two different conversations don't share scroll state.
+     */
+    val saveableKey: String
+        get() = when (this) {
+            is Conversation -> "conv:$peer"
+            is Profile -> "profile:$peer"
+            is Trace -> "trace:$peer"
+            else -> this::class.simpleName ?: "dest"
+        }
 }
 
 @Composable
@@ -60,6 +75,7 @@ fun ChatRoot(vm: ChatViewModel) {
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var showRxLog by rememberSaveable { mutableStateOf(false) }
     var showMeshCoreLog by rememberSaveable { mutableStateOf(false) }
+    var showTopology by rememberSaveable { mutableStateOf(false) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
     var tab by rememberSaveable { mutableStateOf(0) }
 
@@ -81,6 +97,7 @@ fun ChatRoot(vm: ChatViewModel) {
         showAbout -> Dest.About
         openProfile != null -> Dest.Profile(openProfile!!)
         openPeer != null -> Dest.Conversation(openPeer!!)
+        showTopology -> Dest.Topology
         showMeshCoreLog -> Dest.MeshCoreLog
         showRxLog -> Dest.RxLog
         showSettings -> Dest.Settings
@@ -97,6 +114,7 @@ fun ChatRoot(vm: ChatViewModel) {
             is Dest.Profile -> openProfile = null
             is Dest.Conversation -> openPeer = null
             Dest.MeshCoreLog -> showMeshCoreLog = false
+            Dest.Topology -> showTopology = false
             Dest.RxLog -> showRxLog = false
             Dest.Settings -> showSettings = false
             Dest.Tabs -> Unit
@@ -124,6 +142,7 @@ fun ChatRoot(vm: ChatViewModel) {
     }
 
     val avatarStyle by vm.avatarStyle.collectAsState()
+    val stateHolder = rememberSaveableStateHolder()
     CompositionLocalProvider(
         LocalAvatarStyle provides avatarStyle,
         // App-wide mesh navigation: Trace and Rx Log are reachable from any universal
@@ -132,6 +151,7 @@ fun ChatRoot(vm: ChatViewModel) {
             openTrace = { openTrace = it },
             openRxLog = { showRxLog = true },
             openMeshCoreLog = { showMeshCoreLog = true },
+            openTopology = { showTopology = true },
             openProfile = { openProfile = it },
         ),
     ) {
@@ -148,6 +168,9 @@ fun ChatRoot(vm: ChatViewModel) {
         },
         label = "nav",
     ) { dest ->
+        // Preserve each destination's rememberSaveable state (incl. list scroll position) across
+        // navigation, so backing out to a tab list returns you to where you were scrolled.
+        stateHolder.SaveableStateProvider(dest.saveableKey) {
         when (dest) {
             is Dest.Trace -> TraceScreen(vm, dest.peer, onBack = popTop)
             is Dest.Profile -> ProfileScreen(
@@ -182,6 +205,11 @@ fun ChatRoot(vm: ChatViewModel) {
                 onBack = popTop,
                 onOpenProfile = { openProfile = it },
             )
+            Dest.Topology -> TopologyScreen(
+                vm,
+                onBack = popTop,
+                onOpenProfile = { openProfile = it },
+            )
             Dest.About -> AboutScreen(onBack = popTop)
             Dest.Tabs -> TabsScaffold(
                 vm,
@@ -192,6 +220,7 @@ fun ChatRoot(vm: ChatViewModel) {
                 onOpenSettings = { showSettings = true },
                 onOpenAbout = { showAbout = true },
             )
+        }
         }
     }
     }

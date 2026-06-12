@@ -157,6 +157,19 @@ fun NetworkScreen(
 
             item { HorizontalDivider(Modifier.padding(vertical = 8.dp)) }
 
+            item { SectionHeader("Topology") }
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                ) {
+                    FilledTonalButton(onClick = nav.openTopology, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Default.Hub, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Topology View")
+                    }
+                }
+            }
+
             item { SectionHeader("Known topology (${others.size})") }
             if (others.isEmpty()) {
                 item { EmptyLine("No nodes learned yet.") }

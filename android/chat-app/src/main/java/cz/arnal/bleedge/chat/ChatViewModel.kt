@@ -268,6 +268,27 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         it?.isRunning ?: flowOf(false)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
+    /**
+     * The mesh as a force-graph: one node per known node, one link per (deduped) neighbor
+     * relationship. Rebuilt whenever the topology or our direct connections change; the
+     * Topology view throttles how often it pushes this to the WebView.
+     */
+    val topologyGraph: StateFlow<cz.arnal.bleedge.topology.TopologyGraph> =
+        combine(topology, connectedPeers, nodeId) { topo, peers, self ->
+            cz.arnal.bleedge.topology.buildTopologyGraph(
+                selfHex = self.toHex(),
+                peers = peers,
+                topology = topo,
+                nowMs = System.currentTimeMillis(),
+            ) { hex -> topologyLabelFor(hex) }
+        // Lazily started (not Eagerly): the resolver touches `contacts`, which is declared later in
+        // this class — collecting during <init> would NPE on the not-yet-initialized StateFlow.
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), cz.arnal.bleedge.topology.TopologyGraph(emptyList(), emptyList()))
+
+    /** Best display label for a node in the topology graph: alias → wire name → derived → short hex. */
+    private fun topologyLabelFor(hex: String): String =
+        nameForHex(hex).ifBlank { nameFromPubKey(pubKeyForHex(hex)) }.ifBlank { hex.take(12) }
+
     val stats: StateFlow<MeshStats> = _service.flatMapLatest {
         it?.stats ?: flowOf(MeshStats())
     }.stateIn(viewModelScope, SharingStarted.Eagerly, MeshStats())
