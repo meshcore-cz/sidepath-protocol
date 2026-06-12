@@ -15,16 +15,14 @@ const (
 
 // Neighbor represents a directly connected peer.
 type Neighbor struct {
-	ID          NodeID
-	Direction   ConnDirection
-	LastSeen    time.Time
-	RSSI        int
-	TxPHY       PHY
-	RxPHY       PHY
-	Caps        Capabilities
-	Description string // free-form bio from the peer's NODE_INFO (direct links only)
-	Name        string // primary display label from the peer's NODE_INFO (direct links only)
-	Platform    string // OS/device string from the peer's NODE_INFO (direct links only)
+	ID        NodeID
+	Direction ConnDirection
+	LastSeen  time.Time
+	RSSI      int
+	TxPHY     PHY
+	RxPHY     PHY
+	Caps      Capabilities
+	PublicKey []byte
 }
 
 func (n Neighbor) String() string {
@@ -90,6 +88,17 @@ func (t *NeighborTable) IDs() []NodeID {
 	return ids
 }
 
+func (t *NeighborTable) Reap() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	for id, n := range t.neighbors {
+		if now.Sub(n.LastSeen) > t.timeout {
+			delete(t.neighbors, id)
+		}
+	}
+}
+
 func (t *NeighborTable) Touch(id NodeID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -101,13 +110,6 @@ func (t *NeighborTable) Touch(id NodeID) {
 func (t *NeighborTable) reap() {
 	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
-		t.mu.Lock()
-		now := time.Now()
-		for id, n := range t.neighbors {
-			if now.Sub(n.LastSeen) > t.timeout {
-				delete(t.neighbors, id)
-			}
-		}
-		t.mu.Unlock()
+		t.Reap()
 	}
 }

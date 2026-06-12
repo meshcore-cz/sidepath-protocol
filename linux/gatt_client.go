@@ -24,9 +24,9 @@ type GattClient struct {
 	name        string      // primary display label from NODE_INFO
 	platform    string      // OS/device string from NODE_INFO
 	caps        core.Capabilities
-	txPHY     core.PHY
-	rxPHY     core.PHY
-	rssi      int16
+	txPHY       core.PHY
+	rxPHY       core.PHY
+	rssi        int16
 
 	charNodeInfo  dbus.ObjectPath
 	charPacketIn  dbus.ObjectPath
@@ -195,12 +195,8 @@ func (c *GattClient) readNodeInfo(ctx context.Context) error {
 	}
 	c.pubKey = ni.PubKey
 	c.nodeID = core.NodeIDFromPubKey(c.pubKey)
-	c.caps = ni.Caps
-	c.description = ni.Description
-	c.name = ni.Name
-	c.platform = ni.Platform
-	log.Printf("[gatt-client] node_info: peer=%s caps=0x%02x name=%q platform=%q desc=%q",
-		c.nodeID, c.caps, c.name, c.platform, c.description)
+	c.caps = ni.ProvisionalCaps
+	log.Printf("[gatt-client] node_info: peer=%s caps=0x%04x", c.nodeID, c.caps)
 	return nil
 }
 

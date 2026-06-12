@@ -1,5 +1,7 @@
 // bleedge-simulate is an in-memory mesh simulator with no BLE dependencies.
 // It exercises all core routing logic and prints clearly labelled pass/fail results.
+//go:build v2obsolete
+
 package main
 
 import (
@@ -20,7 +22,7 @@ type chanLink struct {
 	rssi   int
 }
 
-func (l *chanLink) PeerID() core.NodeID  { return l.peerID }
+func (l *chanLink) PeerID() core.NodeID { return l.peerID }
 func (l *chanLink) SendFrame(b []byte) error {
 	select {
 	case l.ch <- b:
@@ -28,7 +30,7 @@ func (l *chanLink) SendFrame(b []byte) error {
 	}
 	return nil
 }
-func (l *chanLink) RSSI() int     { return l.rssi }
+func (l *chanLink) RSSI() int       { return l.rssi }
 func (l *chanLink) TxPHY() core.PHY { return core.PHYCoded }
 func (l *chanLink) RxPHY() core.PHY { return core.PHYCoded }
 
@@ -426,7 +428,9 @@ func testDeduplication() {
 	check("dedup: first pass processes packet", firstHasDelivery, "")
 	check("dedup: second pass drops duplicate", secondDropped,
 		fmt.Sprintf("got %d actions, first=%v", len(actions2), func() string {
-			if len(actions2) > 0 { return string(actions2[0].Type) }
+			if len(actions2) > 0 {
+				return string(actions2[0].Type)
+			}
 			return "none"
 		}()))
 }

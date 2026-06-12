@@ -8,6 +8,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"strings"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 // MeshCore-compatible group/channel messaging, matching `meshcore-cz/meshpkt`
@@ -31,6 +33,10 @@ func DeriveChannelSecret(name string) []byte {
 	out := make([]byte, ChannelSecretLen)
 	copy(out, h[:ChannelSecretLen])
 	return out
+}
+
+func DeriveChannelPassphraseSecret(passphrase string) []byte {
+	return DeriveChannelSecret(passphrase)
 }
 
 // ChannelHash is the 1-byte routing hash: SHA-256(secret)[0].
@@ -58,6 +64,29 @@ func SealChannel(secret []byte, sender, text string, timestamp uint32) []byte {
 	copy(out[1:1+channelMACLen], mac)
 	copy(out[1+channelMACLen:], ct)
 	return out
+}
+
+type chatChannelBody struct {
+	ChannelPayload []byte `cbor:"1,keyasint"`
+}
+
+func BuildChannelText(secret []byte, sender, text string, timestamp uint32) ([]byte, error) {
+	if !textWithinLimit(text) {
+		return nil, ErrTextTooLong
+	}
+	return encodeChatEnvelope(ChatChannelText, chatChannelBody{ChannelPayload: SealChannel(secret, sender, text, timestamp)})
+}
+
+func ChannelPayloadFromChat(payload []byte) []byte {
+	env, err := DecodeChatEnvelope(payload)
+	if err != nil || env.Version != ChatVersion || env.Kind != ChatChannelText {
+		return nil
+	}
+	var body chatChannelBody
+	if err := cbor.Unmarshal(env.Body, &body); err != nil {
+		return nil
+	}
+	return body.ChannelPayload
 }
 
 // ChannelMessage is a decoded channel message.
@@ -95,6 +124,14 @@ func OpenChannel(secret, payload []byte) (ChannelMessage, bool) {
 		sender, text = body[:i], body[i+2:]
 	}
 	return ChannelMessage{Sender: sender, Text: text, Timestamp: ts}, true
+}
+
+func OpenChannelText(secret, payload []byte) (ChannelMessage, bool) {
+	cp := ChannelPayloadFromChat(payload)
+	if cp == nil {
+		return ChannelMessage{}, false
+	}
+	return OpenChannel(secret, cp)
 }
 
 // ---- primitives -------------------------------------------------------------

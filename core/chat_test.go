@@ -2,69 +2,53 @@ package core
 
 import (
 	"bytes"
-	"encoding/hex"
 	"testing"
 )
 
-// RFC 7748 §5.2 first X25519 test vector.
-func TestX25519RFC7748Vector(t *testing.T) {
-	scalar, _ := hex.DecodeString("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
-	u, _ := hex.DecodeString("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
-	want, _ := hex.DecodeString("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
-
-	got := x25519(scalar, u)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("x25519 = %x, want %x", got, want)
+func TestPublicTextRoundTrip(t *testing.T) {
+	alice := testIdentity(1)
+	ctx := ChatContext{DatagramID: NewDatagramID(), Source: alice.NodeID(), Destination: BroadcastNodeID}
+	payload, err := BuildPublicText(alice, ctx, "hello public", 123)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	got, ok := OpenPublicText(payload, ctx)
+	if !ok {
+		t.Fatal("open failed")
+	}
+	if got.Text != "hello public" || got.SentAt != 123 || !bytes.Equal(got.SenderPublicKey, alice.Pub) {
+		t.Fatalf("got %+v", got)
 	}
 }
 
-func TestChatSealOpenRoundTrip(t *testing.T) {
-	var seedA, seedB [SeedSize]byte
-	for i := range seedA {
-		seedA[i] = byte(i + 1)
-		seedB[i] = byte(i + 100)
+func TestTypingRoundTrip(t *testing.T) {
+	alice := testIdentity(1)
+	bob := testIdentity(30)
+	ctx := ChatContext{DatagramID: NewDatagramID(), Source: alice.NodeID(), Destination: bob.NodeID()}
+	payload, err := BuildTyping(alice, ctx, 456)
+	if err != nil {
+		t.Fatalf("build: %v", err)
 	}
-	alice := IdentityFromSeed(seedA)
-	bob := IdentityFromSeed(seedB)
+	sentAt, pub, ok := OpenTyping(payload, ctx)
+	if !ok || sentAt != 456 || !bytes.Equal(pub, alice.Pub) {
+		t.Fatalf("typing open failed sentAt=%d ok=%v", sentAt, ok)
+	}
+}
 
-	env, err := SealChat("ahoj — příliš žluťoučký 🦊", alice, bob.Pub)
+func TestDirectTextRoundTripAndWrongRecipientFails(t *testing.T) {
+	alice := testIdentity(1)
+	bob := testIdentity(30)
+	eve := testIdentity(60)
+	ctx := ChatContext{DatagramID: NewDatagramID(), Source: alice.NodeID(), Destination: bob.NodeID()}
+	payload, err := SealDirectText(alice, bob.Pub, ctx, "secret", 789)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	got, ok := OpenChat(env, bob)
-	if !ok {
-		t.Fatal("bob could not open envelope")
+	got, ok := OpenDirectText(bob, payload, ctx)
+	if !ok || got.Text != "secret" || got.SentAt != 789 || !bytes.Equal(got.SenderPublicKey, alice.Pub) {
+		t.Fatalf("open failed: %+v ok=%v", got, ok)
 	}
-	if got != "ahoj — příliš žluťoučký 🦊" {
-		t.Fatalf("plaintext = %q", got)
-	}
-	if !bytes.Equal(ChatEnvelopeSenderPub(env), alice.Pub) {
-		t.Error("envelope sender pubkey mismatch")
-	}
-}
-
-func TestChatWrongRecipientFails(t *testing.T) {
-	var sa, sb, se [SeedSize]byte
-	for i := range sa {
-		sa[i], sb[i], se[i] = byte(i+1), byte(i+2), byte(i+3)
-	}
-	alice, bob, eve := IdentityFromSeed(sa), IdentityFromSeed(sb), IdentityFromSeed(se)
-	env, _ := SealChat("secret", alice, bob.Pub)
-	if _, ok := OpenChat(env, eve); ok {
-		t.Error("eve must not be able to open the envelope")
-	}
-}
-
-// ECDH must be symmetric: X25519(a, B) == X25519(b, A).
-func TestX25519SharedSecretSymmetric(t *testing.T) {
-	var sa, sb [SeedSize]byte
-	for i := range sa {
-		sa[i], sb[i] = byte(i+7), byte(i+9)
-	}
-	alice, bob := IdentityFromSeed(sa), IdentityFromSeed(sb)
-	ab := x25519(ed25519SeedToX25519Priv(alice.Seed[:]), ed25519PubToX25519(bob.Pub))
-	ba := x25519(ed25519SeedToX25519Priv(bob.Seed[:]), ed25519PubToX25519(alice.Pub))
-	if !bytes.Equal(ab, ba) {
-		t.Fatalf("shared secret asymmetric:\n ab=%x\n ba=%x", ab, ba)
+	if _, ok := OpenDirectText(eve, payload, ChatContext{DatagramID: ctx.DatagramID, Source: alice.NodeID(), Destination: eve.NodeID()}); ok {
+		t.Fatal("wrong recipient opened direct text")
 	}
 }

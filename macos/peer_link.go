@@ -20,8 +20,8 @@ type MacPeerLink struct {
 }
 
 func (l *MacPeerLink) PeerID() core.NodeID { return l.peerID }
-func (l *MacPeerLink) TxPHY() core.PHY    { return l.txPHY }
-func (l *MacPeerLink) RxPHY() core.PHY    { return l.rxPHY }
+func (l *MacPeerLink) TxPHY() core.PHY     { return l.txPHY }
+func (l *MacPeerLink) RxPHY() core.PHY     { return l.rxPHY }
 func (l *MacPeerLink) RSSI() int           { return l.rssi }
 
 // sendFrame writes a raw GATT frame to PACKET_IN (write without response).

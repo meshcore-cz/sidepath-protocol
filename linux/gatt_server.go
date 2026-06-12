@@ -17,21 +17,21 @@ const (
 	gattManagerIF    = "org.bluez.GattManager1"
 	gattDescriptorIF = "org.bluez.GattDescriptor1"
 
-	servicePath  = dbus.ObjectPath("/org/bleedge/service0")
-	charNodeInfo = dbus.ObjectPath("/org/bleedge/service0/char0")
-	charPacketIn = dbus.ObjectPath("/org/bleedge/service0/char1")
+	servicePath   = dbus.ObjectPath("/org/bleedge/service0")
+	charNodeInfo  = dbus.ObjectPath("/org/bleedge/service0/char0")
+	charPacketIn  = dbus.ObjectPath("/org/bleedge/service0/char1")
 	charPacketOut = dbus.ObjectPath("/org/bleedge/service0/char2")
 
 	// Service and characteristic UUIDs
-	ServiceUUID    = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a001"
-	NodeInfoUUID   = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a002"
-	PacketInUUID   = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a003"
-	PacketOutUUID  = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004"
+	ServiceUUID   = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a001"
+	NodeInfoUUID  = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a002"
+	PacketInUUID  = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a003"
+	PacketOutUUID = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004"
 )
 
 // GattServer implements the BLEEdge GATT service over BlueZ D-Bus Application API.
 type GattServer struct {
-	conn     *dbus.Conn
+	conn        *dbus.Conn
 	adapter     *Adapter
 	nodeID      core.NodeID
 	pubKey      []byte // 32-byte Ed25519 public key advertised via NODE_INFO
@@ -41,8 +41,8 @@ type GattServer struct {
 	platform    string
 	onFrame     func(frame []byte, sender dbus.Sender)
 
-	mu           sync.Mutex
-	notifyConns  map[dbus.Sender]bool // peers subscribed to PACKET_OUT notifications
+	mu          sync.Mutex
+	notifyConns map[dbus.Sender]bool // peers subscribed to PACKET_OUT notifications
 }
 
 // NewGattServer creates and registers the GATT server. pubKey is the node's
@@ -127,7 +127,7 @@ func (g *GattServer) NotifyFrame(frame []byte) {
 
 // nodeInfoValue encodes the NODE_INFO characteristic (see core.EncodeNodeInfo).
 func (g *GattServer) nodeInfoValue() []byte {
-	return core.EncodeNodeInfo(core.ProtocolVersion, g.pubKey, g.caps, g.description, g.name, g.platform)
+	return core.EncodeNodeInfo(g.pubKey, g.caps)
 }
 
 // serviceProps returns a D-Bus property map for the GattService1 interface.
@@ -192,11 +192,10 @@ func (c *packetOutCharacteristic) StopNotify() *dbus.Error {
 
 func (c *packetOutCharacteristic) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error) {
 	return map[string]dbus.Variant{
-		"UUID":    dbus.MakeVariant(PacketOutUUID),
-		"Service": dbus.MakeVariant(servicePath),
-		"Flags":   dbus.MakeVariant([]string{"notify"}),
-		"Value":   dbus.MakeVariant([]byte{}),
+		"UUID":      dbus.MakeVariant(PacketOutUUID),
+		"Service":   dbus.MakeVariant(servicePath),
+		"Flags":     dbus.MakeVariant([]string{"notify"}),
+		"Value":     dbus.MakeVariant([]byte{}),
 		"Notifying": dbus.MakeVariant(false),
 	}, nil
 }
-

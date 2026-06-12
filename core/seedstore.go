@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -33,4 +34,21 @@ func LoadOrCreateIdentity(path string) (*Identity, error) {
 		return nil, fmt.Errorf("write seed: %w", err)
 	}
 	return id, nil
+}
+
+func LoadIncrementEpoch(path string) (uint64, error) {
+	var epoch uint64
+	if data, err := os.ReadFile(path); err == nil && len(data) >= 8 {
+		epoch = binary.LittleEndian.Uint64(data[:8])
+	}
+	epoch++
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return 0, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	var out [8]byte
+	binary.LittleEndian.PutUint64(out[:], epoch)
+	if err := os.WriteFile(path, out[:], 0o600); err != nil {
+		return 0, fmt.Errorf("write epoch: %w", err)
+	}
+	return epoch, nil
 }

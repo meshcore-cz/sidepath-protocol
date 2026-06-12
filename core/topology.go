@@ -10,7 +10,9 @@ type TopoNode struct {
 	ID          NodeID
 	Caps        Capabilities
 	Neighbors   []NodeID
+	Epoch       uint64
 	Seq         uint32
+	Timestamp   int64
 	Description string // free-form bio from the node's ANNOUNCE (key 8)
 	Name        string // primary display label from the node's ANNOUNCE (key 9)
 	Platform    string // OS/device string from the node's ANNOUNCE (key 10)
@@ -34,16 +36,17 @@ func NewTopology() *Topology {
 	return t
 }
 
-// Update inserts or refreshes a topology node, ignoring stale (lower Seq) updates.
-func (t *Topology) Update(n TopoNode) {
+// Update inserts or refreshes a topology node, ignoring stale epoch/seq updates.
+func (t *Topology) Update(n TopoNode) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	existing, ok := t.nodes[n.ID]
-	if ok && existing.Seq >= n.Seq {
-		return // stale update
+	if ok && (existing.Epoch > n.Epoch || (existing.Epoch == n.Epoch && existing.Seq >= n.Seq)) {
+		return false
 	}
 	n.LastSeen = time.Now()
 	t.nodes[n.ID] = &n
+	return true
 }
 
 // BFSPath returns the source-route path from `from` to `to` (excluding `from`, including `to`).

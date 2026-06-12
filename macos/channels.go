@@ -83,8 +83,16 @@ func (n *Node) Channels() []Channel {
 // SendToChannel seals text into a GRP_TXT payload (sender name = this node's
 // description) and broadcasts it to the whole mesh. No per-message ACK.
 func (n *Node) SendToChannel(secret []byte, text string) error {
-	payload := core.SealChannel(secret, n.description, text, uint32(time.Now().Unix()))
-	return n.sendData(core.NodeID{}, core.PayloadTypeChannel, payload, 4)
+	label := n.name
+	if label == "" {
+		label = n.description
+	}
+	payload, err := core.BuildChannelText(secret, label, text, uint32(time.Now().Unix()))
+	if err != nil {
+		return err
+	}
+	dg := n.router.NewBroadcast(core.ProtocolBLEEdgeChat, payload, 4)
+	return n.transmit(dg)
 }
 
 // ChannelInbound is a decoded inbound channel message together with the channel
@@ -100,7 +108,11 @@ func (n *Node) DecodeChannel(payload []byte) (ChannelInbound, bool) {
 	if len(payload) == 0 {
 		return ChannelInbound{}, false
 	}
-	hash := payload[0]
+	cp := core.ChannelPayloadFromChat(payload)
+	if len(cp) == 0 {
+		return ChannelInbound{}, false
+	}
+	hash := cp[0]
 	n.mu.Lock()
 	candidates := make([]*Channel, 0, 2)
 	for _, ch := range n.channels {
@@ -110,7 +122,7 @@ func (n *Node) DecodeChannel(payload []byte) (ChannelInbound, bool) {
 	}
 	n.mu.Unlock()
 	for _, ch := range candidates {
-		if msg, ok := core.OpenChannel(ch.Secret, payload); ok {
+		if msg, ok := core.OpenChannel(ch.Secret, cp); ok {
 			return ChannelInbound{Channel: ch.Name, ChannelMessage: msg}, true
 		}
 	}

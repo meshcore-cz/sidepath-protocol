@@ -126,37 +126,50 @@ func (b *bot) send(v any) {
 }
 
 // onIncoming is wired to the node's OnMessage callback.
-func (b *bot) onIncoming(from core.NodeID, ptype core.PayloadType, payload []byte) {
+func (b *bot) onIncoming(dg core.Datagram) {
+	from := dg.Source
 	msg := map[string]any{
 		"type": "message",
 		"from": from.String(),
 		"name": b.node.NameFor(from),
 		"ts":   time.Now().UnixMilli(),
 	}
-	switch ptype {
-	case core.PayloadTypeChatEncrypted:
-		t, ok := core.OpenChat(payload, b.node.Identity())
-		if !ok {
-			return // not for us / undecryptable
-		}
-		msg["text"] = t
-		msg["channel"] = false
-		if pub := core.ChatEnvelopeSenderPub(payload); len(pub) == 32 {
-			b.mu.Lock()
-			b.pubByNode[from] = pub
-			b.mu.Unlock()
-		}
-	case core.PayloadTypeChannel:
-		in, ok := b.node.DecodeChannel(payload)
-		if !ok {
-			return // not on a channel we've joined
-		}
+	if dg.Protocol != core.ProtocolBLEEdgeChat {
+		return
+	}
+	if in, ok := b.node.DecodeChannel(dg.Payload); ok {
 		msg["text"] = in.Text
 		msg["channel"] = true
 		msg["channelName"] = in.Channel
 		msg["sender"] = in.Sender
-	case core.PayloadTypeTextTest:
-		msg["text"] = string(payload)
+		b.send(msg)
+		return
+	}
+	env, err := core.DecodeChatEnvelope(dg.Payload)
+	if err != nil {
+		return
+	}
+	ctx := core.ChatContext{DatagramID: dg.ID, Source: dg.Source, Destination: dg.Destination}
+	switch env.Kind {
+	case core.ChatDirectText:
+		t, ok := core.OpenDirectText(b.node.Identity(), dg.Payload, ctx)
+		if !ok {
+			return
+		}
+		msg["text"] = t.Text
+		msg["channel"] = false
+		if len(t.SenderPublicKey) == 32 {
+			b.mu.Lock()
+			b.pubByNode[from] = t.SenderPublicKey
+			b.mu.Unlock()
+		}
+	case core.ChatPublicText:
+		ctx.Destination = core.BroadcastNodeID
+		t, ok := core.OpenPublicText(dg.Payload, ctx)
+		if !ok {
+			return
+		}
+		msg["text"] = t.Text
 		msg["channel"] = true
 	default:
 		return

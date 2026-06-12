@@ -11,7 +11,8 @@ const (
 	DropDuplicate      DropReason = "duplicate"
 	DropExpired        DropReason = "expired"
 	DropLoop           DropReason = "loop"
-	DropTTL            DropReason = "ttl-exhausted"
+	DropBadTTL         DropReason = "bad-ttl"
+	DropBadRoute       DropReason = "bad-route"
 	DropInvalidVersion DropReason = "invalid-version"
 	DropMalformed      DropReason = "malformed"
 	DropNotNextHop     DropReason = "not-next-hop"
@@ -20,17 +21,17 @@ const (
 	DropBadSignature   DropReason = "bad-signature"
 )
 
-// DedupCache is a thread-safe seen-packet cache keyed by PacketID.
+// DedupCache is a thread-safe seen-datagram cache keyed by DatagramID.
 type DedupCache struct {
 	mu      sync.Mutex
-	entries map[PacketID]time.Time
+	entries map[DatagramID]time.Time
 	maxSize int
 	ttl     time.Duration
 }
 
 func NewDedupCache() *DedupCache {
 	c := &DedupCache{
-		entries: make(map[PacketID]time.Time),
+		entries: make(map[DatagramID]time.Time),
 		maxSize: 4096,
 		ttl:     5 * time.Minute,
 	}
@@ -40,7 +41,7 @@ func NewDedupCache() *DedupCache {
 
 // SeenOrAdd returns true if the packet ID was already seen (and still within TTL).
 // If not seen, it adds the entry and returns false.
-func (c *DedupCache) SeenOrAdd(id PacketID) bool {
+func (c *DedupCache) SeenOrAdd(id DatagramID) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if t, ok := c.entries[id]; ok && time.Since(t) < c.ttl {
@@ -48,7 +49,7 @@ func (c *DedupCache) SeenOrAdd(id PacketID) bool {
 	}
 	if len(c.entries) >= c.maxSize {
 		// evict oldest
-		var oldest PacketID
+		var oldest DatagramID
 		var oldestT time.Time
 		for k, v := range c.entries {
 			if oldestT.IsZero() || v.Before(oldestT) {

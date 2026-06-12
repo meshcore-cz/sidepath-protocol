@@ -94,8 +94,8 @@ func (a *Adapter) PowerOn(ctx context.Context) error {
 func (a *Adapter) SetDiscoveryFilter(ctx context.Context) error {
 	obj := a.conn.Object(bluezService, a.adapterPath)
 	filter := map[string]dbus.Variant{
-		"Transport": dbus.MakeVariant("le"),
-		"RSSI":      dbus.MakeVariant(int16(-100)),
+		"Transport":     dbus.MakeVariant("le"),
+		"RSSI":          dbus.MakeVariant(int16(-100)),
 		"DuplicateData": dbus.MakeVariant(false),
 	}
 	call := obj.CallWithContext(ctx, adapterIface+".SetDiscoveryFilter", 0, filter)

@@ -8,8 +8,6 @@ package macos
 
 import (
 	"context"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -18,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bleedge/bleedge/core"
+	"github.com/fxamacker/cbor/v2"
 	"github.com/go-ble/ble"
 	"github.com/go-ble/ble/darwin"
 	"github.com/pkg/errors"
@@ -32,16 +31,17 @@ var (
 
 // Node is a macOS BLEEdge node.
 type Node struct {
-	nodeID      core.NodeID
-	identity    *core.Identity
-	description string
-	name        string
-	platform    string
-	caps        core.Capabilities
-	router      *core.Router
-	reassem     *core.Reassembler
-	allowlist   map[core.NodeID]bool
-	verbose     bool
+	nodeID        core.NodeID
+	identity      *core.Identity
+	description   string
+	name          string
+	platform      string
+	caps          core.Capabilities
+	router        *core.Router
+	reassem       *core.Reassembler
+	allowlist     map[core.NodeID]bool
+	verbose       bool
+	announceEpoch uint64
 
 	mu sync.Mutex
 	// peer addr string → link
@@ -55,7 +55,7 @@ type Node struct {
 	channels map[string]*Channel
 
 	logFn            func(string)
-	onMessage        func(core.NodeID, core.PayloadType, []byte)
+	onMessage        func(core.Datagram)
 	onPeerConnect    func(core.NodeID)
 	onPeerDisconnect func(core.NodeID)
 }
@@ -69,10 +69,11 @@ type Config struct {
 	Caps             core.Capabilities
 	Allowlist        []core.NodeID
 	Verbose          bool
+	AnnounceEpoch    uint64
 	LogFn            func(string)
-	OnMessage        func(from core.NodeID, ptype core.PayloadType, payload []byte) // called for received DATA packets
-	OnPeerConnect    func(id core.NodeID)                                           // called when outgoing peer connects
-	OnPeerDisconnect func(id core.NodeID)                                           // called when peer disconnects
+	OnMessage        func(dg core.Datagram) // called for locally delivered application datagrams
+	OnPeerConnect    func(id core.NodeID)   // called when outgoing peer connects
+	OnPeerDisconnect func(id core.NodeID)   // called when peer disconnects
 }
 
 // New creates a Node. Call Run to start it.
@@ -101,11 +102,15 @@ func New(cfg Config) *Node {
 		reassem:       core.NewReassembler(),
 		allowlist:     make(map[core.NodeID]bool),
 		verbose:       cfg.Verbose,
+		announceEpoch: cfg.AnnounceEpoch,
 		peers:         make(map[string]*MacPeerLink),
 		notifiers:     make(map[string]ble.Notifier),
 		serverPeerIDs: make(map[string]core.NodeID),
 		channels:      make(map[string]*Channel),
 		logFn:         cfg.LogFn,
+	}
+	if n.announceEpoch == 0 {
+		n.announceEpoch = 1
 	}
 	n.JoinPublicChannel() // MeshCore's default Public channel, like the Android app
 	if n.logFn == nil {
@@ -280,14 +285,14 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 
 	// Read NODE_INFO
 	var peerID core.NodeID
-	var peerDesc, peerName, peerPlatform string
+	var peerPub []byte
 	if nodeInfoChar != nil {
 		data, err := cln.ReadCharacteristic(nodeInfoChar)
 		if err == nil {
 			if ni, ok := core.DecodeNodeInfo(data); ok {
 				peerID = core.NodeIDFromPubKey(ni.PubKey)
-				peerDesc, peerName, peerPlatform = ni.Description, ni.Name, ni.Platform
-				n.logf("peer node_id=%s name=%q platform=%q desc=%q", peerID, peerName, peerPlatform, peerDesc)
+				peerPub = ni.PubKey
+				n.logf("peer node_id=%s caps=0x%04x", peerID, ni.ProvisionalCaps)
 			}
 		}
 	}
@@ -349,14 +354,12 @@ func (n *Node) connectPeer(addr string, adv ble.Advertisement) {
 	}
 
 	n.router.Neighbors.Upsert(core.Neighbor{
-		ID:          peerID,
-		Direction:   core.DirectionOutgoing,
-		RSSI:        adv.RSSI(),
-		TxPHY:       core.PHY1M,
-		RxPHY:       core.PHY1M,
-		Description: peerDesc,
-		Name:        peerName,
-		Platform:    peerPlatform,
+		ID:        peerID,
+		Direction: core.DirectionOutgoing,
+		RSSI:      adv.RSSI(),
+		TxPHY:     core.PHY1M,
+		RxPHY:     core.PHY1M,
+		PublicKey: peerPub,
 	})
 
 	// Subscribe to PACKET_OUT
@@ -385,7 +388,11 @@ func (n *Node) handleIncomingFrame(raw []byte, fromPeer *core.NodeID, fromAddr s
 		n.logf("decode frame error: %v", err)
 		return
 	}
-	data, complete, err := n.reassem.AddFrame(frame)
+	peerKey := fromAddr
+	if fromPeer != nil {
+		peerKey = fromPeer.String()
+	}
+	data, complete, err := n.reassem.AddFrame(peerKey, frame)
 	if err != nil {
 		n.logf("reassemble error: %v", err)
 		return
@@ -394,29 +401,19 @@ func (n *Node) handleIncomingFrame(raw []byte, fromPeer *core.NodeID, fromAddr s
 		return
 	}
 
-	pkt, err := core.DecodePacket(data)
+	dg, err := core.DecodeDatagram(data)
 	if err != nil {
-		n.logf("decode packet error: %v", err)
+		n.logf("decode datagram error: %v", err)
 		return
 	}
-	n.recordTraceMetric(&pkt, fromPeer)
-
-	srcHex := pkt.Source.String()[:8]
-	n.logf("rx packet id=%s source=%s ttl=%d trace=%v",
-		hex.EncodeToString(pkt.ID[:4]), srcHex, pkt.TTL, nodeIDs(pkt.Trace))
+	n.logf("rx datagram id=%x source=%s ttl=%d path=%v", dg.ID[:4], dg.Source, dg.TTL, nodeIDs(dg.Path))
 
 	// Learn the directly-connected neighbor (last trace hop, or source if fresh) so
 	// the neighbor table — and our ANNOUNCE — stay populated even when all peers
 	// connected inbound to us.
-	n.learnNeighbor(pkt, fromAddr)
+	n.learnNeighbor(dg, fromAddr)
 
-	actions := n.router.HandlePacket(pkt, fromPeer)
-	// In verbose mode, dump the full packet as JSON the first time we see it (the router
-	// dedups by id, so relay re-sightings of the same packet are flagged as duplicates and
-	// skipped here). Goes to stderr via logf, so it's safe in bot mode too.
-	if n.verbose && !isDuplicateDrop(actions) {
-		n.logPacketJSON(pkt, data, fromPeer)
-	}
+	actions := n.router.HandleDatagram(dg, fromPeer)
 	n.executeActions(actions)
 }
 
@@ -430,50 +427,12 @@ func isDuplicateDrop(actions []core.Action) bool {
 	return false
 }
 
-// logPacketJSON prints a one-line JSON dump of a freshly-seen packet: the raw bytes plus
-// the decoded header/payload. Verbose-only and called on first occurrence (see caller).
-func (n *Node) logPacketJSON(pkt core.Packet, raw []byte, fromPeer *core.NodeID) {
-	peer := ""
-	if fromPeer != nil {
-		peer = fromPeer.String()
-	}
-	rec := map[string]any{
-		"event":       "rx_packet",
-		"time":        time.Now().Format(time.RFC3339Nano),
-		"fromPeer":    peer,
-		"rawHex":      hex.EncodeToString(raw),
-		"rawLen":      len(raw),
-		"version":     pkt.Version,
-		"type":        uint8(pkt.Type),
-		"id":          hex.EncodeToString(pkt.ID[:]),
-		"source":      pkt.Source.String(),
-		"destination": pkt.Destination.String(),
-		"broadcast":   pkt.IsBroadcast(),
-		"mode":        uint8(pkt.Mode),
-		"ttl":         pkt.TTL,
-		"routeCursor": pkt.RouteCursor,
-		"route":       nodeIDs(pkt.Route),
-		"trace":       nodeIDs(pkt.Trace),
-		"traceMetric": pkt.TraceMetric,
-		"payloadType": uint8(pkt.PayloadType),
-		"payloadLen":  len(pkt.Payload),
-		"payloadHex":  hex.EncodeToString(pkt.Payload),
-		"seq":         pkt.Seq,
-	}
-	b, err := json.Marshal(rec)
-	if err != nil {
-		n.logf("packet json marshal error: %v", err)
-		return
-	}
-	n.logf("%s", b)
-}
-
-func (n *Node) learnNeighbor(pkt core.Packet, fromAddr string) {
+func (n *Node) learnNeighbor(dg core.Datagram, fromAddr string) {
 	var nb core.NodeID
-	if len(pkt.Trace) > 0 {
-		nb = pkt.Trace[len(pkt.Trace)-1]
+	if len(dg.Path) > 0 {
+		nb = dg.Path[len(dg.Path)-1]
 	} else {
-		nb = pkt.Source
+		nb = dg.Source
 	}
 	var zero core.NodeID
 	if nb == n.nodeID || nb == zero {
@@ -523,16 +482,6 @@ func (n *Node) selectTraceRoute(dst core.NodeID) ([]core.NodeID, bool) {
 	return path, true
 }
 
-func (n *Node) recordTraceMetric(pkt *core.Packet, fromPeer *core.NodeID) {
-	if pkt.Type != core.PacketTypeData {
-		return
-	}
-	if pkt.PayloadType != core.PayloadTypeTraceRequest && pkt.PayloadType != core.PayloadTypeTraceResponse {
-		return
-	}
-	pkt.TraceMetric = append(pkt.TraceMetric, int8(clampRSSI(n.rssiForPeer(fromPeer))))
-}
-
 func (n *Node) rssiForPeer(id *core.NodeID) int {
 	if id == nil {
 		return 0
@@ -564,10 +513,10 @@ func (n *Node) executeActions(actions []core.Action) {
 	for _, a := range actions {
 		switch a.Type {
 		case core.ActionDeliverLocal:
-			n.deliverLocal(a.Packet)
+			n.deliverLocal(a.Datagram)
 		case core.ActionRelayFlood:
 			go func(a core.Action) {
-				time.Sleep(core.FloodJitter())
+				time.Sleep(n.router.FloodJitter())
 				n.relayFlood(a)
 			}(a)
 		// ACK and next-hop relay both notify a subscribed central (CoreBluetooth
@@ -584,76 +533,47 @@ func (n *Node) executeActions(actions []core.Action) {
 	}
 }
 
-func (n *Node) deliverLocal(pkt core.Packet) {
-	if pkt.Type == core.PacketTypeAck {
-		n.logf("ack received from=%s", pkt.Source)
-		return
-	}
-	if pkt.Type == core.PacketTypeAnnounce {
-		return // topology update, not user data
-	}
-	if pkt.PayloadType == core.PayloadTypeTraceRequest {
-		if err := n.returnTrace(pkt); err != nil {
-			n.logf("trace response error: %v", err)
-		}
-		return
-	}
-	if pkt.PayloadType == core.PayloadTypeTraceResponse {
-		if result, err := core.DecodeTraceResult(pkt.Payload); err == nil {
-			result.ReturnNodes = append([]core.NodeID(nil), pkt.Trace...)
-			result.ReturnSamples = append([]int8(nil), pkt.TraceMetric...)
-			if payload, err := result.Encode(); err == nil {
-				pkt.Payload = payload
+func (n *Node) deliverLocal(dg core.Datagram) {
+	if dg.Protocol == core.ProtocolBLEEdgeControl {
+		ctrl, err := core.DecodeControl(dg.Payload)
+		if err == nil {
+			switch ctrl.Kind {
+			case core.ControlAck:
+				n.logf("ack received from=%s", dg.Source)
+			case core.ControlAnnounce:
+				return
+			case core.ControlTraceRequest:
+				if err := n.returnTrace(dg, ctrl.Body); err != nil {
+					n.logf("trace response error: %v", err)
+				}
 			}
 		}
+		return
 	}
-	n.logf("deliver payload-type=%d payload=%q trace=%v",
-		pkt.PayloadType, string(pkt.Payload), nodeIDs(pkt.Trace))
+	n.logf("deliver protocol=0x%04x payload=%q path=%v", dg.Protocol, string(dg.Payload), nodeIDs(dg.Path))
 	if n.onMessage != nil {
-		n.onMessage(pkt.Source, pkt.PayloadType, pkt.Payload)
+		n.onMessage(dg)
 	}
 }
 
-func (n *Node) returnTrace(req core.Packet) error {
-	tp, err := core.DecodeTracePayload(req.Payload)
+func (n *Node) returnTrace(req core.Datagram, body []byte) error {
+	var tr core.TraceRequestBody
+	if err := cbor.Unmarshal(body, &tr); err != nil {
+		return err
+	}
+	resp := core.TraceResponseBody{Tag: tr.Tag, Metric: tr.Metric, ForwardPath: append([]core.NodeID(nil), req.Path...), ForwardSamples: tr.ForwardSamples}
+	payload, err := resp.ToControl()
 	if err != nil {
 		return err
 	}
-	result := core.TraceResult{
-		Tag:            tp.Tag,
-		AuthCode:       tp.AuthCode,
-		Route:          append([]core.NodeID(nil), req.Route...),
-		ForwardNodes:   append([]core.NodeID(nil), req.Trace...),
-		ForwardSamples: append([]int8(nil), req.TraceMetric...),
-		Metric:         core.TraceMetricRSSI,
-	}
-	payload, err := result.Encode()
-	if err != nil {
-		return err
-	}
-	route := reverseTraceRoute(req.Trace, req.Source)
-	pkt := core.Packet{
-		Version:     core.ProtocolVersion,
-		Type:        core.PacketTypeData,
-		ID:          core.NewPacketID(),
-		Source:      n.nodeID,
-		Destination: req.Source,
-		Mode:        core.RoutingModeSourceRoute,
-		TTL:         uint8(len(route) + 1),
-		Route:       route,
-		PayloadType: core.PayloadTypeTraceResponse,
-		Payload:     payload,
-	}
-	if len(route) == 0 {
-		pkt.Mode = core.RoutingModeFlood
-		pkt.TTL = 3
-	}
-	n.router.MarkOriginated(pkt.ID)
+	route := reverseTraceRoute(req.Path, req.Source)
+	dg := core.Datagram{Version: core.DatagramVersion, ID: core.NewDatagramID(), Source: n.nodeID, Destination: req.Source, TTL: uint8(len(route)), Route: route, Protocol: core.ProtocolBLEEdgeControl, Payload: payload}
+	n.router.MarkOriginated(dg.ID)
 	// returnTrace runs inside the inbound PACKET_IN write callback (a CoreBluetooth
 	// delegate callback); notifying the central from there re-enters CoreBluetooth and
 	// crashes. Send the response from a separate goroutine.
 	go func() {
-		if err := n.transmitToRoute(pkt); err != nil {
+		if err := n.transmitToRoute(dg); err != nil {
 			n.logf("trace response send error: %v", err)
 		}
 	}()
@@ -676,15 +596,15 @@ func reverseTraceRoute(trace []core.NodeID, dst core.NodeID) []core.NodeID {
 }
 
 func (n *Node) relayFlood(a core.Action) {
-	data, err := a.Packet.Encode()
+	data, err := a.Datagram.Encode()
 	if err != nil {
 		return
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, a.Packet.ID)
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for addr, link := range n.peers {
-		if a.NextHop != nil && link.peerID == *a.NextHop {
+		if a.ExcludePeer != nil && link.peerID == *a.ExcludePeer {
 			continue // don't relay back to incoming peer
 		}
 		for _, f := range frames {
@@ -704,11 +624,11 @@ func (n *Node) relayNextHop(a core.Action) {
 	if a.NextHop == nil {
 		return
 	}
-	data, err := a.Packet.Encode()
+	data, err := a.Datagram.Encode()
 	if err != nil {
 		return
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, a.Packet.ID)
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 	if n.sendFramesToPeer(frames, *a.NextHop) {
 		return
 	}
@@ -716,11 +636,11 @@ func (n *Node) relayNextHop(a core.Action) {
 }
 
 func (n *Node) sendAck(a core.Action) {
-	n.logf("send ack route=%v", nodeIDs(a.Packet.Route))
+	n.logf("send ack route=%v", nodeIDs(a.Datagram.Route))
 	n.relayNextHop(a)
 	// Fallback to flood if next-hop missing
 	if a.NextHop == nil {
-		n.relayFlood(core.Action{Type: core.ActionRelayFlood, Packet: a.Packet})
+		n.relayFlood(core.Action{Type: core.ActionRelayFlood, Datagram: a.Datagram})
 	}
 }
 
@@ -733,17 +653,17 @@ func (n *Node) announceLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			pkt, err := n.router.BuildAnnounce(n.caps, seq)
+			dg, err := n.router.BuildAnnounce(n.caps, n.announceEpoch, seq)
 			if err != nil {
 				continue
 			}
 			seq++
-			n.router.MarkOriginated(pkt.ID)
-			data, err := pkt.Encode()
+			n.router.MarkOriginated(dg.ID)
+			data, err := dg.Encode()
 			if err != nil {
 				continue
 			}
-			frames := core.FragmentPacket(data, core.MaxFrameSize, pkt.ID)
+			frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 			n.mu.Lock()
 			for _, link := range n.peers {
 				for _, f := range frames {
@@ -762,29 +682,51 @@ func (n *Node) announceLoop(ctx context.Context) {
 
 // buildNodeInfo encodes the NODE_INFO characteristic (see core.EncodeNodeInfo).
 func (n *Node) buildNodeInfo() []byte {
-	return core.EncodeNodeInfo(core.ProtocolVersion, n.identity.Pub, n.caps, n.description, n.name, n.platform)
+	return core.EncodeNodeInfo(n.identity.Pub, n.caps)
 }
 
 // SendText sends a plaintext test message to dst (zero = broadcast).
 func (n *Node) SendText(dst core.NodeID, text string, ttl uint8) error {
-	return n.sendData(dst, core.PayloadTypeTextTest, []byte(text), ttl)
+	ctx := core.ChatContext{DatagramID: core.NewDatagramID(), Source: n.nodeID, Destination: core.BroadcastNodeID}
+	payload, err := core.BuildPublicText(n.identity, ctx, text, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	dg := core.Datagram{Version: core.DatagramVersion, ID: ctx.DatagramID, Source: n.nodeID, Destination: core.BroadcastNodeID, TTL: ttl, Protocol: core.ProtocolBLEEdgeChat, Payload: payload}
+	return n.transmit(dg)
 }
 
 // SendTyping sends an ephemeral "I'm typing" hint to dst (empty TYPING payload,
 // never ACKed). Best-effort — used to show activity while preparing a reply.
 func (n *Node) SendTyping(dst core.NodeID) error {
-	return n.sendData(dst, core.PayloadTypeTyping, nil, 4)
+	ctx := core.ChatContext{DatagramID: core.NewDatagramID(), Source: n.nodeID, Destination: dst}
+	payload, err := core.BuildTyping(n.identity, ctx, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	dg, ok := n.router.NewUnicast(dst, core.ProtocolBLEEdgeChat, payload, 0, 4, false)
+	if !ok {
+		return fmt.Errorf("no route to %s", dst)
+	}
+	dg.ID = ctx.DatagramID
+	return n.transmit(dg)
 }
 
 // SendChatTo sends an end-to-end encrypted direct message to dst, encrypted to
 // recipientPub (the recipient's 32-byte Ed25519 public key). For replies the
-// public key is the one carried in the inbound envelope (core.ChatEnvelopeSenderPub).
+// public key is the one carried in the inbound envelope.
 func (n *Node) SendChatTo(dst core.NodeID, recipientPub []byte, text string) error {
-	env, err := core.SealChat(text, n.identity, recipientPub)
+	ctx := core.ChatContext{DatagramID: core.NewDatagramID(), Source: n.nodeID, Destination: dst}
+	env, err := core.SealDirectText(n.identity, recipientPub, ctx, text, time.Now().Unix())
 	if err != nil {
 		return err
 	}
-	return n.sendData(dst, core.PayloadTypeChatEncrypted, env, 4)
+	dg, ok := n.router.NewUnicast(dst, core.ProtocolBLEEdgeChat, env, uint16(core.FlagAckRequested), 4, false)
+	if !ok {
+		return fmt.Errorf("no route to %s", dst)
+	}
+	dg.ID = ctx.DatagramID
+	return n.transmit(dg)
 }
 
 // SendChat sends an encrypted DM to dst, resolving its public key from the
@@ -810,43 +752,20 @@ func (n *Node) RouteTo(dst core.NodeID) ([]core.NodeID, bool) {
 func (n *Node) SendTrace(dst core.NodeID, route []core.NodeID) (uint32, error) {
 	tag := core.RandomUint32()
 	if len(route) == 0 {
-		if selected, ok := n.selectTraceRoute(dst); ok {
-			route = selected
-		}
+		route, _ = n.selectTraceRoute(dst)
 		if len(route) == 0 {
 			return 0, fmt.Errorf("no route known to %s", dst)
 		}
 	} else if route[len(route)-1] != dst {
 		route = append(append([]core.NodeID(nil), route...), dst)
 	}
-	flags, err := core.TraceFlagsForHashWidth(core.TraceHashWidth8)
+	payload, err := (core.TraceRequestBody{Tag: tag, Metric: core.TraceMetricRSSIDBM}).ToControl()
 	if err != nil {
 		return 0, err
 	}
-	routeData, err := core.TraceRouteData(route, core.TraceHashWidth8)
-	if err != nil {
-		return 0, err
-	}
-	payload := core.EncodeTracePayload(core.TracePayload{
-		Tag:       tag,
-		AuthCode:  0,
-		Flags:     flags,
-		RouteData: routeData,
-	})
-	pkt := core.Packet{
-		Version:     core.ProtocolVersion,
-		Type:        core.PacketTypeData,
-		ID:          core.NewPacketID(),
-		Source:      n.nodeID,
-		Destination: dst,
-		TTL:         uint8(len(route) + 2),
-		PayloadType: core.PayloadTypeTraceRequest,
-		Payload:     payload,
-	}
-	pkt.Mode = core.RoutingModeSourceRoute
-	pkt.Route = route
-	n.router.MarkOriginated(pkt.ID)
-	return tag, n.transmitToRoute(pkt)
+	dg := core.Datagram{Version: core.DatagramVersion, ID: core.NewDatagramID(), Source: n.nodeID, Destination: dst, TTL: uint8(len(route)), Route: route, Protocol: core.ProtocolBLEEdgeControl, Payload: payload}
+	n.router.MarkOriginated(dg.ID)
+	return tag, n.transmitToRoute(dg)
 }
 
 // PublicKeyFor returns a node's 32-byte Ed25519 public key from the topology, or nil.
@@ -855,40 +774,13 @@ func (n *Node) PublicKeyFor(id core.NodeID) []byte {
 }
 
 // sendData builds, originates and transmits a DATA packet.
-func (n *Node) sendData(dst core.NodeID, ptype core.PayloadType, payload []byte, ttl uint8) error {
-	pkt := core.Packet{
-		Version:     core.ProtocolVersion,
-		Type:        core.PacketTypeData,
-		ID:          core.NewPacketID(),
-		Source:      n.nodeID,
-		Destination: dst,
-		TTL:         ttl,
-		PayloadType: ptype,
-		Payload:     payload,
-	}
-	var zero core.NodeID
-	if dst == zero {
-		pkt.Mode = core.RoutingModeFlood
-	} else {
-		route, ok := n.router.SelectRoute(dst)
-		if !ok || len(route) == 0 {
-			pkt.Mode = core.RoutingModeFlood
-		} else {
-			pkt.Mode = core.RoutingModeSourceRoute
-			pkt.Route = route
-		}
-	}
-	// Record our own packet so a flood echo doesn't get re-flooded back out.
-	n.router.MarkOriginated(pkt.ID)
-	return n.transmit(pkt)
-}
-
-func (n *Node) transmit(pkt core.Packet) error {
-	data, err := pkt.Encode()
+func (n *Node) transmit(dg core.Datagram) error {
+	n.router.MarkOriginated(dg.ID)
+	data, err := dg.Encode()
 	if err != nil {
 		return err
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, pkt.ID)
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, link := range n.peers {
@@ -905,16 +797,17 @@ func (n *Node) transmit(pkt core.Packet) error {
 	return nil
 }
 
-func (n *Node) transmitToRoute(pkt core.Packet) error {
-	if len(pkt.Route) == 0 {
+func (n *Node) transmitToRoute(dg core.Datagram) error {
+	if len(dg.Route) == 0 {
 		return fmt.Errorf("source route is empty")
 	}
-	data, err := pkt.Encode()
+	n.router.MarkOriginated(dg.ID)
+	data, err := dg.Encode()
 	if err != nil {
 		return err
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, pkt.ID)
-	firstHop := pkt.Route[0]
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
+	firstHop := dg.Route[0]
 	if n.sendFramesToPeer(frames, firstHop) {
 		return nil
 	}
@@ -1015,6 +908,11 @@ func (n *Node) PlatformFor(id core.NodeID) string {
 func LoadOrCreateIdentity() (*core.Identity, error) {
 	path := filepath.Join(os.Getenv("HOME"), ".bleedge", "seed")
 	return core.LoadOrCreateIdentity(path)
+}
+
+func LoadIncrementEpoch() (uint64, error) {
+	path := filepath.Join(os.Getenv("HOME"), ".bleedge", "epoch")
+	return core.LoadIncrementEpoch(path)
 }
 
 func isCtxErr(err error) bool {

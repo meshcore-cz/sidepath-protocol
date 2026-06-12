@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/godbus/dbus/v5"
 
 	"github.com/bleedge/bleedge/core"
@@ -34,11 +35,12 @@ type Node struct {
 	mu    sync.RWMutex
 	peers map[core.NodeID]*BLEPeerLink // connected peers
 
-	announceSeq uint32
-	verbose     bool
-	jsonLog     bool
+	announceSeq   uint32
+	announceEpoch uint64
+	verbose       bool
+	jsonLog       bool
 
-	onDeliver func(pkt core.Packet)
+	onDeliver func(dg core.Datagram)
 }
 
 // NodeConfig holds configuration for a Node.
@@ -63,6 +65,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		if err != nil {
 			return nil, fmt.Errorf("identity: %w", err)
 		}
+	}
+	epoch, err := core.LoadIncrementEpoch(filepath.Join(os.Getenv("HOME"), ".bleedge", "epoch"))
+	if err != nil {
+		return nil, fmt.Errorf("epoch: %w", err)
 	}
 	nodeID := identity.NodeID()
 
@@ -90,19 +96,20 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	n := &Node{
-		nodeID:      nodeID,
-		identity:    identity,
-		description: description,
-		name:        name,
-		platform:    platform,
-		phyMode:     cfg.PHYMode,
-		caps:        core.Capabilities(core.LinuxCapabilities),
-		router:      router,
-		reassembler: core.NewReassembler(),
-		adapter:     adapter,
-		peers:       make(map[core.NodeID]*BLEPeerLink),
-		verbose:     cfg.Verbose,
-		jsonLog:     cfg.JSONLog,
+		nodeID:        nodeID,
+		identity:      identity,
+		description:   description,
+		name:          name,
+		platform:      platform,
+		phyMode:       cfg.PHYMode,
+		caps:          core.Capabilities(core.LinuxCapabilities),
+		router:        router,
+		reassembler:   core.NewReassembler(),
+		adapter:       adapter,
+		peers:         make(map[core.NodeID]*BLEPeerLink),
+		announceEpoch: epoch,
+		verbose:       cfg.Verbose,
+		jsonLog:       cfg.JSONLog,
 	}
 
 	n.gattServer = NewGattServer(adapter, identity.Pub, n.caps, description, name, platform, n.handleIncomingFrame)
@@ -163,21 +170,19 @@ func (n *Node) Stop(ctx context.Context) {
 }
 
 // SetDeliveryHandler sets a callback invoked when a packet is delivered locally.
-func (n *Node) SetDeliveryHandler(fn func(pkt core.Packet)) { n.onDeliver = fn }
+func (n *Node) SetDeliveryHandler(fn func(dg core.Datagram)) { n.onDeliver = fn }
 
 // NodeID returns this node's ID.
 func (n *Node) NodeID() core.NodeID { return n.nodeID }
 
-// SendPacket fragments and sends a packet to all or specific peers.
-func (n *Node) SendPacket(pkt core.Packet) error {
-	// Record our own packet so a flood echo doesn't get re-flooded back out.
-	n.router.MarkOriginated(pkt.ID)
-
-	data, err := pkt.Encode()
+// SendDatagram fragments and sends a datagram to all connected peers.
+func (n *Node) SendDatagram(dg core.Datagram) error {
+	n.router.MarkOriginated(dg.ID)
+	data, err := dg.Encode()
 	if err != nil {
 		return err
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, pkt.ID)
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -196,66 +201,35 @@ func (n *Node) SendPacket(pkt core.Packet) error {
 	return nil
 }
 
-// SendTrace sends a source-routed trace request. If route is empty, the current
-// topology is used. Trace never falls back to flood; only nodes on the selected
-// route track may relay it.
 func (n *Node) SendTrace(dst core.NodeID, route []core.NodeID) (uint32, error) {
 	tag := core.RandomUint32()
 	if len(route) == 0 {
-		if selected, ok := n.router.SelectRoute(dst); ok {
-			if len(selected) == 0 {
-				route = []core.NodeID{dst}
-			} else {
-				route = selected
-			}
-		}
+		route = n.router.SelectRoute(dst)
 		if len(route) == 0 {
 			return 0, fmt.Errorf("no route known to %s", dst)
 		}
 	} else if route[len(route)-1] != dst {
 		route = append(append([]core.NodeID(nil), route...), dst)
 	}
-
-	flags, err := core.TraceFlagsForHashWidth(core.TraceHashWidth8)
+	payload, err := (core.TraceRequestBody{Tag: tag, Metric: core.TraceMetricRSSIDBM, ForwardSamples: nil}).ToControl()
 	if err != nil {
 		return 0, err
 	}
-	routeData, err := core.TraceRouteData(route, core.TraceHashWidth8)
-	if err != nil {
-		return 0, err
-	}
-	payload := core.EncodeTracePayload(core.TracePayload{
-		Tag:       tag,
-		AuthCode:  0,
-		Flags:     flags,
-		RouteData: routeData,
-	})
-	pkt := core.Packet{
-		Version:     core.ProtocolVersion,
-		Type:        core.PacketTypeData,
-		ID:          core.NewPacketID(),
-		Source:      n.nodeID,
-		Destination: dst,
-		Mode:        core.RoutingModeSourceRoute,
-		TTL:         uint8(len(route) + 2),
-		Route:       route,
-		PayloadType: core.PayloadTypeTraceRequest,
-		Payload:     payload,
-	}
-	n.router.MarkOriginated(pkt.ID)
-	return tag, n.transmitToRoute(pkt)
+	dg := core.Datagram{Version: core.DatagramVersion, ID: core.NewDatagramID(), Source: n.nodeID, Destination: dst, TTL: uint8(len(route)), Route: route, Protocol: core.ProtocolBLEEdgeControl, Payload: payload}
+	n.router.MarkOriginated(dg.ID)
+	return tag, n.transmitToRoute(dg)
 }
 
-func (n *Node) transmitToRoute(pkt core.Packet) error {
-	if len(pkt.Route) == 0 {
+func (n *Node) transmitToRoute(dg core.Datagram) error {
+	if len(dg.Route) == 0 {
 		return fmt.Errorf("source route is empty")
 	}
-	data, err := pkt.Encode()
+	data, err := dg.Encode()
 	if err != nil {
 		return err
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, pkt.ID)
-	firstHop := pkt.Route[0]
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
+	firstHop := dg.Route[0]
 	n.mu.RLock()
 	link, ok := n.peers[firstHop]
 	n.mu.RUnlock()
@@ -278,7 +252,7 @@ func (n *Node) handleIncomingFrame(raw []byte, sender dbus.Sender) {
 		return
 	}
 
-	data, done, err := n.reassembler.AddFrame(frame)
+	data, done, err := n.reassembler.AddFrame(string(sender), frame)
 	if err != nil {
 		log.Printf("[node] reassemble: %v", err)
 		return
@@ -287,35 +261,28 @@ func (n *Node) handleIncomingFrame(raw []byte, sender dbus.Sender) {
 		return
 	}
 
-	pkt, err := core.DecodePacket(data)
+	dg, err := core.DecodeDatagram(data)
 	if err != nil {
-		log.Printf("[node] decode packet: %v", err)
+		log.Printf("[node] decode datagram: %v", err)
 		return
 	}
 
 	if n.verbose {
-		log.Printf("rx packet id=%s source=%s ttl=%d trace=%v", pkt.ID, pkt.Source, pkt.TTL, pkt.Trace)
+		log.Printf("rx datagram id=%x source=%s ttl=%d path=%v", dg.ID, dg.Source, dg.TTL, dg.Path)
 	}
 
-	incomingPeer := directNeighborFromPacket(pkt)
-	pkt = n.recordTraceMetric(pkt, incomingPeer)
-
-	// Learn the directly-connected neighbor: the last trace hop (or the source if
-	// the packet is fresh) is always the peer that sent us this frame. This keeps
-	// the neighbor table populated even when all our connections are inbound
-	// (others connected to us), so our ANNOUNCE advertises real neighbors.
-	n.learnNeighbor(pkt)
-
-	actions := n.router.HandlePacket(pkt, incomingPeer)
+	incomingPeer := directNeighborFromDatagram(dg)
+	n.learnNeighbor(dg)
+	actions := n.router.HandleDatagram(dg, incomingPeer)
 	n.executeActions(actions)
 }
 
-func directNeighborFromPacket(pkt core.Packet) *core.NodeID {
+func directNeighborFromDatagram(dg core.Datagram) *core.NodeID {
 	var nb core.NodeID
-	if len(pkt.Trace) > 0 {
-		nb = pkt.Trace[len(pkt.Trace)-1]
+	if len(dg.Path) > 0 {
+		nb = dg.Path[len(dg.Path)-1]
 	} else {
-		nb = pkt.Source
+		nb = dg.Source
 	}
 	if nb == (core.NodeID{}) {
 		return nil
@@ -326,12 +293,12 @@ func directNeighborFromPacket(pkt core.Packet) *core.NodeID {
 // learnNeighbor records the directly-connected peer that delivered a packet
 // (last trace hop, or source for a freshly-originated packet). Existing entries
 // are refreshed without clobbering richer info captured at connect time.
-func (n *Node) learnNeighbor(pkt core.Packet) {
+func (n *Node) learnNeighbor(dg core.Datagram) {
 	var nb core.NodeID
-	if len(pkt.Trace) > 0 {
-		nb = pkt.Trace[len(pkt.Trace)-1]
+	if len(dg.Path) > 0 {
+		nb = dg.Path[len(dg.Path)-1]
 	} else {
-		nb = pkt.Source
+		nb = dg.Source
 	}
 	if nb == n.nodeID || nb == (core.NodeID{}) {
 		return
@@ -341,17 +308,6 @@ func (n *Node) learnNeighbor(pkt core.Packet) {
 	} else {
 		n.router.Neighbors.Upsert(core.Neighbor{ID: nb, Direction: core.DirectionIncoming})
 	}
-}
-
-func (n *Node) recordTraceMetric(pkt core.Packet, incomingPeer *core.NodeID) core.Packet {
-	if pkt.Type != core.PacketTypeData {
-		return pkt
-	}
-	if pkt.PayloadType != core.PayloadTypeTraceRequest && pkt.PayloadType != core.PayloadTypeTraceResponse {
-		return pkt
-	}
-	pkt.TraceMetric = append(pkt.TraceMetric, int8(clampRSSI(n.rssiForPeer(incomingPeer))))
-	return pkt
 }
 
 func (n *Node) rssiForPeer(id *core.NodeID) int {
@@ -383,10 +339,10 @@ func (n *Node) executeActions(actions []core.Action) {
 	for _, action := range actions {
 		switch action.Type {
 		case core.ActionDeliverLocal:
-			n.deliverLocal(action.Packet)
+			n.deliverLocal(action.Datagram)
 
 		case core.ActionRelayFlood:
-			time.AfterFunc(core.FloodJitter(), func() {
+			time.AfterFunc(n.router.FloodJitter(), func() {
 				n.relayFlood(action)
 			})
 
@@ -404,71 +360,47 @@ func (n *Node) executeActions(actions []core.Action) {
 	}
 }
 
-func (n *Node) deliverLocal(pkt core.Packet) {
-	if pkt.Type == core.PacketTypeAck {
-		log.Printf("ack received from=%s", pkt.Source)
-		return
-	}
-	if pkt.Type == core.PacketTypeAnnounce {
-		return
-	}
-	if pkt.PayloadType == core.PayloadTypeTraceRequest {
-		if err := n.returnTrace(pkt); err != nil {
-			log.Printf("[node] trace response: %v", err)
-		}
-		return
-	}
-	if pkt.PayloadType == core.PayloadTypeTraceResponse {
-		if result, err := core.DecodeTraceResult(pkt.Payload); err == nil {
-			result.ReturnNodes = append([]core.NodeID(nil), pkt.Trace...)
-			result.ReturnSamples = append([]int8(nil), pkt.TraceMetric...)
-			if payload, err := result.Encode(); err == nil {
-				pkt.Payload = payload
+func (n *Node) deliverLocal(dg core.Datagram) {
+	if dg.Protocol == core.ProtocolBLEEdgeControl {
+		ctrl, err := core.DecodeControl(dg.Payload)
+		if err == nil {
+			switch ctrl.Kind {
+			case core.ControlAck:
+				log.Printf("ack received from=%s", dg.Source)
+			case core.ControlAnnounce:
+				return
+			case core.ControlTraceRequest:
+				if err := n.returnTrace(dg, ctrl.Body); err != nil {
+					log.Printf("[node] trace response: %v", err)
+				}
 			}
 		}
+		return
 	}
 	if n.verbose {
-		log.Printf("deliver payload-type=%d payload=%q trace=%v", pkt.PayloadType, pkt.Payload, pkt.Trace)
+		log.Printf("deliver protocol=0x%04x payload=%q path=%v", dg.Protocol, dg.Payload, dg.Path)
 	} else {
-		log.Printf("deliver payload-type=%d payload=%q", pkt.PayloadType, pkt.Payload)
+		log.Printf("deliver protocol=0x%04x payload=%q", dg.Protocol, dg.Payload)
 	}
 	if n.onDeliver != nil {
-		n.onDeliver(pkt)
+		n.onDeliver(dg)
 	}
 }
 
-func (n *Node) returnTrace(req core.Packet) error {
-	tp, err := core.DecodeTracePayload(req.Payload)
+func (n *Node) returnTrace(req core.Datagram, body []byte) error {
+	var tr core.TraceRequestBody
+	if err := cbor.Unmarshal(body, &tr); err != nil {
+		return err
+	}
+	resp := core.TraceResponseBody{Tag: tr.Tag, Metric: tr.Metric, ForwardPath: append([]core.NodeID(nil), req.Path...), ForwardSamples: tr.ForwardSamples}
+	payload, err := resp.ToControl()
 	if err != nil {
 		return err
 	}
-	result := core.TraceResult{
-		Tag:            tp.Tag,
-		AuthCode:       tp.AuthCode,
-		Route:          append([]core.NodeID(nil), req.Route...),
-		ForwardNodes:   append([]core.NodeID(nil), req.Trace...),
-		ForwardSamples: append([]int8(nil), req.TraceMetric...),
-		Metric:         core.TraceMetricRSSI,
-	}
-	payload, err := result.Encode()
-	if err != nil {
-		return err
-	}
-	route := reverseTraceRoute(req.Trace, req.Source)
-	pkt := core.Packet{
-		Version:     core.ProtocolVersion,
-		Type:        core.PacketTypeData,
-		ID:          core.NewPacketID(),
-		Source:      n.nodeID,
-		Destination: req.Source,
-		Mode:        core.RoutingModeSourceRoute,
-		TTL:         uint8(len(route) + 1),
-		Route:       route,
-		PayloadType: core.PayloadTypeTraceResponse,
-		Payload:     payload,
-	}
-	n.router.MarkOriginated(pkt.ID)
-	return n.transmitToRoute(pkt)
+	route := reverseTraceRoute(req.Path, req.Source)
+	dg := core.Datagram{Version: core.DatagramVersion, ID: core.NewDatagramID(), Source: n.nodeID, Destination: req.Source, TTL: uint8(len(route)), Route: route, Protocol: core.ProtocolBLEEdgeControl, Payload: payload}
+	n.router.MarkOriginated(dg.ID)
+	return n.transmitToRoute(dg)
 }
 
 func reverseTraceRoute(trace []core.NodeID, dst core.NodeID) []core.NodeID {
@@ -487,19 +419,19 @@ func reverseTraceRoute(trace []core.NodeID, dst core.NodeID) []core.NodeID {
 }
 
 func (n *Node) relayFlood(action core.Action) {
-	data, err := action.Packet.Encode()
+	data, err := action.Datagram.Encode()
 	if err != nil {
 		log.Printf("[node] relay encode: %v", err)
 		return
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, action.Packet.ID)
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
 	for peerID, link := range n.peers {
 		// Exclude the incoming peer
-		if action.NextHop != nil && peerID == *action.NextHop {
+		if action.ExcludePeer != nil && peerID == *action.ExcludePeer {
 			continue
 		}
 		for _, f := range frames {
@@ -525,11 +457,11 @@ func (n *Node) relayNextHop(action core.Action) {
 		log.Printf("[node] relay-next-hop: peer %s not connected", *action.NextHop)
 		return
 	}
-	data, err := action.Packet.Encode()
+	data, err := action.Datagram.Encode()
 	if err != nil {
 		return
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, action.Packet.ID)
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 	for _, f := range frames {
 		link.SendFrame(f.Encode()) //nolint:errcheck
 	}
@@ -547,19 +479,19 @@ func (n *Node) sendAck(action core.Action) {
 	n.mu.RUnlock()
 	if !ok {
 		// Try flood
-		n.relayFlood(core.Action{Type: core.ActionRelayFlood, Packet: action.Packet})
+		n.relayFlood(core.Action{Type: core.ActionRelayFlood, Datagram: action.Datagram})
 		return
 	}
-	data, err := action.Packet.Encode()
+	data, err := action.Datagram.Encode()
 	if err != nil {
 		return
 	}
-	frames := core.FragmentPacket(data, core.MaxFrameSize, action.Packet.ID)
+	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 	for _, f := range frames {
 		link.SendFrame(f.Encode()) //nolint:errcheck
 	}
 	if n.verbose {
-		log.Printf("send ack route=%v", action.Packet.Route)
+		log.Printf("send ack route=%v", action.Datagram.Route)
 	}
 }
 
@@ -644,14 +576,12 @@ func (n *Node) connectDevice(ctx context.Context, result ScanResult) {
 	n.mu.Unlock()
 
 	n.router.Neighbors.Upsert(core.Neighbor{
-		ID:          realID,
-		TxPHY:       link.TxPHY(),
-		RxPHY:       link.RxPHY(),
-		RSSI:        link.RSSI(),
-		Caps:        client.caps,
-		Description: client.description,
-		Name:        client.name,
-		Platform:    client.platform,
+		ID:        realID,
+		TxPHY:     link.TxPHY(),
+		RxPHY:     link.RxPHY(),
+		RSSI:      link.RSSI(),
+		Caps:      client.caps,
+		PublicKey: client.pubKey,
 	})
 }
 
@@ -674,12 +604,12 @@ func (n *Node) announceLoop(ctx context.Context) {
 
 func (n *Node) sendAnnounce() {
 	n.announceSeq++
-	pkt, err := n.router.BuildAnnounce(n.caps, n.announceSeq)
+	dg, err := n.router.BuildAnnounce(n.caps, n.announceEpoch, n.announceSeq)
 	if err != nil {
 		log.Printf("[node] build announce: %v", err)
 		return
 	}
-	if err := n.SendPacket(pkt); err != nil {
+	if err := n.SendDatagram(dg); err != nil {
 		log.Printf("[node] send announce: %v", err)
 	}
 }

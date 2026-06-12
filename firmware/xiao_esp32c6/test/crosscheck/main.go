@@ -5,6 +5,8 @@
 //
 // Usage: go run ./firmware/xiao_esp32c6/test/crosscheck <path-to-host_test>
 // (host_test is built by firmware/xiao_esp32c6/test/run_tests.sh)
+//go:build v2obsolete
+
 package main
 
 import (

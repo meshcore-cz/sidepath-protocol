@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// PeerLink is the transport abstraction — must not depend on any BLE types.
 type PeerLink interface {
 	PeerID() NodeID
 	SendFrame(frame []byte) error
@@ -25,30 +24,26 @@ const (
 	ActionDrop         ActionType = "drop"
 )
 
-// Action is a decision produced by the Router for the transport layer to execute.
 type Action struct {
-	Type    ActionType
-	Reason  string
-	Packet  Packet
-	NextHop *NodeID // for relay-next-hop and send-ack; for relay-flood this is the INCOMING peer (to exclude)
+	Type        ActionType
+	Reason      string
+	Datagram    Datagram
+	NextHop     *NodeID
+	ExcludePeer *NodeID
 }
 
-// Router is the pure-Go mesh routing engine with no BLE dependencies.
 type Router struct {
 	LocalID     NodeID
-	Identity    *Identity // local signing identity; required to BuildAnnounce
-	Name        string    // primary display label advertised in ANNOUNCE/NODE_INFO (unsigned)
-	Platform    string    // OS/device string advertised in ANNOUNCE/NODE_INFO (unsigned)
-	Description string    // free-form bio advertised in ANNOUNCE/NODE_INFO (unsigned)
+	Identity    *Identity
+	Name        string
+	Platform    string
+	Description string
 	dedup       *DedupCache
 	Neighbors   *NeighborTable
 	Topology    *Topology
-	Allowlist   map[NodeID]bool // if non-empty, only these peers are allowed
+	Allowlist   map[NodeID]bool
 }
 
-// NewRouter creates a router with a bare NodeID and no signing identity. It can
-// route and verify incoming announces, but cannot originate signed announces;
-// use NewRouterForIdentity for a real node.
 func NewRouter(id NodeID) *Router {
 	return &Router{
 		LocalID:   id,
@@ -59,313 +54,245 @@ func NewRouter(id NodeID) *Router {
 	}
 }
 
-// NewRouterForIdentity creates a router whose LocalID is derived from the
-// identity's Ed25519 public key (pubkey[:8]) and which can sign announces.
 func NewRouterForIdentity(id *Identity) *Router {
 	r := NewRouter(id.NodeID())
 	r.Identity = id
 	return r
 }
 
-// HandlePacket processes an incoming packet and returns a list of actions the transport should take.
-func (r *Router) HandlePacket(pkt Packet, incomingPeer *NodeID) []Action {
-	// 1. Version check
-	if pkt.Version != ProtocolVersion {
-		return []Action{{Type: ActionDrop, Reason: string(DropInvalidVersion), Packet: pkt}}
+func (r *Router) HandleDatagram(dg Datagram, incomingPeer *NodeID) []Action {
+	if dg.Version != DatagramVersion {
+		return r.drop(dg, DropInvalidVersion)
 	}
-
-	// 2. Allowlist check
+	if dg.TTL < 1 || dg.TTL > MaxTTL || len(dg.Path) > MaxRouteHops || len(dg.ID) != DatagramIDBytes {
+		return r.drop(dg, DropMalformed)
+	}
+	if len(dg.Route) > MaxRouteHops {
+		return r.drop(dg, DropBadRoute)
+	}
 	if incomingPeer != nil && len(r.Allowlist) > 0 && !r.Allowlist[*incomingPeer] {
-		return []Action{{Type: ActionDrop, Reason: string(DropPeerNotAllowed), Packet: pkt}}
+		return r.drop(dg, DropPeerNotAllowed)
 	}
-
-	// Handle ANNOUNCE separately
-	if pkt.Type == PacketTypeAnnounce {
-		return r.handleAnnounce(pkt, incomingPeer)
+	if r.dedup.SeenOrAdd(dg.ID) {
+		return r.drop(dg, DropDuplicate)
 	}
-
-	switch pkt.Mode {
-	case RoutingModeFlood:
-		return r.handleFlood(pkt, incomingPeer)
-	case RoutingModeSourceRoute:
-		return r.handleSourceRoute(pkt, incomingPeer)
-	default:
-		return []Action{{Type: ActionDrop, Reason: string(DropMalformed), Packet: pkt}}
+	for _, hop := range dg.Path {
+		if hop == r.LocalID {
+			return r.drop(dg, DropLoop)
+		}
 	}
+	if ok := r.verifyControlIfAnnounce(dg); ok != nil && !*ok {
+		return r.drop(dg, DropBadSignature)
+	}
+	if dg.IsSourceRouted() {
+		return r.handleSourceRoute(dg)
+	}
+	return r.handleFlood(dg, incomingPeer)
 }
 
-func (r *Router) handleAnnounce(pkt Packet, incomingPeer *NodeID) []Action {
-	ap, err := DecodeAnnounce(pkt.Payload)
+func (r *Router) verifyControlIfAnnounce(dg Datagram) *bool {
+	if dg.Protocol != ProtocolBLEEdgeControl {
+		return nil
+	}
+	ctrl, err := DecodeControl(dg.Payload)
+	if err != nil || ctrl.Kind != ControlAnnounce {
+		return nil
+	}
+	body, err := DecodeAnnounceBody(ctrl.Body)
 	if err != nil {
-		return []Action{{Type: ActionDrop, Reason: string(DropMalformed), Packet: pkt}}
+		v := false
+		return &v
 	}
-	// Authenticate: NodeID must be bound to the carried public key, and the
-	// signature must verify. Reject (and do not relay) on any failure.
-	if len(ap.PublicKey) != 32 || NodeIDFromPubKey(ap.PublicKey) != ap.NodeID || ap.NodeID != pkt.Source {
-		return []Action{{Type: ActionDrop, Reason: string(DropBadSignature), Packet: pkt}}
-	}
-	if !VerifyAnnounce(ap.PublicKey, ap.Signature, uint32(ap.Timestamp), ap.Caps, ap.Seq, ap.Neighbors) {
-		return []Action{{Type: ActionDrop, Reason: string(DropBadSignature), Packet: pkt}}
+	if len(body.PublicKey) != PublicKeyBytes || NodeIDFromPubKey(body.PublicKey) != dg.Source || !body.Valid() {
+		v := false
+		return &v
 	}
 	r.Topology.Update(TopoNode{
-		ID:          ap.NodeID,
-		Caps:        ap.Caps,
-		Neighbors:   ap.Neighbors,
-		Seq:         ap.Seq,
-		Description: ap.Description,
-		Name:        ap.Name,
-		Platform:    ap.Platform,
-		PublicKey:   ap.PublicKey,
+		ID:          dg.Source,
+		Caps:        body.Caps,
+		Neighbors:   body.Neighbors,
+		Epoch:       body.Epoch,
+		Seq:         body.Seq,
+		Timestamp:   body.Timestamp,
+		Description: body.Description,
+		Name:        body.Name,
+		Platform:    body.Platform,
+		PublicKey:   body.PublicKey,
 	})
-	// Flood ANNOUNCE to the rest of the network
-	return r.handleFlood(pkt, incomingPeer)
+	v := true
+	return &v
 }
 
-func (r *Router) handleFlood(pkt Packet, incomingPeer *NodeID) []Action {
-	// Dedup
-	if r.dedup.SeenOrAdd(pkt.ID) {
-		return []Action{{Type: ActionDrop, Reason: string(DropDuplicate), Packet: pkt}}
-	}
-	// Loop detection
-	for _, hop := range pkt.Trace {
-		if hop == r.LocalID {
-			return []Action{{Type: ActionDrop, Reason: string(DropLoop), Packet: pkt}}
-		}
-	}
-	// TTL check
-	if pkt.TTL == 0 {
-		return []Action{{Type: ActionDrop, Reason: string(DropTTL), Packet: pkt}}
-	}
-
-	// Add self to trace
-	pkt.Trace = append(pkt.Trace, r.LocalID)
-
+func (r *Router) handleFlood(dg Datagram, incomingPeer *NodeID) []Action {
+	dg.Path = append(append([]NodeID(nil), dg.Path...), r.LocalID)
 	var actions []Action
 
-	// Deliver locally?
-	if pkt.IsBroadcast() || pkt.Destination == r.LocalID {
-		actions = append(actions, Action{Type: ActionDeliverLocal, Packet: pkt})
-		// ACK for unicast DATA. TRACE has its own request/response exchange.
-		if pkt.Type == PacketTypeData && !pkt.IsBroadcast() && !noAck(pkt.PayloadType) {
-			actions = append(actions, r.buildAck(pkt))
+	if dg.IsBroadcast() || dg.Destination == r.LocalID {
+		actions = append(actions, Action{Type: ActionDeliverLocal, Datagram: dg})
+		if !dg.IsBroadcast() && dg.AckRequested() {
+			actions = append(actions, r.buildAck(dg))
 		}
 	}
 
-	// Relay?
-	if pkt.TTL > 1 && (pkt.IsBroadcast() || pkt.Destination != r.LocalID) {
-		if isTracePayload(pkt.PayloadType) {
-			return actions
-		}
-		relayPkt := pkt
-		relayPkt.TTL--
-		hop := Action{Type: ActionRelayFlood, Packet: relayPkt}
-		if incomingPeer != nil {
-			// Store incoming peer in NextHop so transport can exclude it
-			hop.NextHop = incomingPeer
-		}
-		actions = append(actions, hop)
+	if dg.TTL > 1 && (dg.IsBroadcast() || dg.Destination != r.LocalID) {
+		relay := dg
+		relay.TTL--
+		actions = append(actions, Action{Type: ActionRelayFlood, Datagram: relay, ExcludePeer: incomingPeer})
 	}
-
 	return actions
 }
 
-func isTracePayload(pt PayloadType) bool {
-	return pt == PayloadTypeTraceRequest || pt == PayloadTypeTraceResponse
-}
-
-// noAck reports payloads that are never ACKed: trace (own request/response
-// exchange) and ephemeral typing hints.
-func noAck(pt PayloadType) bool {
-	return isTracePayload(pt) || pt == PayloadTypeTyping
-}
-
-func (r *Router) handleSourceRoute(pkt Packet, incomingPeer *NodeID) []Action {
-	// Dedup + loop + TTL
-	if r.dedup.SeenOrAdd(pkt.ID) {
-		return []Action{{Type: ActionDrop, Reason: string(DropDuplicate), Packet: pkt}}
+func (r *Router) handleSourceRoute(dg Datagram) []Action {
+	cursor := int(dg.RouteCursor)
+	if cursor >= len(dg.Route) || len(dg.Route) == 0 {
+		return r.drop(dg, DropBadRoute)
 	}
-	for _, hop := range pkt.Trace {
-		if hop == r.LocalID {
-			return []Action{{Type: ActionDrop, Reason: string(DropLoop), Packet: pkt}}
-		}
+	if dg.Route[cursor] != r.LocalID {
+		return r.drop(dg, DropNotNextHop)
 	}
-	if pkt.TTL == 0 {
-		return []Action{{Type: ActionDrop, Reason: string(DropTTL), Packet: pkt}}
+	if dg.Route[len(dg.Route)-1] != dg.Destination {
+		return r.drop(dg, DropBadRoute)
 	}
-
-	// Check we are the next hop
-	if int(pkt.RouteCursor) >= len(pkt.Route) || pkt.Route[pkt.RouteCursor] != r.LocalID {
-		return []Action{{Type: ActionDrop, Reason: string(DropNotNextHop), Packet: pkt}}
+	if int(dg.TTL) != len(dg.Route)-cursor {
+		return r.drop(dg, DropBadTTL)
 	}
-
-	pkt.Trace = append(pkt.Trace, r.LocalID)
-	pkt.RouteCursor++
-	pkt.TTL--
-
-	if int(pkt.RouteCursor) >= len(pkt.Route) {
-		// We are the destination
-		actions := []Action{{Type: ActionDeliverLocal, Packet: pkt}}
-		if pkt.Type == PacketTypeData && !noAck(pkt.PayloadType) {
-			actions = append(actions, r.buildAck(pkt))
+	dg.Path = append(append([]NodeID(nil), dg.Path...), r.LocalID)
+	dg.TTL--
+	dg.RouteCursor++
+	if int(dg.RouteCursor) >= len(dg.Route) {
+		actions := []Action{{Type: ActionDeliverLocal, Datagram: dg}}
+		if dg.AckRequested() {
+			actions = append(actions, r.buildAck(dg))
 		}
 		return actions
 	}
-
-	nextHop := pkt.Route[pkt.RouteCursor]
-	return []Action{{Type: ActionRelayNextHop, Packet: pkt, NextHop: &nextHop}}
+	next := dg.Route[dg.RouteCursor]
+	return []Action{{Type: ActionRelayNextHop, Datagram: dg, NextHop: &next}}
 }
 
-// buildAck constructs an ACK packet routed back via the reversed trace.
-func (r *Router) buildAck(data Packet) Action {
-	ack := Packet{
-		Version:     ProtocolVersion,
-		Type:        PacketTypeAck,
-		ID:          NewPacketID(),
+func (r *Router) buildAck(delivered Datagram) Action {
+	route := append([]NodeID(nil), delivered.Path[:len(delivered.Path)-1]...)
+	for i, j := 0, len(route)-1; i < j; i, j = i+1, j-1 {
+		route[i], route[j] = route[j], route[i]
+	}
+	route = append(route, delivered.Source)
+	payload, _ := AckBody{AckedID: delivered.ID}.ToControl()
+	ack := Datagram{
+		Version:     DatagramVersion,
+		ID:          NewDatagramID(),
 		Source:      r.LocalID,
-		Destination: data.Source,
-		TTL:         uint8(len(data.Trace) + 1),
-	}
-
-	// ACK via reversed trace path
-	if len(data.Trace) > 1 {
-		// Build reverse route: exclude self (last element), reverse remaining
-		// data.Trace at this point includes self as last element
-		hops := data.Trace[:len(data.Trace)-1] // all hops before self
-		route := make([]NodeID, len(hops))
-		for i, hop := range hops {
-			route[len(hops)-1-i] = hop
-		}
-		// Append the original source as the final hop. Source-route delivery happens by
-		// route exhaustion, and the originator isn't in the trace, so without this the ACK
-		// would be "delivered" at the last relay instead of reaching the source. Guard
-		// against the source already being terminal.
-		if len(route) == 0 || route[len(route)-1] != data.Source {
-			route = append(route, data.Source)
-		}
-		ack.Mode = RoutingModeSourceRoute
-		ack.Route = route
-		ack.RouteCursor = 0
-	} else {
-		ack.Mode = RoutingModeFlood
-	}
-
-	nextHop := data.Source
-	if len(data.Trace) > 1 {
-		nextHop = data.Trace[len(data.Trace)-2]
-	}
-	// We originated this ACK — record it so a flood echo isn't re-flooded back.
-	r.dedup.SeenOrAdd(ack.ID)
-	return Action{Type: ActionSendAck, Packet: ack, NextHop: &nextHop}
-}
-
-// BuildAnnounce creates a periodic, signed announce packet for this node.
-func (r *Router) BuildAnnounce(caps Capabilities, seq uint32) (Packet, error) {
-	if r.Identity == nil {
-		return Packet{}, fmt.Errorf("router has no signing identity")
-	}
-	neighbors := r.Neighbors.IDs()
-	ts := time.Now().Unix()
-	sig := r.Identity.SignAnnounce(uint32(ts), caps, seq, neighbors)
-	ap := AnnouncePayload{
-		NodeID:      r.LocalID,
-		Caps:        caps,
-		Neighbors:   neighbors,
-		Seq:         seq,
-		Timestamp:   ts,
-		PublicKey:   r.Identity.Pub,
-		Signature:   sig,
-		Description: r.Description,
-		Name:        r.Name,
-		Platform:    r.Platform,
-	}
-	payload, err := ap.Encode()
-	if err != nil {
-		return Packet{}, err
-	}
-	return Packet{
-		Version:     ProtocolVersion,
-		Type:        PacketTypeAnnounce,
-		ID:          NewPacketID(),
-		Source:      r.LocalID,
-		Mode:        RoutingModeFlood,
-		TTL:         3,
-		PayloadType: PayloadTypeTextTest,
+		Destination: delivered.Source,
+		TTL:         uint8(len(route)),
+		Route:       route,
+		Protocol:    ProtocolBLEEdgeControl,
 		Payload:     payload,
-	}, nil
+	}
+	r.MarkOriginated(ack.ID)
+	next := route[0]
+	return Action{Type: ActionSendAck, Datagram: ack, NextHop: &next}
 }
 
-// MarkOriginated records a packet ID this node is about to send as already seen,
-// so that if a flood echoes the packet back to us we drop it as a duplicate instead
-// of re-flooding our own packet. Call this for every packet this node originates.
-func (r *Router) MarkOriginated(id PacketID) {
+func (r *Router) BuildAnnounce(caps Capabilities, epoch uint64, seq uint32) (Datagram, error) {
+	if r.Identity == nil {
+		return Datagram{}, fmt.Errorf("router has no signing identity")
+	}
+	body := NewAnnounceBody(r.Identity, epoch, seq, time.Now().Unix(), caps, r.Neighbors.IDs(), r.Name, r.Description, r.Platform)
+	payload, err := body.ToControl()
+	if err != nil {
+		return Datagram{}, err
+	}
+	dg := Datagram{
+		Version:     DatagramVersion,
+		ID:          NewDatagramID(),
+		Source:      r.LocalID,
+		Destination: BroadcastNodeID,
+		TTL:         AnnounceTTL,
+		Protocol:    ProtocolBLEEdgeControl,
+		Payload:     payload,
+	}
+	r.MarkOriginated(dg.ID)
+	return dg, nil
+}
+
+func (r *Router) NewBroadcast(protocol PayloadProtocol, payload []byte, ttl uint8) Datagram {
+	if ttl == 0 || ttl > MaxTTL {
+		ttl = DefaultFloodTTL
+	}
+	dg := Datagram{Version: DatagramVersion, ID: NewDatagramID(), Source: r.LocalID, Destination: BroadcastNodeID, TTL: ttl, Protocol: protocol, Payload: payload}
+	r.MarkOriginated(dg.ID)
+	return dg
+}
+
+func (r *Router) NewUnicast(dst NodeID, protocol PayloadProtocol, payload []byte, flags uint16, floodTTL uint8, requireRoute bool) (Datagram, bool) {
+	route := r.SelectRoute(dst)
+	var dg Datagram
+	if len(route) > 0 {
+		dg = Datagram{Version: DatagramVersion, ID: NewDatagramID(), Source: r.LocalID, Destination: dst, TTL: uint8(len(route)), Route: route, Protocol: protocol, Flags: flags, Payload: payload}
+	} else {
+		if requireRoute {
+			return Datagram{}, false
+		}
+		if floodTTL == 0 || floodTTL > MaxTTL {
+			floodTTL = DefaultFloodTTL
+		}
+		dg = Datagram{Version: DatagramVersion, ID: NewDatagramID(), Source: r.LocalID, Destination: dst, TTL: floodTTL, Protocol: protocol, Flags: flags, Payload: payload}
+	}
+	r.MarkOriginated(dg.ID)
+	return dg, true
+}
+
+func (r *Router) SelectRoute(dst NodeID) []NodeID {
+	if _, ok := r.Neighbors.Get(dst); ok {
+		return []NodeID{dst}
+	}
+	return r.Topology.BFSPath(r.LocalID, dst)
+}
+
+func (r *Router) MarkOriginated(id DatagramID) {
 	r.dedup.SeenOrAdd(id)
 }
 
-// SelectRoute picks a source route to dst or signals direct/flood fallback.
-// Returns (route, true) for a known multi-hop path, (nil, true) if direct neighbor, (nil, false) if unknown.
-func (r *Router) SelectRoute(dst NodeID) ([]NodeID, bool) {
-	// Direct neighbor?
-	if _, ok := r.Neighbors.Get(dst); ok {
-		return nil, true // direct
-	}
-	path := r.Topology.BFSPath(r.LocalID, dst)
-	return path, len(path) > 0
+func (r *Router) FloodJitter() time.Duration {
+	return time.Duration(10+rand.Intn(91)) * time.Millisecond
 }
 
-// DescriptionFor resolves a node's diagnostic label: the direct neighbor's
-// NODE_INFO description if known, else the description from its ANNOUNCE
-// (topology). Returns "" if unknown.
-func (r *Router) DescriptionFor(id NodeID) string {
-	if n, ok := r.Neighbors.Get(id); ok && n.Description != "" {
-		return n.Description
-	}
-	if tn, ok := r.Topology.GetNode(id); ok {
-		return tn.Description
-	}
-	return ""
+func (r *Router) drop(dg Datagram, reason DropReason) []Action {
+	return []Action{{Type: ActionDrop, Reason: string(reason), Datagram: dg}}
 }
 
-// NameFor resolves a node's primary display label: the direct neighbor's NODE_INFO
-// name if known, else the name from its ANNOUNCE (topology), else the deterministic
-// default derived from its public key if we know it, else "".
-func (r *Router) NameFor(id NodeID) string {
-	if n, ok := r.Neighbors.Get(id); ok && n.Name != "" {
-		return n.Name
-	}
-	if tn, ok := r.Topology.GetNode(id); ok {
-		if tn.Name != "" {
-			return tn.Name
-		}
-		if name := DefaultNodeName(tn.PublicKey); name != "" {
-			return name
-		}
-	}
-	return ""
-}
-
-// PlatformFor resolves a node's OS/device string from its NODE_INFO (neighbor) or
-// ANNOUNCE (topology). Returns "" if unknown.
-func (r *Router) PlatformFor(id NodeID) string {
-	if n, ok := r.Neighbors.Get(id); ok && n.Platform != "" {
-		return n.Platform
-	}
-	if tn, ok := r.Topology.GetNode(id); ok {
-		return tn.Platform
-	}
-	return ""
-}
-
-// PublicKeyFor returns a node's 32-byte Ed25519 public key as learned from its
-// signed ANNOUNCE (topology), or nil if unknown. Used to encrypt a DM to a node
-// we haven't received a message from yet.
 func (r *Router) PublicKeyFor(id NodeID) []byte {
-	if tn, ok := r.Topology.GetNode(id); ok && len(tn.PublicKey) == 32 {
-		return tn.PublicKey
+	if n, ok := r.Neighbors.Get(id); ok && len(n.PublicKey) == PublicKeyBytes {
+		return append([]byte(nil), n.PublicKey...)
+	}
+	if n, ok := r.Topology.GetNode(id); ok && len(n.PublicKey) == PublicKeyBytes {
+		return append([]byte(nil), n.PublicKey...)
 	}
 	return nil
 }
 
-// FloodJitter returns a random relay delay between 10ms and 100ms to reduce collision probability.
-func FloodJitter() time.Duration {
-	return time.Duration(10+rand.Intn(90)) * time.Millisecond
+func (r *Router) NameFor(id NodeID) string {
+	if n, ok := r.Topology.GetNode(id); ok {
+		if n.Name != "" {
+			return n.Name
+		}
+		return DefaultNodeName(n.PublicKey)
+	}
+	if n, ok := r.Neighbors.Get(id); ok && len(n.PublicKey) == PublicKeyBytes {
+		return DefaultNodeName(n.PublicKey)
+	}
+	return ""
+}
+
+func (r *Router) DescriptionFor(id NodeID) string {
+	if n, ok := r.Topology.GetNode(id); ok {
+		return n.Description
+	}
+	return ""
+}
+
+func (r *Router) PlatformFor(id NodeID) string {
+	if n, ok := r.Topology.GetNode(id); ok {
+		return n.Platform
+	}
+	return ""
 }

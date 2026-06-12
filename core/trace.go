@@ -13,9 +13,9 @@ const (
 	TraceHashWidth4 = 4
 	TraceHashWidth8 = 8
 
-	TraceMetricUnknown = "unknown"
-	TraceMetricRSSI    = "rssi"
-	TraceMetricSNR     = "snr"
+	TraceMetricNameUnknown = "unknown"
+	TraceMetricNameRSSI    = "rssi"
+	TraceMetricNameSNR     = "snr"
 )
 
 // TracePayload follows MeshCore's TRACE payload prefix:

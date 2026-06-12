@@ -9,37 +9,25 @@ import (
 	"time"
 )
 
-// Frame is the GATT transport unit.
-// Wire encoding: version(1) + packet_id(16) + frag_idx(1) + frag_count(1) + crc32(4) + data
 type Frame struct {
 	Version       uint8
-	PacketID      PacketID
+	TransferID    TransferID
 	FragmentIndex uint8
 	FragmentCount uint8
 	PayloadCRC32  uint32
 	Data          []byte
 }
 
-// FrameHeaderSize is the fixed GATT frame header:
-// version(1) + packet_id(16) + frag_idx(1) + frag_count(1) + crc32(4).
-const FrameHeaderSize = 23
-
-// MaxFrameSize is the maximum GATT frame — and therefore the maximum single ATT
-// write — used for fragmentation by ALL implementations. It must stay <= the
-// smallest peer's negotiated (ATT_MTU - 3). The ESP32 relay negotiates an ATT
-// MTU of 247, so 200 is safe for every peer. Nodes still request ATT MTU 512,
-// but deliberately cap frames here: broadcast and relayed packets are fragmented
-// ONCE and sent to every neighbour, so the frames must fit the smallest link in
-// a single write. Reassembly is size-agnostic, so capping has no interop cost.
-// Mirrors the firmware FRAGMENT_MTU and the Kotlin MAX_FRAME_SIZE.
-const MaxFrameSize = 200
-
-const frameHeaderSize = FrameHeaderSize
+const (
+	FrameHeaderSize = 23
+	MaxFrameSize    = 200
+	MaxFrameData    = MaxFrameSize - FrameHeaderSize
+)
 
 func (f Frame) Encode() []byte {
-	buf := make([]byte, frameHeaderSize+len(f.Data))
+	buf := make([]byte, FrameHeaderSize+len(f.Data))
 	buf[0] = f.Version
-	copy(buf[1:17], f.PacketID[:])
+	copy(buf[1:17], f.TransferID[:])
 	buf[17] = f.FragmentIndex
 	buf[18] = f.FragmentCount
 	binary.BigEndian.PutUint32(buf[19:23], f.PayloadCRC32)
@@ -48,48 +36,42 @@ func (f Frame) Encode() []byte {
 }
 
 func DecodeFrame(raw []byte) (Frame, error) {
-	if len(raw) < frameHeaderSize {
+	if len(raw) < FrameHeaderSize {
 		return Frame{}, fmt.Errorf("frame too short: %d bytes", len(raw))
 	}
 	var f Frame
 	f.Version = raw[0]
-	copy(f.PacketID[:], raw[1:17])
+	copy(f.TransferID[:], raw[1:17])
 	f.FragmentIndex = raw[17]
 	f.FragmentCount = raw[18]
 	f.PayloadCRC32 = binary.BigEndian.Uint32(raw[19:23])
-	f.Data = make([]byte, len(raw)-frameHeaderSize)
-	copy(f.Data, raw[23:])
+	f.Data = append([]byte(nil), raw[23:]...)
+	if f.Version != FrameVersion {
+		return Frame{}, fmt.Errorf("invalid frame version: %d", f.Version)
+	}
+	if f.FragmentCount == 0 || f.FragmentIndex >= f.FragmentCount {
+		return Frame{}, fmt.Errorf("invalid fragment index/count: %d/%d", f.FragmentIndex, f.FragmentCount)
+	}
 	return f, nil
 }
 
-// FragmentPacket splits packet payload bytes into GATT frames. The mtu argument
-// is the maximum frame (single GATT write) size in bytes — pass core.MaxFrameSize
-// (or, for a known single peer, that peer's negotiated ATT_MTU-3). Each frame
-// carries up to mtu-FrameHeaderSize bytes of packet data.
-func FragmentPacket(packetData []byte, mtu int, pid PacketID) []Frame {
-	maxData := mtu - frameHeaderSize
+func FragmentDatagram(datagramBytes []byte, maxFrameSize int, transferID TransferID) []Frame {
+	maxData := maxFrameSize - FrameHeaderSize
 	if maxData < 1 {
 		maxData = 1
 	}
-
-	crc := crc32.ChecksumIEEE(packetData)
-
+	crc := crc32.ChecksumIEEE(datagramBytes)
 	var frames []Frame
-	for i := 0; i < len(packetData); i += maxData {
+	for i := 0; i < len(datagramBytes) || (len(datagramBytes) == 0 && i == 0); i += maxData {
 		end := i + maxData
-		if end > len(packetData) {
-			end = len(packetData)
+		if end > len(datagramBytes) {
+			end = len(datagramBytes)
 		}
-		chunk := make([]byte, end-i)
-		copy(chunk, packetData[i:end])
-		frames = append(frames, Frame{
-			Version:       1,
-			PacketID:      pid,
-			FragmentIndex: uint8(len(frames)),
-			FragmentCount: 0, // filled in below
-			PayloadCRC32:  crc,
-			Data:          chunk,
-		})
+		chunk := append([]byte(nil), datagramBytes[i:end]...)
+		frames = append(frames, Frame{Version: FrameVersion, TransferID: transferID, FragmentIndex: uint8(len(frames)), PayloadCRC32: crc, Data: chunk})
+		if len(datagramBytes) == 0 {
+			break
+		}
 	}
 	count := uint8(len(frames))
 	for i := range frames {
@@ -98,11 +80,19 @@ func FragmentPacket(packetData []byte, mtu int, pid PacketID) []Frame {
 	return frames
 }
 
-// Reassembler collects frames and reassembles packets.
+func FragmentDatagramNew(datagramBytes []byte, maxFrameSize int) []Frame {
+	return FragmentDatagram(datagramBytes, maxFrameSize, NewTransferID())
+}
+
 type Reassembler struct {
 	mu      sync.Mutex
-	pending map[PacketID]*assembly
+	pending map[reassemblyKey]*assembly
 	timeout time.Duration
+}
+
+type reassemblyKey struct {
+	Peer       string
+	TransferID TransferID
 }
 
 type assembly struct {
@@ -114,47 +104,49 @@ type assembly struct {
 
 func NewReassembler() *Reassembler {
 	r := &Reassembler{
-		pending: make(map[PacketID]*assembly),
+		pending: make(map[reassemblyKey]*assembly),
 		timeout: 10 * time.Second,
 	}
 	go r.reap()
 	return r
 }
 
-// AddFrame adds a frame. Returns (packetData, true, nil) when all fragments received and CRC OK.
-func (r *Reassembler) AddFrame(f Frame) ([]byte, bool, error) {
+func (r *Reassembler) AddFrame(peerLinkID string, f Frame) ([]byte, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	a, ok := r.pending[f.PacketID]
+	k := reassemblyKey{Peer: peerLinkID, TransferID: f.TransferID}
+	a, ok := r.pending[k]
 	if !ok {
 		a = &assembly{frags: make(map[uint8][]byte), count: f.FragmentCount, crc: f.PayloadCRC32}
-		r.pending[f.PacketID] = a
+		r.pending[k] = a
+	}
+	if a.count != f.FragmentCount || a.crc != f.PayloadCRC32 {
+		delete(r.pending, k)
+		return nil, false, fmt.Errorf("fragment metadata changed")
 	}
 	a.lastSeen = time.Now()
 	if _, dup := a.frags[f.FragmentIndex]; dup {
-		return nil, false, nil // duplicate fragment, ignore
+		return nil, false, nil
 	}
 	a.frags[f.FragmentIndex] = f.Data
-
 	if uint8(len(a.frags)) < a.count {
 		return nil, false, nil
 	}
 
-	// All fragments received — verify we have every index
 	var buf bytes.Buffer
 	for i := uint8(0); i < a.count; i++ {
 		d, ok := a.frags[i]
 		if !ok {
-			return nil, false, nil // still missing one
+			return nil, false, nil
 		}
 		buf.Write(d)
 	}
-	delete(r.pending, f.PacketID)
+	delete(r.pending, k)
 
 	data := buf.Bytes()
 	if crc32.ChecksumIEEE(data) != a.crc {
-		return nil, false, fmt.Errorf("CRC mismatch on packet %x", f.PacketID)
+		return nil, false, fmt.Errorf("CRC mismatch on transfer %x", f.TransferID)
 	}
 	return data, true, nil
 }
@@ -166,8 +158,6 @@ func (r *Reassembler) reap() {
 	}
 }
 
-// Reap removes stale assemblies that have not received a fragment within the timeout.
-// Exported for testing.
 func (r *Reassembler) Reap() {
 	r.mu.Lock()
 	now := time.Now()

@@ -6,18 +6,39 @@ import (
 	"strings"
 )
 
-// ProtocolVersion is bumped to 2 for Ed25519 identities + signed ANNOUNCE.
-// v2 is intentionally incompatible with v1 nodes (the router drops version
-// mismatches).
-const ProtocolVersion = 2
+const (
+	FrameVersion     = 2
+	DatagramVersion  = 3
+	NodeInfoVersion  = 1
+	AnnounceVersion  = 1
+	NodeIDBytes      = 10
+	DatagramIDBytes  = 16
+	TransferIDBytes  = 16
+	PublicKeyBytes   = 32
+	SignatureBytes   = 64
+	SeedSize         = 32
+	MaxTTL           = 16
+	DefaultFloodTTL  = 5
+	MaxRouteHops     = 16
+	AnnounceTTL      = 5
+	MaxNeighbors     = 255
+	MaxNameBytes     = 64
+	MaxDescBytes     = 255
+	MaxPlatformBytes = 64
+)
 
-type NodeID [8]byte
+type NodeID [NodeIDBytes]byte
+
+var BroadcastNodeID NodeID
 
 func (n NodeID) String() string { return hex.EncodeToString(n[:]) }
+func (n NodeID) IsBroadcast() bool {
+	return n == BroadcastNodeID
+}
 
 func ParseNodeID(s string) (NodeID, error) {
 	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != 8 {
+	if err != nil || len(b) != NodeIDBytes {
 		return NodeID{}, fmt.Errorf("invalid node id: %s", s)
 	}
 	var id NodeID
@@ -37,32 +58,48 @@ func (n NodeID) Less(other NodeID) bool {
 	return false
 }
 
-type PacketType uint8
+func CompareNodeID(a, b NodeID) int {
+	for i := range a {
+		if a[i] != b[i] {
+			return int(a[i]) - int(b[i])
+		}
+	}
+	return 0
+}
+
+type DatagramID [DatagramIDBytes]byte
+type TransferID [TransferIDBytes]byte
+
+type PayloadProtocol uint16
 
 const (
-	PacketTypeData     PacketType = 1
-	PacketTypeAnnounce PacketType = 2
-	PacketTypeAck      PacketType = 3
+	ProtocolBLEEdgeControl PayloadProtocol = 0x0000
+	ProtocolMeshCorePacket PayloadProtocol = 0x0001
+	ProtocolBLEEdgeChat    PayloadProtocol = 0x0100
 )
 
-type RoutingMode uint8
+type DatagramFlag uint16
 
 const (
-	RoutingModeFlood       RoutingMode = 1
-	RoutingModeSourceRoute RoutingMode = 2
+	FlagAckRequested DatagramFlag = 0x0001
 )
 
-type PayloadType uint8
+type ControlKind uint8
 
 const (
-	PayloadTypeTextTest      PayloadType = 1
-	PayloadTypeMeshCoreRaw   PayloadType = 2
-	PayloadTypeChatPlain     PayloadType = 3 // broadcast channel text (UTF-8)
-	PayloadTypeChatEncrypted PayloadType = 4 // direct message: Crypto sealed envelope (CBOR)
-	PayloadTypeChannel       PayloadType = 5 // MeshCore-compatible group channel: GRP_TXT payload (see channel.go)
-	PayloadTypeTraceRequest  PayloadType = 6 // MeshCore-shaped trace request
-	PayloadTypeTraceResponse PayloadType = 7 // BLEEdge trace result returned to requester
-	PayloadTypeTyping        PayloadType = 8 // ephemeral "peer is typing" hint — never ACKed, empty payload
+	ControlAnnounce      ControlKind = 1
+	ControlAck           ControlKind = 2
+	ControlTraceRequest  ControlKind = 3
+	ControlTraceResponse ControlKind = 4
+)
+
+type TraceMetric uint8
+
+const (
+	TraceMetricUnknown TraceMetric = 0
+	TraceMetricRSSIDBM TraceMetric = 1
+	TraceMetricSNRQ4   TraceMetric = 2
+	TraceUnavailable               = int16(-32768)
 )
 
 type PHY uint8
@@ -87,23 +124,22 @@ func (p PHY) String() string {
 	}
 }
 
-type Capability uint8
+type Capability uint16
 
 const (
-	CapSender   Capability = 0x01
-	CapReceiver Capability = 0x02
-	CapRelay    Capability = 0x04
-	CapGateway  Capability = 0x08
-	CapCodedPHY Capability = 0x10
+	CapSender   Capability = 0x0001
+	CapReceiver Capability = 0x0002
+	CapRelay    Capability = 0x0004
+	CapGateway  Capability = 0x0008
+	CapCodedPHY Capability = 0x0010
 )
 
-type Capabilities uint8
+type Capabilities uint16
 
-func (c Capabilities) Has(cap Capability) bool { return uint8(c)&uint8(cap) != 0 }
+func (c Capabilities) Has(cap Capability) bool { return uint16(c)&uint16(cap) != 0 }
 func (c Capabilities) IsRelay() bool           { return c.Has(CapRelay) }
 func (c Capabilities) IsGateway() bool         { return c.Has(CapGateway) }
 
-// String renders the capability flags as a pipe-joined list (mirrors the Kotlin side).
 func (c Capabilities) String() string {
 	var flags []string
 	if c.Has(CapSender) {
@@ -128,8 +164,8 @@ func (c Capabilities) String() string {
 }
 
 const (
-	AndroidCapabilities = Capability(CapSender | CapReceiver | CapRelay | CapCodedPHY)
-	LinuxCapabilities   = Capability(CapReceiver | CapGateway | CapCodedPHY)
+	AndroidCapabilities = Capabilities(CapSender | CapReceiver | CapRelay | CapCodedPHY)
+	LinuxCapabilities   = Capabilities(CapReceiver | CapGateway | CapCodedPHY)
 )
 
 type PHYMode string
@@ -137,8 +173,5 @@ type PHYMode string
 const (
 	PHYModeCodedOnly      PHYMode = "coded-only"
 	PHYModeCodedPreferred PHYMode = "coded-preferred"
-	// PHYMode1M is the default. 1M is universally supported for both advertising
-	// and scanning; Coded PHY (Long Range) is opt-in because many devices can
-	// advertise on it but cannot scan it (despite reporting support).
-	PHYMode1M PHYMode = "1m"
+	PHYMode1M             PHYMode = "1m"
 )

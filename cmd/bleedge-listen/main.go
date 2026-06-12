@@ -21,18 +21,18 @@ import (
 
 type multiString []string
 
-func (m *multiString) String() string  { return strings.Join(*m, ",") }
+func (m *multiString) String() string     { return strings.Join(*m, ",") }
 func (m *multiString) Set(v string) error { *m = append(*m, v); return nil }
 
 func main() {
 	var (
-		adapterFlag  = flag.String("adapter", "hci0", "Bluetooth adapter name (e.g. hci0)")
-		seedFlag     = flag.String("seed-hex", "", "Ed25519 identity seed (32 bytes / 64 hex chars); loaded from ~/.bleedge/seed if empty. NodeID = pubkey[:8]")
-		descFlag     = flag.String("description", "", "Free-form node bio shown to peers (default: empty)")
-		nameFlag     = flag.String("name", "", "Node display name (default: deterministic from public key, e.g. barrel-two-return)")
-		phyFlag      = flag.String("phy", "1m", "PHY mode: 1m (default) | coded-only | coded-preferred")
-		jsonFlag     = flag.Bool("json", false, "Output log lines as JSON")
-		verboseFlag  = flag.Bool("verbose", false, "Verbose logging")
+		adapterFlag = flag.String("adapter", "hci0", "Bluetooth adapter name (e.g. hci0)")
+		seedFlag    = flag.String("seed-hex", "", "Ed25519 identity seed (32 bytes / 64 hex chars); loaded from ~/.bleedge/seed if empty. NodeID = pubkey[:8]")
+		descFlag    = flag.String("description", "", "Free-form node bio shown to peers (default: empty)")
+		nameFlag    = flag.String("name", "", "Node display name (default: deterministic from public key, e.g. barrel-two-return)")
+		phyFlag     = flag.String("phy", "1m", "PHY mode: 1m (default) | coded-only | coded-preferred")
+		jsonFlag    = flag.Bool("json", false, "Output log lines as JSON")
+		verboseFlag = flag.Bool("verbose", false, "Verbose logging")
 	)
 	var allowPeers multiString
 	flag.Var(&allowPeers, "allow-peer", "Allowed peer NodeID (hex); repeatable; empty = allow all")
@@ -98,20 +98,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	node.SetDeliveryHandler(func(pkt core.Packet) {
+	node.SetDeliveryHandler(func(dg core.Datagram) {
 		if *jsonFlag {
 			printJSON(map[string]interface{}{
-				"event":        "deliver",
-				"id":           pkt.ID,
-				"source":       pkt.Source.String(),
-				"payload_type": pkt.PayloadType,
-				"payload":      string(pkt.Payload),
-				"trace":        traceStrings(pkt.Trace),
-				"ts":           time.Now().Unix(),
+				"event":    "deliver",
+				"id":       dg.ID,
+				"source":   dg.Source.String(),
+				"protocol": dg.Protocol,
+				"payload":  string(dg.Payload),
+				"path":     traceStrings(dg.Path),
+				"ts":       time.Now().Unix(),
 			})
 		} else {
-			log.Printf("deliver payload-type=%d payload=%q trace=%v",
-				pkt.PayloadType, string(pkt.Payload), traceStrings(pkt.Trace))
+			log.Printf("deliver protocol=0x%04x payload=%q path=%v",
+				dg.Protocol, string(dg.Payload), traceStrings(dg.Path))
 		}
 	})
 

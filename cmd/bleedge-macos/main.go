@@ -112,8 +112,9 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		}
 	}
 
-	// Load or generate the Ed25519 identity (NodeID = pubkey[:8])
+	// Load or generate the Ed25519 identity (NodeID = pubkey[:10])
 	var identity *core.Identity
+	var announceEpoch uint64 = 1
 	if seedHex != "" {
 		b, err := hex.DecodeString(seedHex)
 		if err != nil || len(b) != core.SeedSize {
@@ -127,6 +128,10 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		identity, err = blenode.LoadOrCreateIdentity()
 		if err != nil {
 			fatalf("cannot load identity: %v", err)
+		}
+		announceEpoch, err = blenode.LoadIncrementEpoch()
+		if err != nil {
+			fatalf("cannot load epoch: %v", err)
 		}
 	}
 
@@ -180,29 +185,30 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		emitLog(line)
 	}
 	node = blenode.New(blenode.Config{
-		Identity:    identity,
-		Name:        nodeName,
-		Description: description,
-		Caps:        core.Capabilities(uint8(core.CapSender) | uint8(core.CapReceiver) | uint8(core.CapRelay)),
-		Allowlist:   allowlist,
-		Verbose:     verbose,
-		LogFn:       logFn,
-		OnMessage: func(from core.NodeID, ptype core.PayloadType, payload []byte) {
+		Identity:      identity,
+		Name:          nodeName,
+		Description:   description,
+		Caps:          core.Capabilities(core.CapSender | core.CapReceiver | core.CapRelay),
+		Allowlist:     allowlist,
+		Verbose:       verbose,
+		AnnounceEpoch: announceEpoch,
+		LogFn:         logFn,
+		OnMessage: func(dg core.Datagram) {
 			// The bot consumes every message; the TUI (when present) also shows it.
 			if theBot != nil {
-				theBot.onIncoming(from, ptype, payload)
+				theBot.onIncoming(dg)
 			}
 			if headless {
 				return
 			}
 			ts := time.Now().Format("15:04:05")
-			if ptype == core.PayloadTypeChannel {
-				if in, ok := node.DecodeChannel(payload); ok {
+			if dg.Protocol == core.ProtocolBLEEdgeChat {
+				if in, ok := node.DecodeChannel(dg.Payload); ok {
 					emitUI(fmt.Sprintf("[%s] #%s %s: %s", ts, in.Channel, in.Sender, in.Text))
+					return
 				}
-				return
 			}
-			emitUI(fmt.Sprintf("[%s] MSG from %s: %s", ts, from, renderIncoming(ptype, payload, identity)))
+			emitUI(fmt.Sprintf("[%s] MSG from %s: %s", ts, dg.Source, renderIncoming(dg, identity)))
 		},
 		OnPeerConnect: func(id core.NodeID) {
 			ts := time.Now().Format("15:04:05")
@@ -277,22 +283,28 @@ func fatalf(format string, args ...any) {
 
 // renderIncoming turns a received payload into displayable text, decrypting
 // encrypted DMs with our identity.
-func renderIncoming(ptype core.PayloadType, payload []byte, id *core.Identity) string {
-	switch ptype {
-	case core.PayloadTypeChatEncrypted:
-		if text, ok := core.OpenChat(payload, id); ok {
-			return text
+func renderIncoming(dg core.Datagram, id *core.Identity) string {
+	if dg.Protocol == core.ProtocolBLEEdgeChat {
+		ctx := core.ChatContext{DatagramID: dg.ID, Source: dg.Source, Destination: dg.Destination}
+		switch env, err := core.DecodeChatEnvelope(dg.Payload); {
+		case err != nil:
+			return "[bad chat payload]"
+		case env.Kind == core.ChatDirectText:
+			if msg, ok := core.OpenDirectText(id, dg.Payload, ctx); ok {
+				return msg.Text
+			}
+			return "[encrypted - not for me]"
+		case env.Kind == core.ChatPublicText:
+			ctx.Destination = core.BroadcastNodeID
+			if msg, ok := core.OpenPublicText(dg.Payload, ctx); ok {
+				return msg.Text
+			}
+			return "[bad public chat]"
+		case env.Kind == core.ChatTyping:
+			return "[typing]"
 		}
-		return "[encrypted — not for me]"
-	case core.PayloadTypeTraceResponse:
-		result, err := core.DecodeTraceResult(payload)
-		if err != nil {
-			return fmt.Sprintf("[bad trace result: %v]", err)
-		}
-		return renderTraceResult(result)
-	default:
-		return string(payload)
 	}
+	return string(dg.Payload)
 }
 
 func parseTraceCommand(s string) (core.NodeID, []core.NodeID, error) {
@@ -335,7 +347,7 @@ func formatRoute(route []core.NodeID) string {
 func renderTraceResult(r core.TraceResult) string {
 	metric := r.Metric
 	if metric == "" {
-		metric = core.TraceMetricUnknown
+		metric = core.TraceMetricNameUnknown
 	}
 	return fmt.Sprintf("TRACE tag=%08x metric=%s forward=[%s] return=[%s]",
 		r.Tag, metric, formatTraceSamples(r.ForwardNodes, r.ForwardSamples), formatTraceSamples(r.ReturnNodes, r.ReturnSamples))

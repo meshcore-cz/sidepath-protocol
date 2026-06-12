@@ -1,47 +1,190 @@
 package core
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/binary"
 	"math/big"
 
 	"github.com/fxamacker/cbor/v2"
 )
 
-// Chat end-to-end encryption, byte-compatible with the Android `core.Crypto`
-// (Kotlin). Identity keys are Ed25519; for encryption both keys are mapped to
-// their X25519 (Curve25519) form (the libsodium ed25519→curve25519 transform),
-// a static↔static X25519 ECDH shared secret is derived, run through HKDF-SHA256
-// (info "bleedge-chat-v1") to a 32-byte AES key, and sealed with AES-256-GCM.
-//
-// The shared secret is symmetric, so the recipient re-derives the same key from
-// the sender's public key carried in the envelope. Implemented with the standard
-// library only (RFC 7748 X25519 via math/big; no external crypto dependency).
+const (
+	ChatVersion          = 1
+	ChatMaxTextBytes     = 2048
+	ChatDirectNonceBytes = 12
+)
 
-const chatHKDFInfo = "bleedge-chat-v1"
+type ChatKind uint8
 
-// curve25519P = 2^255 - 19, the Curve25519 field prime.
-var curve25519P = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(19))
+const (
+	ChatPublicText  ChatKind = 1
+	ChatDirectText  ChatKind = 2
+	ChatTyping      ChatKind = 3
+	ChatChannelText ChatKind = 4
+)
 
-// chatEnvelope is the CBOR wire form of an encrypted DM (integer keys 1/2/3,
-// matching the Kotlin sealChat output).
-type chatEnvelope struct {
-	SenderPub []byte `cbor:"1,keyasint"`
-	IV        []byte `cbor:"2,keyasint"`
-	CT        []byte `cbor:"3,keyasint"`
+type ChatEnvelope struct {
+	Version uint8           `cbor:"1,keyasint"`
+	Kind    ChatKind        `cbor:"2,keyasint"`
+	Body    cbor.RawMessage `cbor:"3,keyasint"`
 }
 
-// SealChat encrypts plain for the holder of recipientEdPub (their 32-byte Ed25519
-// public key), authenticated to the sender identity. Returns the CBOR envelope.
-func SealChat(plain string, sender *Identity, recipientEdPub []byte) ([]byte, error) {
-	myPriv := ed25519SeedToX25519Priv(sender.Seed[:])
-	theirPub := ed25519PubToX25519(recipientEdPub)
-	key := chatDeriveKey(x25519(myPriv, theirPub))
+type ChatContext struct {
+	DatagramID  DatagramID
+	Source      NodeID
+	Destination NodeID
+}
 
+func textWithinLimit(text string) bool { return len([]byte(text)) <= ChatMaxTextBytes }
+
+func encodeChatEnvelope(kind ChatKind, body any) ([]byte, error) {
+	bodyBytes, err := cbor.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return cbor.Marshal(ChatEnvelope{Version: ChatVersion, Kind: kind, Body: bodyBytes})
+}
+
+func DecodeChatEnvelope(payload []byte) (ChatEnvelope, error) {
+	var env ChatEnvelope
+	err := cbor.Unmarshal(payload, &env)
+	return env, err
+}
+
+type chatPublicBody struct {
+	SenderPublicKey []byte `cbor:"1,keyasint"`
+	SentAt          int64  `cbor:"2,keyasint"`
+	Text            string `cbor:"3,keyasint"`
+	Signature       []byte `cbor:"4,keyasint"`
+}
+
+type PublicText struct {
+	Text            string
+	SentAt          int64
+	SenderPublicKey []byte
+}
+
+func BuildPublicText(identity *Identity, ctx ChatContext, text string, sentAt int64) ([]byte, error) {
+	if !textWithinLimit(text) {
+		return nil, ErrTextTooLong
+	}
+	msg := publicTextSignedBytes(ctx, identity.Pub, sentAt, text)
+	body := chatPublicBody{SenderPublicKey: identity.Pub, SentAt: sentAt, Text: text, Signature: ed25519.Sign(identity.Priv, msg)}
+	return encodeChatEnvelope(ChatPublicText, body)
+}
+
+func OpenPublicText(payload []byte, ctx ChatContext) (PublicText, bool) {
+	if !ctx.Destination.IsBroadcast() {
+		return PublicText{}, false
+	}
+	env, err := DecodeChatEnvelope(payload)
+	if err != nil || env.Version != ChatVersion || env.Kind != ChatPublicText {
+		return PublicText{}, false
+	}
+	var body chatPublicBody
+	if err := cbor.Unmarshal(env.Body, &body); err != nil {
+		return PublicText{}, false
+	}
+	if len(body.SenderPublicKey) != PublicKeyBytes || NodeIDFromPubKey(body.SenderPublicKey) != ctx.Source || !textWithinLimit(body.Text) {
+		return PublicText{}, false
+	}
+	msg := publicTextSignedBytes(ctx, body.SenderPublicKey, body.SentAt, body.Text)
+	if !ed25519.Verify(ed25519.PublicKey(body.SenderPublicKey), msg, body.Signature) {
+		return PublicText{}, false
+	}
+	return PublicText{Text: body.Text, SentAt: body.SentAt, SenderPublicKey: body.SenderPublicKey}, true
+}
+
+func publicTextSignedBytes(ctx ChatContext, senderPub []byte, sentAt int64, text string) []byte {
+	t := []byte(text)
+	out := bytes.NewBuffer(nil)
+	out.Write(asciiNul("BLEEDGE-CHAT-PUBLIC-TEXT-V1"))
+	out.Write(ctx.DatagramID[:])
+	out.Write(ctx.Source[:])
+	out.Write(ctx.Destination[:])
+	out.Write(senderPub)
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(sentAt))
+	out.Write(b[:])
+	out.Write(appendLE16(nil, uint16(len(t))))
+	out.Write(t)
+	return out.Bytes()
+}
+
+type chatTypingBody struct {
+	SenderPublicKey []byte `cbor:"1,keyasint"`
+	SentAt          int64  `cbor:"2,keyasint"`
+	Signature       []byte `cbor:"3,keyasint"`
+}
+
+func BuildTyping(identity *Identity, ctx ChatContext, sentAt int64) ([]byte, error) {
+	msg := typingSignedBytes(ctx, identity.Pub, sentAt)
+	body := chatTypingBody{SenderPublicKey: identity.Pub, SentAt: sentAt, Signature: ed25519.Sign(identity.Priv, msg)}
+	return encodeChatEnvelope(ChatTyping, body)
+}
+
+func OpenTyping(payload []byte, ctx ChatContext) (int64, []byte, bool) {
+	env, err := DecodeChatEnvelope(payload)
+	if err != nil || env.Version != ChatVersion || env.Kind != ChatTyping {
+		return 0, nil, false
+	}
+	var body chatTypingBody
+	if err := cbor.Unmarshal(env.Body, &body); err != nil {
+		return 0, nil, false
+	}
+	if len(body.SenderPublicKey) != PublicKeyBytes || NodeIDFromPubKey(body.SenderPublicKey) != ctx.Source {
+		return 0, nil, false
+	}
+	if !ed25519.Verify(ed25519.PublicKey(body.SenderPublicKey), typingSignedBytes(ctx, body.SenderPublicKey, body.SentAt), body.Signature) {
+		return 0, nil, false
+	}
+	return body.SentAt, body.SenderPublicKey, true
+}
+
+func typingSignedBytes(ctx ChatContext, senderPub []byte, sentAt int64) []byte {
+	out := bytes.NewBuffer(nil)
+	out.Write(asciiNul("BLEEDGE-CHAT-TYPING-V1"))
+	out.Write(ctx.DatagramID[:])
+	out.Write(ctx.Source[:])
+	out.Write(ctx.Destination[:])
+	out.Write(senderPub)
+	out.Write(appendLE64(nil, uint64(sentAt)))
+	return out.Bytes()
+}
+
+type chatDirectBody struct {
+	SenderPublicKey []byte `cbor:"1,keyasint"`
+	Nonce           []byte `cbor:"2,keyasint"`
+	Ciphertext      []byte `cbor:"3,keyasint"`
+}
+
+type directPlaintext struct {
+	SentAt int64  `cbor:"1,keyasint"`
+	Text   string `cbor:"2,keyasint"`
+}
+
+type DirectText struct {
+	Text            string
+	SentAt          int64
+	SenderPublicKey []byte
+}
+
+func SealDirectText(sender *Identity, recipientPublicKey []byte, ctx ChatContext, text string, sentAt int64) ([]byte, error) {
+	if !textWithinLimit(text) {
+		return nil, ErrTextTooLong
+	}
+	key, err := pairwiseKey(sender.Seed[:], sender.Pub, recipientPublicKey)
+	if err != nil {
+		return nil, err
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -50,154 +193,160 @@ func SealChat(plain string, sender *Identity, recipientEdPub []byte) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	iv := make([]byte, gcm.NonceSize()) // 12 bytes
-	if _, err := rand.Read(iv); err != nil {
+	nonce := make([]byte, ChatDirectNonceBytes)
+	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	ct := gcm.Seal(nil, iv, []byte(plain), nil)
-
-	return cbor.Marshal(chatEnvelope{SenderPub: sender.Pub, IV: iv, CT: ct})
+	pt, err := cbor.Marshal(directPlaintext{SentAt: sentAt, Text: text})
+	if err != nil {
+		return nil, err
+	}
+	ct := gcm.Seal(nil, nonce, pt, directAAD(ctx, sender.Pub))
+	return encodeChatEnvelope(ChatDirectText, chatDirectBody{SenderPublicKey: sender.Pub, Nonce: nonce, Ciphertext: ct})
 }
 
-// OpenChat decrypts a SealChat envelope addressed to me. Returns the plaintext and
-// true, or ("", false) if the envelope is malformed / not decryptable with this
-// identity.
-func OpenChat(envelope []byte, me *Identity) (string, bool) {
-	var env chatEnvelope
-	if err := cbor.Unmarshal(envelope, &env); err != nil || len(env.SenderPub) != 32 {
-		return "", false
+func OpenDirectText(recipient *Identity, payload []byte, ctx ChatContext) (DirectText, bool) {
+	if ctx.Destination != recipient.NodeID() {
+		return DirectText{}, false
 	}
-	myPriv := ed25519SeedToX25519Priv(me.Seed[:])
-	theirPub := ed25519PubToX25519(env.SenderPub)
-	key := chatDeriveKey(x25519(myPriv, theirPub))
-
+	env, err := DecodeChatEnvelope(payload)
+	if err != nil || env.Version != ChatVersion || env.Kind != ChatDirectText {
+		return DirectText{}, false
+	}
+	var body chatDirectBody
+	if err := cbor.Unmarshal(env.Body, &body); err != nil {
+		return DirectText{}, false
+	}
+	if len(body.SenderPublicKey) != PublicKeyBytes || len(body.Nonce) != ChatDirectNonceBytes || NodeIDFromPubKey(body.SenderPublicKey) != ctx.Source {
+		return DirectText{}, false
+	}
+	key, err := pairwiseKey(recipient.Seed[:], recipient.Pub, body.SenderPublicKey)
+	if err != nil {
+		return DirectText{}, false
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return "", false
+		return DirectText{}, false
 	}
 	gcm, err := cipher.NewGCM(block)
-	if err != nil || len(env.IV) != gcm.NonceSize() {
-		return "", false
-	}
-	pt, err := gcm.Open(nil, env.IV, env.CT, nil)
 	if err != nil {
-		return "", false
+		return DirectText{}, false
 	}
-	return string(pt), true
+	pt, err := gcm.Open(nil, body.Nonce, body.Ciphertext, directAAD(ctx, body.SenderPublicKey))
+	if err != nil {
+		return DirectText{}, false
+	}
+	var plain directPlaintext
+	if err := cbor.Unmarshal(pt, &plain); err != nil || !textWithinLimit(plain.Text) {
+		return DirectText{}, false
+	}
+	return DirectText{Text: plain.Text, SentAt: plain.SentAt, SenderPublicKey: body.SenderPublicKey}, true
 }
 
-// ChatEnvelopeSenderPub returns the sender's Ed25519 public key carried in an
-// envelope, or nil.
-func ChatEnvelopeSenderPub(envelope []byte) []byte {
-	var env chatEnvelope
-	if err := cbor.Unmarshal(envelope, &env); err != nil {
+func DirectSenderPublicKey(payload []byte) []byte {
+	env, err := DecodeChatEnvelope(payload)
+	if err != nil || env.Kind != ChatDirectText {
 		return nil
 	}
-	return env.SenderPub
+	var body chatDirectBody
+	if err := cbor.Unmarshal(env.Body, &body); err != nil || len(body.SenderPublicKey) != PublicKeyBytes {
+		return nil
+	}
+	return body.SenderPublicKey
 }
 
-// ---- key conversion & ECDH --------------------------------------------------
+func directAAD(ctx ChatContext, senderPub []byte) []byte {
+	out := bytes.NewBuffer(nil)
+	out.Write(asciiNul("BLEEDGE-CHAT-DIRECT-AAD-V1"))
+	out.Write(ctx.DatagramID[:])
+	out.Write(ctx.Source[:])
+	out.Write(ctx.Destination[:])
+	out.Write(senderPub)
+	out.Write(appendLE16(nil, uint16(ProtocolBLEEdgeChat)))
+	out.WriteByte(ChatVersion)
+	out.WriteByte(byte(ChatDirectText))
+	return out.Bytes()
+}
 
-// ed25519PubToX25519 converts a 32-byte Ed25519 public key (compressed Edwards
-// point) to the equivalent X25519 (Montgomery) public key: u = (1+y)/(1-y) mod p.
-func ed25519PubToX25519(edPub []byte) []byte {
-	le := make([]byte, 32)
-	copy(le, edPub)
-	le[31] &= 0x7f // clear the x-sign bit
+func pairwiseKey(mySeed, myPub, peerPub []byte) ([]byte, error) {
+	myPriv := ed25519SeedToX25519Priv(mySeed)
+	theirPub, err := ed25519PubToX25519(peerPub)
+	if err != nil {
+		return nil, err
+	}
+	priv, err := ecdh.X25519().NewPrivateKey(myPriv)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := ecdh.X25519().NewPublicKey(theirPub)
+	if err != nil {
+		return nil, err
+	}
+	secret, err := priv.ECDH(pub)
+	if err != nil {
+		return nil, err
+	}
+	low, high := myPub, peerPub
+	if bytes.Compare(low, high) > 0 {
+		low, high = high, low
+	}
+	info := bytes.NewBuffer(nil)
+	info.Write(asciiNul("BLEEDGE-CHAT-DIRECT-V1"))
+	info.Write(low)
+	info.Write(high)
+	return hkdfSHA256(secret, nil, info.Bytes(), 32), nil
+}
+
+var curve25519P = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(19))
+
+func ed25519PubToX25519(edPub []byte) ([]byte, error) {
+	if len(edPub) != PublicKeyBytes {
+		return nil, ErrInvalidPublicKey
+	}
+	le := append([]byte(nil), edPub...)
+	le[31] &= 0x7f
 	y := leToBig(le)
 	oneMinusY := new(big.Int).Mod(new(big.Int).Sub(big.NewInt(1), y), curve25519P)
-	onePlusY := new(big.Int).Mod(new(big.Int).Add(big.NewInt(1), y), curve25519P)
-	u := new(big.Int).Mul(onePlusY, new(big.Int).ModInverse(oneMinusY, curve25519P))
+	if oneMinusY.Sign() == 0 {
+		return nil, ErrInvalidPublicKey
+	}
+	u := new(big.Int).Mul(new(big.Int).Mod(new(big.Int).Add(big.NewInt(1), y), curve25519P), new(big.Int).ModInverse(oneMinusY, curve25519P))
 	u.Mod(u, curve25519P)
-	return bigToLe(u)
+	return bigToLe(u), nil
 }
 
-// ed25519SeedToX25519Priv derives the X25519 private scalar from an Ed25519 seed:
-// a = clamp(SHA-512(seed)[0:32]).
 func ed25519SeedToX25519Priv(seed []byte) []byte {
 	h := sha512.Sum512(seed)
-	a := make([]byte, 32)
-	copy(a, h[:32])
+	a := append([]byte(nil), h[:32]...)
 	a[0] &= 248
 	a[31] &= 127
 	a[31] |= 64
 	return a
 }
 
-func chatDeriveKey(secret []byte) []byte {
-	// HKDF-SHA256 (RFC 5869): salt nil → zero key; one expand block is enough for 32 bytes.
-	prk := hmacSha256(make([]byte, sha256.Size), secret) // extract
-	t := hmacSha256(prk, append([]byte(chatHKDFInfo), 0x01))
-	return t[:32]
+func hkdfSHA256(secret, salt, info []byte, n int) []byte {
+	if salt == nil {
+		salt = make([]byte, sha256.Size)
+	}
+	prk := hmacSha256(salt, secret)
+	var out, prev []byte
+	counter := byte(1)
+	for len(out) < n {
+		m := hmac.New(sha256.New, prk)
+		m.Write(prev)
+		m.Write(info)
+		m.Write([]byte{counter})
+		prev = m.Sum(nil)
+		out = append(out, prev...)
+		counter++
+	}
+	return out[:n]
 }
 
 func hmacSha256(key, data []byte) []byte {
 	m := hmac.New(sha256.New, key)
 	m.Write(data)
 	return m.Sum(nil)
-}
-
-// x25519 performs the RFC 7748 X25519 scalar multiplication (Montgomery ladder).
-func x25519(scalar, uIn []byte) []byte {
-	// Clamp the scalar.
-	e := make([]byte, 32)
-	copy(e, scalar)
-	e[0] &= 248
-	e[31] &= 127
-	e[31] |= 64
-	k := leToBig(e)
-
-	// Decode the u-coordinate (mask the high bit).
-	uc := make([]byte, 32)
-	copy(uc, uIn)
-	uc[31] &= 0x7f
-	x1 := leToBig(uc)
-
-	x2 := big.NewInt(1)
-	z2 := big.NewInt(0)
-	x3 := new(big.Int).Set(x1)
-	z3 := big.NewInt(1)
-	a24 := big.NewInt(121665)
-	swap := 0
-
-	for t := 254; t >= 0; t-- {
-		kt := int(k.Bit(t))
-		swap ^= kt
-		cswap(swap, x2, x3)
-		cswap(swap, z2, z3)
-		swap = kt
-
-		A := fadd(x2, z2)
-		AA := fmul(A, A)
-		B := fsub(x2, z2)
-		BB := fmul(B, B)
-		E := fsub(AA, BB)
-		C := fadd(x3, z3)
-		D := fsub(x3, z3)
-		DA := fmul(D, A)
-		CB := fmul(C, B)
-		x3 = fmul(fadd(DA, CB), fadd(DA, CB))
-		z3 = fmul(x1, fmul(fsub(DA, CB), fsub(DA, CB)))
-		x2 = fmul(AA, BB)
-		z2 = fmul(E, fadd(AA, fmul(a24, E)))
-	}
-	cswap(swap, x2, x3)
-	cswap(swap, z2, z3)
-
-	res := fmul(x2, new(big.Int).ModInverse(z2, curve25519P))
-	return bigToLe(res)
-}
-
-func fadd(a, b *big.Int) *big.Int { return new(big.Int).Mod(new(big.Int).Add(a, b), curve25519P) }
-func fsub(a, b *big.Int) *big.Int { return new(big.Int).Mod(new(big.Int).Sub(a, b), curve25519P) }
-func fmul(a, b *big.Int) *big.Int { return new(big.Int).Mod(new(big.Int).Mul(a, b), curve25519P) }
-
-func cswap(swap int, a, b *big.Int) {
-	if swap == 1 {
-		tmp := new(big.Int).Set(a)
-		a.Set(b)
-		b.Set(tmp)
-	}
 }
 
 func leToBig(le []byte) *big.Int {
@@ -209,10 +358,19 @@ func leToBig(le []byte) *big.Int {
 }
 
 func bigToLe(v *big.Int) []byte {
-	be := v.Bytes() // big-endian, may be shorter than 32
+	be := v.Bytes()
 	out := make([]byte, 32)
 	for i := 0; i < len(be) && i < 32; i++ {
 		out[i] = be[len(be)-1-i]
 	}
 	return out
 }
+
+var (
+	ErrTextTooLong      = fmtError("text too long")
+	ErrInvalidPublicKey = fmtError("invalid public key")
+)
+
+type fmtError string
+
+func (e fmtError) Error() string { return string(e) }
