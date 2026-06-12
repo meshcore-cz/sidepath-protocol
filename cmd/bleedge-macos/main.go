@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	mcbridge "github.com/bleedge/bleedge/bridge/meshcore"
 	"github.com/bleedge/bleedge/core"
 	blenode "github.com/bleedge/bleedge/macos"
 )
@@ -49,11 +50,19 @@ func main() {
 	botScript := ""
 	bunPath := "bun"
 	botChannels := "Public"
+	meshcoreBridge := false
+	meshcoreSocket := ""
 	verbose := false
 	for i, arg := range os.Args[1:] {
 		switch {
 		case arg == "--verbose" || arg == "-v":
 			verbose = true
+		case arg == "--meshcore-bridge":
+			meshcoreBridge = true
+		case strings.HasPrefix(arg, "--meshcore-socket="):
+			meshcoreSocket = strings.TrimPrefix(arg, "--meshcore-socket=")
+		case arg == "--meshcore-socket" && i+1 < len(os.Args[1:]):
+			meshcoreSocket = os.Args[i+2]
 		case strings.HasPrefix(arg, "--seed-hex="):
 			seedHex = strings.TrimPrefix(arg, "--seed-hex=")
 		case arg == "--seed-hex" && i+1 < len(os.Args[1:]):
@@ -88,6 +97,7 @@ func main() {
 Usage:
   bleedge-macos [--seed-hex <hex>] [--description <str>] [--allow-peer <id,...>] [--verbose]
   bleedge-macos --bot <script.ts> [--bun <path>] [--channels <name,...>]   # run as a bot driven by a Bun script
+  bleedge-macos --meshcore-bridge [--meshcore-socket <path>]               # bridge MeshCore adverts into the BLEEdge mesh
 
 Interactive commands (type and press Enter):
   <text>             broadcast a message on the public channel
@@ -104,6 +114,13 @@ Bot mode (--bot): the node runs headless and forwards chat messages to a Bun
   e.g. --channels "Public,rock climbers"). See bots/ for examples:
     bleedge-macos --bot bots/time-bot.ts
     bleedge-macos --bot bots/echo-bot.ts --channels "Public,dev"
+
+Bridge mode (--meshcore-bridge): taps a running meshcore-go backend daemon over
+  its Unix-socket IPC (watch_rf), and re-floods every MeshCore ADVERT it hears
+  into the BLEEdge mesh as an opaque PayloadTypeMeshCoreRaw packet. Phase 1 is
+  one-way (MeshCore -> BLEEdge). Requires the meshcore-go backend running with
+  RF logging enabled. Socket defaults to MC_BACKEND_SOCKET or
+  <cache>/mc/backend.sock; override with --meshcore-socket.
 
 NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
       Use bleedge-listen on Linux for the Long Range PoC.
@@ -217,6 +234,25 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 	// Run node in background
 	errCh := make(chan error, 1)
 	go func() { errCh <- node.Run(ctx) }()
+
+	// MeshCore bridge: tap the meshcore-go backend and re-flood adverts.
+	if meshcoreBridge {
+		bridgeLog := func(s string) {
+			if headless {
+				fmt.Fprintln(os.Stderr, s)
+				return
+			}
+			emitUI(fmt.Sprintf("%s  %s", time.Now().Format("15:04:05"), s))
+		}
+		br := mcbridge.New(mcbridge.Config{Socket: meshcoreSocket, Log: bridgeLog})
+		go br.Run(ctx, func(a mcbridge.Advert) {
+			if err := node.SendMeshCoreRaw(a.Bytes); err != nil {
+				bridgeLog(fmt.Sprintf("meshcore bridge: forward failed: %v", err))
+				return
+			}
+			bridgeLog(fmt.Sprintf("meshcore bridge: forwarded advert (%d bytes, rssi=%d) -> BLEEdge", len(a.Bytes), a.RSSI))
+		})
+	}
 
 	// Bot mode: start the Bun bridge. Headless (no TTY) runs until interrupted; with a TTY
 	// the bot runs in the background and we fall through to the interactive TUI in front.

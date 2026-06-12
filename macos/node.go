@@ -770,6 +770,15 @@ func (n *Node) SendText(dst core.NodeID, text string, ttl uint8) error {
 	return n.sendData(dst, core.PayloadTypeTextTest, []byte(text), ttl)
 }
 
+// SendMeshCoreRaw floods an opaque MeshCore over-the-air packet into the
+// BLEEdge mesh as a PayloadTypeMeshCoreRaw DATA packet (broadcast, TTL 3).
+// The bytes are carried verbatim; no BLEEdge node decodes them. Used by the
+// meshcore bridge to repeat MeshCore adverts into BLEEdge.
+func (n *Node) SendMeshCoreRaw(payload []byte) error {
+	var broadcast core.NodeID
+	return n.sendData(broadcast, core.PayloadTypeMeshCoreRaw, payload, 3)
+}
+
 // SendTyping sends an ephemeral "I'm typing" hint to dst (empty TYPING payload,
 // never ACKed). Best-effort — used to show activity while preparing a reply.
 func (n *Node) SendTyping(dst core.NodeID) error {
