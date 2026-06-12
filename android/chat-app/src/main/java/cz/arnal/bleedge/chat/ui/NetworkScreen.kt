@@ -54,8 +54,6 @@ fun NetworkScreen(
     vm: ChatViewModel,
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
-    onOpenTrace: (String) -> Unit,
-    onOpenRxLog: () -> Unit,
 ) {
     val peers by vm.connectedPeers.collectAsState()
     val topology by vm.topology.collectAsState()
@@ -64,6 +62,7 @@ fun NetworkScreen(
     val stats by vm.stats.collectAsState()
     val running by vm.isRunning.collectAsState()
     val lastPacketAt by vm.lastPacketAtMs.collectAsState()
+    val nav = LocalMeshNav.current
     val myHex = myNode.toHex()
 
     // Identicons are drawn from a node's 32-byte public key; learn it from the live topology.
@@ -106,7 +105,7 @@ fun NetworkScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     FilledTonalButton(
-                        onClick = { traceTarget?.let(onOpenTrace) },
+                        onClick = { traceTarget?.let(nav.openTrace) },
                         enabled = traceTarget != null,
                         modifier = Modifier.weight(1f),
                     ) {
@@ -114,7 +113,7 @@ fun NetworkScreen(
                         Spacer(Modifier.width(8.dp))
                         Text("Trace")
                     }
-                    OutlinedButton(onClick = onOpenRxLog, modifier = Modifier.weight(1f)) {
+                    OutlinedButton(onClick = nav.openRxLog, modifier = Modifier.weight(1f)) {
                         Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("Rx Log")

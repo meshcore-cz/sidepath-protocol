@@ -120,7 +120,15 @@ fun ChatRoot(vm: ChatViewModel) {
     }
 
     val avatarStyle by vm.avatarStyle.collectAsState()
-    CompositionLocalProvider(LocalAvatarStyle provides avatarStyle) {
+    CompositionLocalProvider(
+        LocalAvatarStyle provides avatarStyle,
+        // App-wide mesh navigation: Trace and Rx Log are reachable from any universal
+        // component (e.g. the connection-status sheet) without threading callbacks.
+        LocalMeshNav provides MeshNav(
+            openTrace = { openTrace = it },
+            openRxLog = { showRxLog = true },
+        ),
+    ) {
     AnimatedContent(
         targetState = top,
         modifier = Modifier.fillMaxSize(),
@@ -141,6 +149,7 @@ fun ChatRoot(vm: ChatViewModel) {
                 onBack = popTop,
                 onOpenConversation = { openProfile = null; openPeer = it },
                 onTrace = { openTrace = it },
+                onOpenProfile = { openProfile = it },
             )
             is Dest.Conversation -> ConversationScreen(
                 vm, dest.peer,
@@ -167,8 +176,6 @@ fun ChatRoot(vm: ChatViewModel) {
                 onOpenProfile = { openProfile = it },
                 onOpenSettings = { showSettings = true },
                 onOpenAbout = { showAbout = true },
-                onOpenTrace = { openTrace = it },
-                onOpenRxLog = { showRxLog = true },
             )
         }
     }
@@ -184,8 +191,6 @@ private fun TabsScaffold(
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onOpenAbout: () -> Unit,
-    onOpenTrace: (String) -> Unit,
-    onOpenRxLog: () -> Unit,
 ) {
     val conversations by vm.conversations.collectAsState()
     val unread = remember(conversations) { conversations.sumOf { it.unread } }
@@ -232,8 +237,6 @@ private fun TabsScaffold(
                     onOpenProfile = onOpenProfile,
                     onOpenSettings = onOpenSettings,
                     onOpenAbout = onOpenAbout,
-                    onOpenTrace = onOpenTrace,
-                    onOpenRxLog = onOpenRxLog,
                 )
                 1 -> ChannelsScreen(
                     vm,
@@ -246,8 +249,6 @@ private fun TabsScaffold(
                     vm,
                     onOpenProfile = onOpenProfile,
                     onOpenSettings = onOpenSettings,
-                    onOpenTrace = onOpenTrace,
-                    onOpenRxLog = onOpenRxLog,
                 )
             }
         }

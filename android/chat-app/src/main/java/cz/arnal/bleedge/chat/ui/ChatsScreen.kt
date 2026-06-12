@@ -53,8 +53,6 @@ fun ChatsScreen(
     onOpenProfile: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onOpenAbout: () -> Unit,
-    onOpenTrace: ((String) -> Unit)? = null,
-    onOpenRxLog: (() -> Unit)? = null,
 ) {
     val conversations by vm.conversations.collectAsState()
     val myNode by vm.nodeId.collectAsState()
@@ -91,7 +89,7 @@ fun ChatsScreen(
                     }
                 },
                 actions = {
-                    ConnectionStatusButton(vm, onOpenTrace = onOpenTrace, onOpenRxLog = onOpenRxLog)
+                    ConnectionStatusButton(vm)
                     IconButton(onClick = {
                         searching = !searching
                         if (!searching) query = ""

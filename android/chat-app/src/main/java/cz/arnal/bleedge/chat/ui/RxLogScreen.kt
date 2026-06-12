@@ -160,6 +160,7 @@ private fun PacketRow(
             ) {
                 TypePill(p)
                 if (isMine) MineChip()
+                p.droppedReason?.let { DropChip(it) }
                 Text(timeFmt.format(Date(p.timestampMs)), style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace)
                 Text(
                     "${vm.nameForHex(p.source.toHex())} → ${destLabel(p, vm)}",
@@ -176,6 +177,7 @@ private fun PacketRow(
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TypePill(p)
                     if (isMine) MineChip()
+                    p.droppedReason?.let { DropChip(it) }
                     Text(
                         "${vm.nameForHex(p.source.toHex())} → ${destLabel(p, vm)}",
                         style = MaterialTheme.typography.bodyMedium,
@@ -213,6 +215,24 @@ private fun TypePill(p: RxPacket) {
             style = MaterialTheme.typography.labelSmall,
             fontFamily = FontFamily.Monospace,
             color = color,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+        )
+    }
+}
+
+/** A small red chip flagging a routing drop, e.g. "dup" for a duplicate datagram. */
+@Composable
+private fun DropChip(reason: String) {
+    val label = if (reason == "duplicate") "dup" else reason
+    Surface(
+        color = MaterialTheme.colorScheme.error.copy(alpha = 0.15f),
+        shape = RoundedCornerShape(6.dp),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.error,
             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
         )
     }
@@ -340,6 +360,7 @@ private fun PacketDetailDialog(
                 Field("Destination", if (p.destination.isBroadcast()) "broadcast" else
                     "${vm.nameForHex(p.destination.toHex())}\n${p.destination.toHex()}")
                 Field("Routing", "${routingLabel(p)} · ttl ${p.ttl} · ${if (p.forUs) "for us" else "overheard"}")
+                p.droppedReason?.let { Field("Dropped", it) }
                 Field("Flags", if (p.ackRequested) "ACK_REQUESTED" else if (p.flags == 0) "none" else "0x%04x".format(p.flags))
                 if (p.route.isNotEmpty()) Field("Route", p.route.joinToString(" → ") { "${vm.nameForHex(it.toHex())} (${it.toHex().take(20)})" })
                 if (p.path.isNotEmpty()) Field("Path", p.path.joinToString(" → ") { "${vm.nameForHex(it.toHex())} (${it.toHex().take(20)})" })

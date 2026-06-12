@@ -121,15 +121,12 @@ fun ConversationScreen(
     // Repeats of our own flooded messages heard back, keyed by packet-id hex (= message id).
     val floodRepeats by vm.floodRepeats.collectAsState()
 
-    // Drive outgoing typing hints: each keystroke (re)arms this; after ~5s of no change we
-    // consider the user stopped. An empty field stops immediately, as does leaving the screen.
+    // Outgoing typing hints are STARTED only from a genuine user edit (see the input's
+    // onChange below) — never merely from opening the conversation or a programmatic draft
+    // change. This idle timer only STOPS: ~5s after the last text change with no new
+    // keystroke we consider the user stopped. Leaving the screen also stops it.
     LaunchedEffect(draft.text, peerHex, isChannel) {
-        if (isChannel) return@LaunchedEffect
-        if (draft.text.isBlank()) {
-            vm.stopTyping(peerHex)
-            return@LaunchedEffect
-        }
-        vm.onUserTyping(peerHex)
+        if (isChannel || draft.text.isBlank()) return@LaunchedEffect
         delay(5_000)
         vm.stopTyping(peerHex)
     }
@@ -260,7 +257,16 @@ fun ConversationScreen(
                 }
                 MessageInput(
                     value = draft,
-                    onChange = { draft = it },
+                    onChange = { newValue ->
+                        // A real user edit in the input box: only now do we emit a "typing"
+                        // hint (DMs only), and only when the text actually changed to non-blank.
+                        val textChanged = newValue.text != draft.text
+                        draft = newValue
+                        if (!isChannel && textChanged) {
+                            if (newValue.text.isNotBlank()) vm.onUserTyping(peerHex)
+                            else vm.stopTyping(peerHex)
+                        }
+                    },
                     fullScreen = onBack != null,
                     onEmoji = { showEmoji = true },
                     onSend = {
@@ -269,6 +275,7 @@ fun ConversationScreen(
                             if (isChannel) vm.sendChannelMessage(channelPskHexOf(peerHex), text)
                             else vm.sendChat(peerHex, text)
                             draft = TextFieldValue("")
+                            vm.stopTyping(peerHex) // a real message supersedes the typing hint
                         }
                     },
                 )

@@ -22,10 +22,12 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Route
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -65,6 +67,7 @@ fun ProfileScreen(
     onBack: () -> Unit,
     onOpenConversation: (String) -> Unit,
     onTrace: (String) -> Unit,
+    onOpenProfile: (String) -> Unit = {},
 ) {
     val profile by remember(peerHex) { vm.profileFor(peerHex) }.collectAsState()
     var renaming by remember { mutableStateOf(false) }
@@ -179,18 +182,18 @@ fun ProfileScreen(
                 Text(if (profile.isChannel) "Open channel" else "Message")
             }
             Spacer(Modifier.size(8.dp))
+            // Primary actions: Show QR · Rename · Trace (Trace is user-only). The QR is no
+            // longer rendered inline — "Show QR" opens it in a sheet.
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                if (shareUri != null) {
+                    CompactAction(Icons.Default.QrCode2, "Show QR") { showShare = true }
+                }
                 CompactAction(Icons.Default.Edit, "Rename") { renaming = true }
                 if (!profile.isChannel) {
                     CompactAction(Icons.Default.Route, "Trace") { onTrace(peerHex) }
-                }
-                if (profile.isChannel) {
-                    CompactAction(Icons.Default.Logout, "Leave") { confirmDelete = true }
-                } else if (profile.isContact) {
-                    CompactAction(Icons.Default.Delete, "Delete") { confirmDelete = true }
                 }
             }
 
@@ -201,18 +204,26 @@ fun ProfileScreen(
                 ChannelInfo(profile)
             } else {
                 UserInfo(profile)
+                // Neighbors this node directly connects to, learned from its signed ANNOUNCE.
+                if (profile.neighborHexes.isNotEmpty()) {
+                    Spacer(Modifier.size(20.dp))
+                    NeighborsSection(vm, profile.neighborHexes, onOpenProfile)
+                }
             }
 
-            // Share QR — a MeshCore URI other apps can scan to add this contact/channel.
-            if (shareUri != null) {
+            // Destructive action (Leave channel / Delete contact) kept apart from the
+            // primary actions, at the bottom.
+            if (profile.isChannel || profile.isContact) {
                 Spacer(Modifier.size(28.dp))
-                Text(
-                    if (profile.isChannel) "Scan to join this channel" else "Scan to add this contact",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.size(12.dp))
-                QrImage(shareUri, modifier = Modifier.size(240.dp).clickable { showShare = true })
+                OutlinedButton(
+                    onClick = { confirmDelete = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) {
+                    Icon(if (profile.isChannel) Icons.Default.Logout else Icons.Default.Delete, contentDescription = null)
+                    Spacer(Modifier.size(8.dp))
+                    Text(if (profile.isChannel) "Leave channel" else "Delete contact")
+                }
             }
         }
     }
@@ -309,6 +320,41 @@ private fun RowScope.CompactAction(
             Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.size(4.dp))
             Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+        }
+    }
+}
+
+/** Lists a node's directly-connected neighbors (from its signed ANNOUNCE); tap to open one. */
+@Composable
+private fun NeighborsSection(
+    vm: ChatViewModel,
+    neighborHexes: List<String>,
+    onOpenProfile: (String) -> Unit,
+) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Neighbors (${neighborHexes.size})",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        neighborHexes.forEach { hex ->
+            val label = vm.nameForHex(hex).ifBlank { "node ${hex.take(8)}" }
+            Row(
+                Modifier.fillMaxWidth().clickable { onOpenProfile(hex) },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Avatar(seed = hex, label = label, size = 32)
+                Spacer(Modifier.size(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(label, style = MaterialTheme.typography.bodyMedium, fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
+                    Text(
+                        hex.take(20),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }

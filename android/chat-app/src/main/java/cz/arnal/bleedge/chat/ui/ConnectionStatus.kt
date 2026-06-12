@@ -28,6 +28,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,15 +39,26 @@ import cz.arnal.bleedge.chat.ConnState
 import cz.arnal.bleedge.service.RSSI_UNKNOWN
 
 /**
+ * App-wide mesh navigation actions (open the Trace and Rx Log screens). Provided once at the
+ * navigation root via [LocalMeshNav], so universal components like [ConnectionStatusButton]
+ * can navigate from anywhere without each screen having to thread callbacks through.
+ */
+data class MeshNav(
+    val openTrace: (String) -> Unit = {},
+    val openRxLog: () -> Unit = {},
+)
+
+val LocalMeshNav = staticCompositionLocalOf { MeshNav() }
+
+/**
  * Universal connection-status chip: a colored health dot + the connected-peer count. Tapping
- * it opens a sheet with health, peers and topology stats. Reusable in any TopAppBar.
+ * it opens a sheet with health, peers, topology stats, and Trace / Rx Log shortcuts. Reusable
+ * in any TopAppBar — navigation comes from [LocalMeshNav], so no per-screen wiring is needed.
  */
 @Composable
 fun ConnectionStatusButton(
     vm: ChatViewModel,
     modifier: Modifier = Modifier,
-    onOpenTrace: ((String) -> Unit)? = null,
-    onOpenRxLog: (() -> Unit)? = null,
 ) {
     val status by vm.connectionStatus.collectAsState()
     val peers by vm.connectedPeers.collectAsState()
@@ -68,17 +80,16 @@ fun ConnectionStatusButton(
         )
     }
 
-    if (open) ConnectionStatusSheet(vm, onOpenTrace, onOpenRxLog) { open = false }
+    if (open) ConnectionStatusSheet(vm) { open = false }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ConnectionStatusSheet(
     vm: ChatViewModel,
-    onOpenTrace: ((String) -> Unit)?,
-    onOpenRxLog: (() -> Unit)?,
     onDismiss: () -> Unit,
 ) {
+    val nav = LocalMeshNav.current
     val status by vm.connectionStatus.collectAsState()
     val peers by vm.connectedPeers.collectAsState()
     val topology by vm.topology.collectAsState()
@@ -123,30 +134,24 @@ private fun ConnectionStatusSheet(
                 StatRow("Topology links", "$links")
             }
 
-            if (onOpenTrace != null || onOpenRxLog != null) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    if (onOpenTrace != null) {
-                        val traceTarget = peers.firstOrNull()?.nodeId?.toHex()
-                        FilledTonalButton(
-                            onClick = { traceTarget?.let { onDismiss(); onOpenTrace(it) } },
-                            enabled = traceTarget != null,
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Icon(Icons.Default.Route, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text("Trace")
-                        }
-                    }
-                    if (onOpenRxLog != null) {
-                        OutlinedButton(
-                            onClick = { onDismiss(); onOpenRxLog() },
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text("Rx Log")
-                        }
-                    }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                val traceTarget = peers.firstOrNull()?.nodeId?.toHex()
+                FilledTonalButton(
+                    onClick = { traceTarget?.let { onDismiss(); nav.openTrace(it) } },
+                    enabled = traceTarget != null,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(Icons.Default.Route, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Trace")
+                }
+                OutlinedButton(
+                    onClick = { onDismiss(); nav.openRxLog() },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Rx Log")
                 }
             }
 

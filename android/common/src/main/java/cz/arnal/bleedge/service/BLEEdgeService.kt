@@ -128,6 +128,7 @@ data class RxPacket(
     val payloadSize: Int,
     val raw: ByteArray,
     val forUs: Boolean,
+    val droppedReason: String? = null, // non-null if the router dropped it (e.g. "duplicate", "loop")
 )
 
 data class RepeatSample(
@@ -465,21 +466,6 @@ class BLEEdgeService : Service() {
         val directPeer = dg.path.lastOrNull() ?: dg.source.takeIf { !it.isBroadcast() && it != _nodeId.value }
         learnNeighbor(directPeer, addrHex, device)
 
-        val forUs = dg.isBroadcast || dg.destination == _nodeId.value
-        val chatKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CHAT) Chat.peekKind(dg.payload) else null
-        val controlKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CONTROL)
-            runCatching { ControlMessage.decode(dg.payload).kind }.getOrNull() else null
-        _rxPackets.update {
-            (listOf(RxPacket(
-                timestampMs = System.currentTimeMillis(),
-                protocol = dg.protocol, chatKind = chatKind, controlKind = controlKind,
-                id = dg.id, source = dg.source, destination = dg.destination,
-                sourceRouted = dg.isSourceRouted, routeCursor = dg.routeCursor, ttl = dg.ttl,
-                flags = dg.flags, ackRequested = dg.ackRequested(),
-                path = dg.path, route = dg.route, payloadSize = dg.payload.size, raw = data, forUs = forUs,
-            )) + it).take(maxRxPackets)
-        }
-
         // A reception of one of our own flooded messages is a repeat (a relay rebroadcast it).
         val idHex = dg.id.toHex()
         if (originatedFloodIds.containsKey(idHex)) {
@@ -488,6 +474,25 @@ class BLEEdgeService : Service() {
         }
 
         val actions = router.handle(dg, directPeer)
+
+        // Capture for the Rx Log AFTER routing so we can flag drops (duplicate, loop, ttl, …).
+        val forUs = dg.isBroadcast || dg.destination == _nodeId.value
+        val chatKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CHAT) Chat.peekKind(dg.payload) else null
+        val controlKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CONTROL)
+            runCatching { ControlMessage.decode(dg.payload).kind }.getOrNull() else null
+        val droppedReason = actions.firstOrNull { it.type == ActionType.DROP }?.reason
+        _rxPackets.update {
+            (listOf(RxPacket(
+                timestampMs = System.currentTimeMillis(),
+                protocol = dg.protocol, chatKind = chatKind, controlKind = controlKind,
+                id = dg.id, source = dg.source, destination = dg.destination,
+                sourceRouted = dg.isSourceRouted, routeCursor = dg.routeCursor, ttl = dg.ttl,
+                flags = dg.flags, ackRequested = dg.ackRequested(),
+                path = dg.path, route = dg.route, payloadSize = dg.payload.size, raw = data, forUs = forUs,
+                droppedReason = droppedReason,
+            )) + it).take(maxRxPackets)
+        }
+
         _stats.update { s ->
             s.copy(
                 packetsReceived = s.packetsReceived + 1,

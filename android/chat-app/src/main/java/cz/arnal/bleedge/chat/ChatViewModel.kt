@@ -125,6 +125,7 @@ data class ProfileInfo(
     val channelKind: String = "",
     val channelHash: Int = 0,
     val pskHex: String = "",
+    val neighborHexes: List<String> = emptyList(), // this node's directly-connected neighbors (from its ANNOUNCE)
 )
 
 /** A row in the Channels list. */
@@ -654,6 +655,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     online = t.any { it.nodeId.toHex() == peerHex },
                     description = nodeDescription(peerHex, byNode, t),
                     platform = nodePlatform(peerHex, t),
+                    neighborHexes = t.firstOrNull { it.nodeId.toHex() == peerHex }
+                        ?.neighborIds?.map { it.toHex() } ?: emptyList(),
                 )
             }
         }.stateIn(
