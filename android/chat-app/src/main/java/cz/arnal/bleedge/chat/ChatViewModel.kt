@@ -577,6 +577,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearTrace() { _trace.value = null }
 
+    fun clearDiscoveredContacts() {
+        viewModelScope.launch { dao.clearDiscovered() }
+    }
+
     private fun handleTraceResponse(msg: ReceivedMessage) {
         val result = msg.traceResponse ?: return
         val cur = _trace.value ?: return
@@ -624,7 +628,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             service.meshCoreAdverts.collect { adverts ->
                 for (a in adverts) {
                     if (!processed.add("disc:mc:${a.publicKeyHex}:${a.timestampSec}")) continue
-                    val advertisedMs = if (a.timestampSec > 0) a.timestampSec * 1000 else System.currentTimeMillis()
+                    val heardMs = System.currentTimeMillis()
+                    val nodeAdvertisedMs = if (a.timestampSec > 0) a.timestampSec * 1000 else 0L
                     upsertDiscovered(
                         pubKeyHex = a.publicKeyHex,
                         nodeHex = a.publicKeyHex.take(20), // BLEEdge-style NodeId = pubkey[:10]
@@ -635,7 +640,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         lat = a.lat,
                         lon = a.lon,
                         sigVerified = a.sigVerified,
-                        lastAdvertisedMs = advertisedMs,
+                        lastAdvertisedMs = heardMs,
+                        nodeAdvertisedMs = nodeAdvertisedMs,
                     )
                 }
             }
@@ -1144,6 +1150,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         lon: Double = 0.0,
         sigVerified: Boolean = false,
         lastAdvertisedMs: Long,
+        nodeAdvertisedMs: Long = 0L,
     ) {
         val firstSeen = dao.discoveredByPubKey(pubKeyHex)?.firstSeenMs?.takeIf { it > 0 } ?: lastAdvertisedMs
         dao.upsertDiscovered(
@@ -1158,6 +1165,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 lon = lon,
                 sigVerified = sigVerified,
                 lastAdvertisedMs = lastAdvertisedMs,
+                nodeAdvertisedMs = nodeAdvertisedMs,
                 firstSeenMs = firstSeen,
             )
         )

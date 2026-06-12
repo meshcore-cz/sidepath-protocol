@@ -72,6 +72,9 @@ interface ChatDao {
     @Query("DELETE FROM discovered_contacts WHERE pubKeyHex = :pubKeyHex")
     suspend fun deleteDiscovered(pubKeyHex: String)
 
+    @Query("DELETE FROM discovered_contacts")
+    suspend fun clearDiscovered()
+
     /** Drops discovered contacts not heard from since [cutoffMs] (their TTL has elapsed). */
     @Query("DELETE FROM discovered_contacts WHERE lastAdvertisedMs < :cutoffMs")
     suspend fun pruneDiscovered(cutoffMs: Long)

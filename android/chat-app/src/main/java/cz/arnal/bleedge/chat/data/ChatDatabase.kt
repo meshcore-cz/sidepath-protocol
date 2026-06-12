@@ -11,7 +11,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 // destructive migration wipes the v2 store. See docs/PROTOCOL.md migration §17.
 @Database(
     entities = [Message::class, Contact::class, Channel::class, DiscoveredContact::class],
-    version = 7,
+    version = 8,
     exportSchema = false,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -31,12 +31,20 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        // v7→v8: keep discovered_contacts.lastAdvertisedMs as local receipt time and store the
+        // MeshCore node's own advertised timestamp separately.
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE discovered_contacts ADD COLUMN nodeAdvertisedMs INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun get(context: Context): ChatDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 ChatDatabase::class.java,
                 "bleedge_chat.db",
-            ).addMigrations(MIGRATION_6_7)
+            ).addMigrations(MIGRATION_6_7, MIGRATION_7_8)
                 .fallbackToDestructiveMigration()
                 .build().also { instance = it }
         }

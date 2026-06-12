@@ -37,7 +37,9 @@ object DiscoverySource {
  * A node we've heard advertise but haven't added to our contacts. Surfaced on the Explore tab.
  * Keyed by [pubKeyHex] (32-byte Ed25519 key) which both BLEEdge nodes and MeshCore nodes carry.
  * [nodeType] is the MeshCore node type (0=unknown 1=chat 2=repeater 3=room 4=sensor; 0 for
- * BLEEdge). [lastAdvertisedMs] is updated each time we hear the node advertise.
+ * BLEEdge). [lastAdvertisedMs] is local device receipt time and is updated each time we
+ * hear the node advertise. [nodeAdvertisedMs] preserves a MeshCore advert's own timestamp,
+ * which can be wrong on repeaters without accurate clocks.
  */
 @Entity(tableName = "discovered_contacts")
 data class DiscoveredContact(
@@ -51,6 +53,7 @@ data class DiscoveredContact(
     val lon: Double = 0.0,
     val sigVerified: Boolean = false,
     val lastAdvertisedMs: Long = 0L,
+    val nodeAdvertisedMs: Long = 0L,
     val firstSeenMs: Long = 0L,
 )
 

@@ -15,8 +15,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.TravelExplore
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -54,6 +56,7 @@ fun ExploreScreen(
 ) {
     val discovered by vm.discoveredContacts.collectAsState()
     var detail by remember { mutableStateOf<DiscoveredContact?>(null) }
+    var confirmClear by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -61,7 +64,20 @@ fun ExploreScreen(
                 title = { Text("Explore") },
                 actions = {
                     ConnectionStatusButton(vm)
-                    OverflowMenu(onOpenSettings = onOpenSettings, onOpenAbout = onOpenAbout)
+                    OverflowMenu(
+                        onOpenSettings = onOpenSettings,
+                        onOpenAbout = onOpenAbout,
+                        extraItems = { dismiss ->
+                            DropdownMenuItem(
+                                text = { Text("Clear discovered contacts") },
+                                leadingIcon = { Icon(Icons.Default.DeleteSweep, contentDescription = null) },
+                                onClick = {
+                                    dismiss()
+                                    confirmClear = true
+                                },
+                            )
+                        },
+                    )
                 },
             )
         },
@@ -113,6 +129,25 @@ fun ExploreScreen(
                 detail = null
             },
             onDismiss = { detail = null },
+        )
+    }
+
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear discovered contacts?") },
+            text = { Text("This removes all discovered contacts from Explore. Saved contacts and chat history are kept.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        vm.clearDiscoveredContacts()
+                        confirmClear = false
+                    },
+                ) { Text("Clear") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClear = false }) { Text("Cancel") }
+            },
         )
     }
 }
@@ -197,6 +232,9 @@ private fun DiscoveredDetailDialog(
                 if (d.pubKeyHex.isNotBlank()) ExploreField("Public key", d.pubKeyHex)
                 if (d.hasGps) ExploreField("Location", "%.6f, %.6f".format(d.lat, d.lon))
                 ExploreField("Last advertised", "${formatRelative(d.lastAdvertisedMs)} (${formatClock(d.lastAdvertisedMs)})")
+                if (d.source == DiscoverySource.MESHCORE && d.nodeAdvertisedMs > 0) {
+                    ExploreField("Node advert time", "${formatRelative(d.nodeAdvertisedMs)} (${formatClock(d.nodeAdvertisedMs)})")
+                }
                 if (d.firstSeenMs > 0) ExploreField("First seen", formatRelative(d.firstSeenMs))
                 if (!isBleedge) {
                     Spacer(Modifier.size(4.dp))
