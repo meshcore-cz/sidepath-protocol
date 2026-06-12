@@ -231,6 +231,12 @@ func classify(raw []byte) (meshpkt.Packet, ForwardMode, []byte, string, error) {
 	if err != nil {
 		return meshpkt.Packet{}, 0, nil, "", err
 	}
+	// ADVERTs are broadcast node announcements — always flood them onto BLEEdge so nodes can
+	// discover the advertiser, even when MeshCore sent the advert as a DIRECT packet (which has
+	// no routable target hash and would otherwise be skipped below).
+	if pkt.Type == meshpkt.PayloadAdvert {
+		return pkt, ForwardFlood, nil, "", nil
+	}
 	switch pkt.Route {
 	case meshpkt.RouteFlood, meshpkt.RouteTransportFlood:
 		return pkt, ForwardFlood, nil, "", nil

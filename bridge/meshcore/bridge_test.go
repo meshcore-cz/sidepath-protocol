@@ -88,6 +88,27 @@ func TestClassifyDirectPacketWithoutTargetHash(t *testing.T) {
 	}
 }
 
+func TestClassifyDirectAdvertIsFlooded(t *testing.T) {
+	// A DIRECT-routed ADVERT has no routable target hash, but adverts are broadcast node
+	// announcements and must still be flooded onto BLEEdge for discovery.
+	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
+		Route:        meshpkt.RouteDirect,
+		Type:         meshpkt.PayloadAdvert,
+		PathHashSize: 2,
+		Payload:      []byte{1, 2, 3, 4},
+	})
+	if err != nil {
+		t.Fatalf("EncodePacket: %v", err)
+	}
+	_, mode, target, reason, err := classify(raw)
+	if err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	if mode != ForwardFlood || len(target) != 0 || reason != "" {
+		t.Fatalf("classify direct advert got mode=%v target=%x reason=%q", mode, target, reason)
+	}
+}
+
 func TestShouldForwardDedup(t *testing.T) {
 	b := New(Config{DedupTTL: time.Hour})
 	packet := []byte{0x11, 1, 2, 3}
