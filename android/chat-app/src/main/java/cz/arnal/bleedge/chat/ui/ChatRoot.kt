@@ -30,7 +30,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import cz.arnal.bleedge.chat.ChatViewModel
+import cz.arnal.bleedge.service.MessageNotifier
 
 /**
  * Navigation destinations, ordered by [depth] (how deep in the push stack they are). The
@@ -95,6 +99,25 @@ fun ChatRoot(vm: ChatViewModel) {
         }
     }
     BackHandler(enabled = top !is Dest.Tabs) { popTop() }
+
+    val activeConversationPeer = (top as? Dest.Conversation)?.peer
+    val lifecycleOwner = LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner, activeConversationPeer) {
+        fun syncActiveConversation() {
+            MessageNotifier.setActiveConversation(
+                activeConversationPeer
+                    ?.takeIf { lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
+            )
+        }
+
+        val observer = LifecycleEventObserver { _, _ -> syncActiveConversation() }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        syncActiveConversation()
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            MessageNotifier.setActiveConversation(null)
+        }
+    }
 
     val avatarStyle by vm.avatarStyle.collectAsState()
     CompositionLocalProvider(LocalAvatarStyle provides avatarStyle) {

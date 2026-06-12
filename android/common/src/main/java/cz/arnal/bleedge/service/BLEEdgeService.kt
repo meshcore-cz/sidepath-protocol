@@ -712,7 +712,9 @@ class BLEEdgeService : Service() {
             PayloadType.TEXT_TEST,
             PayloadType.CHANNEL,
             -> {
-                val sender = msg.fromNodeId.toHexString().take(8)
+                val peerHex = msg.fromNodeId.toHexString()
+                if (MessageNotifier.isConversationActive(peerHex)) return
+                val sender = peerHex.take(8)
                 MessageNotifier.show(
                     context = this,
                     sender = "BLEEdge · $sender",

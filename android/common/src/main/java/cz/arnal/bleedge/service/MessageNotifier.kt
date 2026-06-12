@@ -16,6 +16,15 @@ import androidx.core.content.ContextCompat
 
 object MessageNotifier {
     private const val CHANNEL_ID = "bleedge_messages"
+    @Volatile
+    private var activeConversationPeerHex: String? = null
+
+    fun setActiveConversation(peerHex: String?) {
+        activeConversationPeerHex = peerHex?.lowercase()
+    }
+
+    fun isConversationActive(peerHex: String): Boolean =
+        activeConversationPeerHex == peerHex.lowercase()
 
     fun show(
         context: Context,
