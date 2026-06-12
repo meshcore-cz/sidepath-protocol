@@ -50,8 +50,8 @@ import cz.arnal.bleedge.chat.ChatViewModel
 import cz.arnal.bleedge.chat.ThemeMode
 import cz.arnal.bleedge.chat.hexToBytes
 import cz.arnal.bleedge.chat.toHex
-import cz.arnal.bleedge.core.Identity
-import cz.arnal.bleedge.core.PHYMode
+import cz.arnal.bleedge.protocol.Identity
+import cz.arnal.bleedge.transport.PHYMode
 
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable

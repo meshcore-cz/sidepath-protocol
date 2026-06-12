@@ -84,9 +84,9 @@ private fun ConnectionStatusSheet(
     val topology by vm.topology.collectAsState()
     val running by vm.isRunning.collectAsState()
     val lastPacketAt by vm.lastPacketAtMs.collectAsState()
-    val myHex = vm.nodeId.collectAsState().value.toHexString()
+    val myHex = vm.nodeId.collectAsState().value.toHex()
 
-    val others = remember(topology, myHex) { topology.filter { it.nodeId.toHexString() != myHex } }
+    val others = remember(topology, myHex) { topology.filter { it.nodeId.toHex() != myHex } }
     val links = remember(others) { others.sumOf { it.neighborIds.size } }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -126,7 +126,7 @@ private fun ConnectionStatusSheet(
             if (onOpenTrace != null || onOpenRxLog != null) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     if (onOpenTrace != null) {
-                        val traceTarget = peers.firstOrNull()?.nodeId?.toHexString()
+                        val traceTarget = peers.firstOrNull()?.nodeId?.toHex()
                         FilledTonalButton(
                             onClick = { traceTarget?.let { onDismiss(); onOpenTrace(it) } },
                             enabled = traceTarget != null,
@@ -157,9 +157,9 @@ private fun ConnectionStatusSheet(
                 Text("None right now.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 peers.forEach { p ->
-                    val name = vm.nameForHex(p.nodeId.toHexString())
+                    val name = vm.nameForHex(p.nodeId.toHex())
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(seed = p.nodeId.toHexString(), label = name, size = 32)
+                        Avatar(seed = p.nodeId.toHex(), label = name, size = 32)
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
                             Text(name, fontWeight = FontWeight.Medium, maxLines = 1)

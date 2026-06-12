@@ -50,8 +50,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.ChatViewModel
-import cz.arnal.bleedge.core.NodeID
-import cz.arnal.bleedge.core.TraceResult
+import cz.arnal.bleedge.protocol.NodeId
+import cz.arnal.bleedge.protocol.TraceResponseBody
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -121,7 +121,7 @@ fun TraceScreen(vm: ChatViewModel, peerHex: String, onBack: () -> Unit) {
 private fun CustomRoutePanel(vm: ChatViewModel, peerHex: String) {
     val topo by vm.topology.collectAsState()
     var expanded by remember { mutableStateOf(false) }
-    var picked by remember { mutableStateOf(listOf<NodeID>()) }
+    var picked by remember { mutableStateOf(listOf<NodeId>()) }
     var manual by remember { mutableStateOf("") }
     var manualError by remember { mutableStateOf<String?>(null) }
 
@@ -160,7 +160,7 @@ private fun CustomRoutePanel(vm: ChatViewModel, peerHex: String) {
                         InputChip(
                             selected = false,
                             onClick = { picked = picked.toMutableList().also { it.removeAt(i) } },
-                            label = { Text("${i + 1}. ${vm.nameForHex(node.toHexString())}") },
+                            label = { Text("${i + 1}. ${vm.nameForHex(node.toHex())}") },
                             trailingIcon = { Icon(Icons.Default.Close, contentDescription = "Remove", Modifier.size(16.dp)) },
                         )
                     }
@@ -168,7 +168,7 @@ private fun CustomRoutePanel(vm: ChatViewModel, peerHex: String) {
             }
 
             val candidates = remember(topo) {
-                topo.map { it.nodeId }.filter { it.toHexString() != vm.myNodeHex() }
+                topo.map { it.nodeId }.filter { it.toHex() != vm.myNodeHex() }
             }
             if (candidates.isEmpty()) {
                 Text(
@@ -184,7 +184,7 @@ private fun CustomRoutePanel(vm: ChatViewModel, peerHex: String) {
                     candidates.forEach { node ->
                         AssistChip(
                             onClick = { picked = picked + node },
-                            label = { Text(vm.nameForHex(node.toHexString()), maxLines = 1) },
+                            label = { Text(vm.nameForHex(node.toHex()), maxLines = 1) },
                             leadingIcon = { Icon(Icons.Default.Add, contentDescription = null, Modifier.size(16.dp)) },
                         )
                     }
@@ -236,9 +236,9 @@ private fun Loading(text: String) {
 }
 
 @Composable
-private fun TraceResultView(result: TraceResult, rttMs: Long?, vm: ChatViewModel, onRetry: () -> Unit) {
-    val hops = result.forwardNodes.size
-    Text("Reached in $hops hop${if (hops == 1) "" else "s"} · metric: ${result.metric}", fontWeight = FontWeight.Medium)
+private fun TraceResultView(result: TraceResponseBody, rttMs: Long?, vm: ChatViewModel, onRetry: () -> Unit) {
+    val hops = result.forwardPath.size
+    Text("Reached in $hops hop${if (hops == 1) "" else "s"} · metric: ${metricName(result.metric)}", fontWeight = FontWeight.Medium)
     if (rttMs != null) {
         Text(
             "RTT: ${rttMs} ms",
@@ -250,20 +250,21 @@ private fun TraceResultView(result: TraceResult, rttMs: Long?, vm: ChatViewModel
 
     HorizontalDivider()
     Text("Forward path", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-    if (result.forwardNodes.isEmpty()) {
+    if (result.forwardPath.isEmpty()) {
         Text("Direct (no relays)", color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
-        result.forwardNodes.forEachIndexed { i, node ->
+        result.forwardPath.forEachIndexed { i, node ->
             HopRow(i + 1, node, result.forwardSamples.getOrNull(i), result.metric, vm)
         }
     }
 
-    if (result.returnNodes.isNotEmpty()) {
+    if (result.returnSamples.isNotEmpty()) {
         HorizontalDivider()
-        Text("Return path", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-        result.returnNodes.forEachIndexed { i, node ->
-            HopRow(i + 1, node, result.returnSamples.getOrNull(i), result.metric, vm)
-        }
+        Text(
+            "Return samples: ${result.returnSamples.joinToString(", ") { it.toString() }}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 
     Spacer(Modifier.size(8.dp))
@@ -275,8 +276,15 @@ private fun TraceResultView(result: TraceResult, rttMs: Long?, vm: ChatViewModel
 }
 
 @Composable
-private fun HopRow(index: Int, node: NodeID, sample: Byte?, metric: String, vm: ChatViewModel) {
-    val hex = node.toHexString()
+private fun metricName(metric: Int): String = when (metric) {
+    1 -> "rssi"
+    2 -> "snr"
+    else -> "unknown"
+}
+
+@Composable
+private fun HopRow(index: Int, node: NodeId, sample: Short?, metric: Int, vm: ChatViewModel) {
+    val hex = node.toHex()
     val profile by remember(hex) { vm.profileFor(hex) }.collectAsState()
     val label = profile.name.ifBlank { vm.nameForHex(hex) }
     val identiconKey = profile.pubKeyHex.ifBlank { null }
@@ -289,7 +297,7 @@ private fun HopRow(index: Int, node: NodeID, sample: Byte?, metric: String, vm: 
             Text(hex.take(16), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (sample != null) {
-            SignalLabel(sample.toInt(), metric)
+            SignalLabel(sample.toInt(), metricName(metric))
         }
     }
 }

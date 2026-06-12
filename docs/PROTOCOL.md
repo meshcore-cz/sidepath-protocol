@@ -1,538 +1,834 @@
 # BLEEdge Protocol Specification
 
-**Protocol version: 2**
+**Datagram protocol version: 3**
+**GATT frame version: 2**
 
-> v2 (current) adds Ed25519 node identities and signed ANNOUNCE. It is
-> intentionally incompatible with v1 (the router drops version mismatches).
+> BLEEdge is a protocol-agnostic Bluetooth Low Energy mesh transport. It routes
+> opaque datagrams between nearby nodes. MeshCore packets and future
+> application-defined protocols are carried as payloads and are not interpreted
+> by the routing engine.
 
-This document is the single source of truth for the on-the-wire behavior of the
-BLEEdge BLE Coded-PHY mesh transport. Every implementation must conform to it:
-
-| Implementation | Location | Roles |
-| --- | --- | --- |
-| Go core (reference) | `core/` | routing engine, no BLE deps |
-| Linux | `linux/`, `cmd/bleedge-listen/` | central + peripheral (BlueZ D-Bus) |
-| macOS | `macos/`, `cmd/bleedge-macos/` | central + peripheral (CoreBluetooth, 1M only) |
-| Android | `android/` | central + peripheral (Kotlin) |
-| ESP32-C6 | `firmware/xiao_esp32c6/` | peripheral-only relay hub (NimBLE) |
-
-The Go `core/` package is the **reference implementation**. When this document
-and the code disagree, `core/` wins, and this document must be corrected. The
-ESP32 `mesh.cpp` and Android Kotlin port are cross-checked against `core/`
-(see `firmware/xiao_esp32c6/test/run_tests.sh`).
-
-> Scope: this is an early PoC. LoRa, MeshCore protocol framing, encryption, and
-> auth are out of scope. The packet payload is opaque bytes.
+This document is the single source of truth for BLEEdge v3 on-the-wire behavior.
+BLEEdge v3 is intentionally incompatible with earlier proof-of-concept packet
+formats.
 
 ---
 
-## 1. Identity
+## 1. Design principles
 
-A node identity is an **Ed25519 keypair** (RFC 8032), MeshCore-compatible:
+BLEEdge has three layers:
 
-- A node stores a random **32-byte seed**; the keypair is derived from it
-  (`ed25519` public key = 32 bytes). The same seed yields the same keypair under
-  any RFC 8032 implementation — Go stdlib, BouncyCastle (Android), orlp/ed25519
-  (ESP32) — so identities and signatures interoperate. The seed is persisted
-  (`~/.bleedge/seed` on Go nodes; NVS on the ESP32) and must never be shared.
-- The **32-byte public key** is the canonical identity. It is carried in
-  `NODE_INFO` and in every ANNOUNCE, and is what signatures verify against.
-- **NodeID** (the 8-byte routing address used in packet headers) = the **first 8
-  bytes of the public key**. This keeps packet headers and advertising compact
-  (MeshCore likewise routes on a pubkey prefix). Rendered as lowercase hex.
-- NodeID ordering (`Less`) is a plain big-endian lexicographic byte compare.
-- The all-zero NodeID is reserved and means **broadcast** as a packet destination.
-
-> Reference: `core.Identity`, `core.NodeIDFromPubKey`, `core.LoadOrCreateIdentity`.
-
-### 1.1 Deterministic bootstrap name
-
-Every identity has a friendly **name** (the primary label shown in UIs), carried
-on the wire in [`NODE_INFO`](#21-gatt-service--characteristics) and
-[ANNOUNCE](#41-announce-payload). It is user-overridable, but when an identity is
-first created it gets a default derived purely from its public key, so a node
-always has a stable, human-readable label and peers can show the same default as
-a fallback until they receive the on-wire name (the ESP32 relay relies on this —
-it sends an empty name and every receiver derives this).
-
-`DefaultNodeName(pubkey)` is a deterministic, varied three-token string (e.g.
-`barrel-two-return`, `five-meadow-one`, `cedar-pine-eight`). The algorithm MUST
-match across platforms (`core.DefaultNodeName` / Kotlin `defaultNodeName` /
-C++ port):
-
-```
-d = MD5( ascii(lowercase hex of the 32-byte public key) )      # 16 bytes
-w0 = NAME_WORDS[d[0] % 64];  num = NUMBER_WORDS[d[1] % 10];  w2 = NAME_WORDS[d[2] % 64]
-switch d[3] % 3:
-  0 -> "{w0}-{num}-{w2}"
-  1 -> "{NUMBER_WORDS[d[4] % 10]}-{w0}-{NUMBER_WORDS[... ]}"   # number-word-number (num then num2=d[4])
-  2 -> "{w0}-{w2}-{num}"
+```text
+BLE GATT frame
+└── BLEEdge datagram
+    └── Payload protocol
+        ├── BLEEdge control
+        ├── MeshCore packet
+        └── application-defined protocol
 ```
 
-`NUMBER_WORDS` = `zero`..`nine`. `NAME_WORDS` is the fixed 64-entry list in
-`core/nodename.go` / `NodeName.kt` (kept identical). Shared vector: public key
-`03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8`
-→ `marble-seven-kelp` (asserted by `NodeNameTest` and the Go core tests).
+The layers have distinct responsibilities:
+
+| Layer            | Responsibility                                                                |
+| ---------------- | ----------------------------------------------------------------------------- |
+| BLE GATT frame   | Hop-local fragmentation, reassembly, and CRC validation                       |
+| BLEEdge datagram | End-to-end datagram identity, routing, TTL, deduplication, and path recording |
+| Payload protocol | Application-specific or encapsulated protocol data                            |
+
+The BLEEdge routing engine MUST treat application payloads as opaque bytes.
+Unknown payload protocols MUST still be forwarded normally.
+
+BLEEdge-native announces, acknowledgements, and diagnostics use the built-in
+`BLEEDGE_CONTROL` protocol. They MUST NOT be encoded as MeshCore packets.
 
 ---
 
-## 2. BLE layer
+## 2. Terminology
 
-### 2.1 GATT service & characteristics
-
-| Name | UUID | Properties |
-| --- | --- | --- |
-| Service | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a001` | primary |
-| `NODE_INFO` | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a002` | Read |
-| `PACKET_IN` | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a003` | Write / Write-No-Response |
-| `PACKET_OUT` | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004` | Notify |
-
-- A client **writes** a GATT frame to `PACKET_IN` to send into the mesh.
-- The server **notifies** on `PACKET_OUT` to push a GATT frame to the client.
-- Both directions carry the same [frame format](#3-gatt-frame-format).
-
-**`NODE_INFO`** identifies the peer without parsing an ANNOUNCE. The reader
-derives `NodeID = pubkey[:8]`. After the fixed 34-byte header it carries three
-length-prefixed UTF-8 strings (each ≤255 bytes), appended in order so a reader
-that stops after `desc` still parses the header + description:
-
-```
-version(1) | pubkey(32) | caps(1) | descLen(1) | desc | nameLen(1) | name | platLen(1) | platform
-```
-
-- `desc` — free-form bio (default empty).
-- `name` — primary display label. Default is the deterministic
-  [`DefaultNodeName`](#11-deterministic-bootstrap-name) derived from the public
-  key; user-overridable. An empty `name` means "derive the default from my
-  pubkey" (the ESP32 relay sends empty on purpose).
-- `platform` — OS/device string (e.g. `darwin/arm64`, `Android 14 (Pixel 7)`,
-  `esp32-c6`). Auto-set per platform, read-only.
-
-All three are informational only — **never** use them for routing or trust.
-
-### 2.2 Advertising & discovery
-
-- NodeID is advertised in **manufacturer-specific data** with company ID
-  `0xBEED`, payload = the raw 8-byte NodeID (= pubkey prefix), in the **primary**
-  advertising PDU. Peers learn each other's NodeID from the scan result without
-  connecting; the full 32-byte public key is learned later via `NODE_INFO` or
-  ANNOUNCE. (The full key does not fit a legacy advert alongside the service
-  UUID, which is why only the 8-byte prefix is advertised.)
-- The BLEEdge service UUID is also advertised.
-- A scanner accepts a device that has **either** the `0xBEED` manufacturer data
-  **or** the BLEEdge service UUID. macOS/CoreBluetooth peripherals cannot
-  broadcast manufacturer data, so they are discovered by service UUID and their
-  NodeID is read from `NODE_INFO` after connecting. **Do not** tighten scanners
-  to manufacturer-data-only — it breaks macOS interop.
-- Do not rely on a hardware `ScanFilter`: some chipsets silently drop Coded-PHY
-  extended PDUs when a filter is set. Filter app-side on the `0xBEED` data.
-
-### 2.3 Connection rule
-
-**"Whoever discovers, connects."** There is no NodeID-ordering gate on *whether*
-to connect (that deadlocks under asymmetric discovery). Instead, mutual
-double-connections are collapsed deterministically: of the two links between the
-same NodeID pair, the node with the **larger** NodeID drops its outgoing link and
-keeps the inbound one. Dedup links by NodeID.
-
-### 2.4 PHY modes
-
-Selectable per node; default is **`1m`**:
-
-| Mode string | Meaning |
-| --- | --- |
-| `1m` | 1M PHY only (default, universally supported for adv + scan) |
-| `coded-preferred` | prefer Coded PHY, fall back to 1M |
-| `coded-only` | Coded PHY (Long Range) only |
-
-> Legacy stored value `"1m-debug"` maps to `1m`.
-
-**Known limitation:** many devices report Coded-PHY support and can *advertise*
-on it but cannot reliably *scan/receive* coded extended advertisements, so they
-never discover each other on `coded-only`. Android exposes no API for coded-scan
-capability. Use `1m` for interop testing.
+| Term                 | Meaning                                                               |
+| -------------------- | --------------------------------------------------------------------- |
+| **Node**             | A BLEEdge participant with an Ed25519 identity                        |
+| **NodeID**           | Compact 10-byte BLEEdge routing address derived from the public key   |
+| **Peer link**        | One direct BLE connection between two BLEEdge nodes                   |
+| **Frame**            | Hop-local GATT transport unit carrying one fragment                   |
+| **Datagram**         | End-to-end BLEEdge routing unit reconstructed from one or more frames |
+| **Payload protocol** | Protocol identified by the datagram `protocol` field                  |
+| **Control message**  | BLEEdge-native message carried using `BLEEDGE_CONTROL`                |
+| **Gateway**          | Node that injects or extracts packets for another protocol            |
 
 ---
 
-## 3. GATT frame format
+## 3. Identity
 
-A frame is the GATT transport unit. A mesh packet (section 4) is CBOR-encoded,
-then split into one or more frames that fit the negotiated MTU.
+A BLEEdge node identity is an Ed25519 keypair as specified by RFC 8032.
 
-**Big-endian, fixed 23-byte header + data:**
+* A node stores a random 32-byte Ed25519 seed.
+* The seed MUST be persisted and MUST NOT be shared.
+* The canonical identity is the 32-byte Ed25519 public key.
+* `NodeID = public_key[0:10]`.
+* NodeID values are rendered as lowercase hexadecimal.
+* NodeID ordering is a plain lexicographic byte comparison.
+* The all-zero NodeID is reserved and means broadcast when used as a datagram
+  destination.
 
+The full public key is authoritative. NodeID is only a compact routing address.
+If an implementation encounters two different public keys with the same NodeID,
+it MUST report an identity collision and MUST NOT silently merge them.
+
+### 3.1 Deterministic fallback name
+
+A node MAY derive a deterministic human-readable fallback name from its public
+key. This name is a UI fallback only. It MUST NOT be used for routing,
+authorization, or trust decisions.
+
+A user-configured name is distributed through the signed `ANNOUNCE` control
+message. Until an `ANNOUNCE` has been verified, a UI SHOULD display either the
+deterministic fallback name or the NodeID.
+
+---
+
+## 4. BLE layer
+
+### 4.1 GATT service and characteristics
+
+| Name         | UUID                                   | Properties                     |
+| ------------ | -------------------------------------- | ------------------------------ |
+| Service      | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a001` | Primary                        |
+| `NODE_INFO`  | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a002` | Read                           |
+| `PACKET_IN`  | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a003` | Write / Write Without Response |
+| `PACKET_OUT` | `9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004` | Notify                         |
+
+A client writes frames to `PACKET_IN`. A server emits frames through
+`PACKET_OUT`. Both directions use the same frame format.
+
+### 4.2 `NODE_INFO`
+
+`NODE_INFO` is bootstrap-only. It allows a newly connected peer to bind a direct
+BLE connection to a public key before receiving a routed signed announce.
+
+Binary layout:
+
+```text
+version(1) | public_key(32) | provisional_caps(2)
 ```
+
+| Field              | Type                 | Meaning                        |
+| ------------------ | -------------------- | ------------------------------ |
+| `version`          | uint8                | Must equal `1`                 |
+| `public_key`       | 32 bytes             | Ed25519 public key             |
+| `provisional_caps` | uint16 little-endian | Optional early capability hint |
+
+`NODE_INFO` is not signed. Therefore:
+
+* `public_key` is used only to identify the directly connected peer.
+* `provisional_caps` is advisory and MUST NOT be treated as authoritative.
+* Name, description, platform, neighbor list, and authoritative capabilities are
+  distributed only through signed `ANNOUNCE` messages.
+
+### 4.3 Advertising and discovery
+
+A node SHOULD advertise:
+
+* the BLEEdge service UUID; and
+* manufacturer-specific data with company ID `0xBEED` and payload equal to the
+  raw 10-byte NodeID.
+
+A scanner MUST accept a device that advertises either the manufacturer data or
+the BLEEdge service UUID. Service-UUID-only discovery is required for platforms
+that cannot advertise manufacturer-specific data.
+
+A scanner SHOULD apply BLEEdge filtering in application code rather than relying
+on a hardware scan filter, because hardware filtering can interfere with BLE
+Coded-PHY discovery on some devices.
+
+### 4.4 Connection rule
+
+Whoever discovers a peer MAY connect.
+
+Mutual duplicate connections are collapsed deterministically. For a pair of
+NodeIDs, the node with the larger NodeID drops its outgoing link and keeps the
+incoming link. Peer links are deduplicated by NodeID.
+
+### 4.5 PHY modes
+
+| Mode              | Meaning                                  |
+| ----------------- | ---------------------------------------- |
+| `1m`              | Use BLE 1M PHY only                      |
+| `coded-preferred` | Prefer BLE Coded PHY and fall back to 1M |
+| `coded-only`      | Use BLE Coded PHY only                   |
+
+The default is `1m` for interoperability.
+
+---
+
+## 5. GATT frame format
+
+A frame is a hop-local fragment of a serialized BLEEdge datagram.
+
+The frame header is fixed-width and big-endian except where explicitly stated.
+
+```text
 offset  size  field
-0       1     version          (= 1)
-1       16    packet_id        (matches the packet's CBOR id field)
-17      1     fragment_index   (0-based)
-18      1     fragment_count    (total fragments for this packet_id)
-19      4     payload_crc32    (CRC-32/IEEE of the *entire* reassembled packet bytes)
-23      N     data             (this fragment's slice of the packet bytes)
+0       1     frame_version
+1       16    transfer_id
+17      1     fragment_index
+18      1     fragment_count
+19      4     payload_crc32
+23      N     data
 ```
 
-### 3.1 Fragmentation
+| Field            | Meaning                                                      |
+| ---------------- | ------------------------------------------------------------ |
+| `frame_version`  | Must equal `2`                                               |
+| `transfer_id`    | Random hop-local identifier for this serialized transmission |
+| `fragment_index` | Zero-based fragment index                                    |
+| `fragment_count` | Total number of fragments                                    |
+| `payload_crc32`  | CRC-32/IEEE of the complete serialized BLEEdge datagram      |
+| `data`           | Fragment bytes                                               |
 
-A frame must fit in a single GATT write, i.e. `frame_size <= ATT_MTU - 3` (the
-ATT opcode + handle cost 3 bytes). Within that budget the header costs 23 bytes,
-so `data_per_frame = frame_size - 23`.
+### 5.1 `transfer_id` and datagram `id`
 
-**All implementations use one shared maximum frame size: `MAX_FRAME_SIZE = 200`
-bytes** (→ `data_per_frame = 200 - 23 = 177`). Rationale:
+`transfer_id` is hop-local. Datagram `id` is end-to-end.
 
-- Nodes request an ATT MTU of 512, but a node fragments a broadcast or relayed
-  packet **once** and sends the identical frames to every neighbor. Those frames
-  must therefore fit the **smallest** peer's link. The ESP32 relay negotiates an
-  ATT MTU of 247 (→ max frame 244), so a fixed cap of 200 is safe for everyone.
-- Reassembly is size-agnostic (it concatenates by index and checks CRC), so a
-  uniform small frame size costs nothing in interop and keeps all four
-  implementations byte-for-byte identical.
+They MUST NOT be treated as the same value.
 
-This constant is `core.MaxFrameSize` (Go), `MAX_FRAME_SIZE` (Kotlin), and
-`FRAGMENT_MTU` (firmware) — they must stay equal. Do **not** fragment using the
-raw negotiated 512: a 512-byte frame cannot be written to the ESP32's 247-MTU
-link. `core.FragmentPacket(data, mtu, id)`'s `mtu` argument is the max **frame**
-size (it subtracts the 23-byte header internally) — pass `MaxFrameSize`.
+* A relay keeps the datagram `id` unchanged.
+* A relay MUST generate a new `transfer_id` when it serializes a datagram for an
+  outgoing transmission.
+* A sender MAY reuse one `transfer_id` when sending identical serialized bytes to
+  multiple direct neighbors as part of the same transmission batch.
+* Reassembly buffers MUST be keyed by `(peer_link, transfer_id)`.
 
-- All frames of one packet share the same `packet_id`, `fragment_count`, and
-  `payload_crc32`. `fragment_index` runs `0 .. fragment_count-1`.
+This prevents fragments from distinct links or differently mutated relay copies
+from colliding during flood propagation.
 
-### 3.2 Reassembly
+### 5.2 Fragmentation
 
-- Collect frames by `packet_id`. Duplicate `fragment_index` values are ignored.
-- When all `fragment_count` indices are present, concatenate by index and verify
-  CRC-32 over the result. **CRC mismatch → drop.**
-- Reassembly buffers time out after **10 s** without a new fragment.
+All implementations MUST use:
+
+```text
+MAX_FRAME_SIZE = 200 bytes
+HEADER_SIZE    = 23 bytes
+MAX_FRAME_DATA = 177 bytes
+```
+
+A frame MUST fit within one GATT write. Nodes MAY negotiate a larger ATT MTU,
+but MUST NOT exceed `MAX_FRAME_SIZE` for BLEEdge frames.
+
+All frames belonging to one transmission share the same `transfer_id`,
+`fragment_count`, and `payload_crc32`.
+
+### 5.3 Reassembly
+
+A receiver:
+
+1. groups fragments by `(peer_link, transfer_id)`;
+2. ignores duplicate `fragment_index` values;
+3. concatenates fragments in index order after all fragments are present;
+4. verifies CRC-32/IEEE over the complete serialized datagram; and
+5. drops the transmission on CRC mismatch.
+
+Incomplete reassembly buffers expire after 10 seconds without a new fragment.
 
 ---
 
-## 4. Mesh packet (CBOR)
+## 6. BLEEdge datagram
 
-Packets are CBOR maps with **compact integer keys** (not string keys) for
-cross-language compactness. Field order is irrelevant; keys are authoritative.
+A BLEEdge datagram is encoded as a CBOR map with compact integer keys. Field
+order is irrelevant. Keys are authoritative.
 
-| Key | Field | Type | Notes |
-| --- | --- | --- | --- |
-| 1 | `version` | uint8 | must equal `1`, else drop |
-| 2 | `type` | uint8 | 1=DATA, 2=ANNOUNCE, 3=ACK |
-| 3 | `id` | 16 bytes | random per packet; dedup key |
-| 4 | `source` | 8 bytes | originating NodeID |
-| 5 | `destination` | 8 bytes | zero = broadcast |
-| 6 | `mode` | uint8 | 1=FLOOD, 2=SOURCE_ROUTE |
-| 7 | `ttl` | uint8 | decremented per hop |
-| 8 | `route_cursor` | uint8 | index into `route` (source-route) |
-| 9 | `route` | array of 8-byte | ordered next-hops (source-route) |
-| 10 | `trace` | array of 8-byte | hops visited so far (appended per hop) |
-| 11 | `payload_type` | uint8 | 1=TEXT_TEST, 2=MESHCORE_RAW, 3=CHAT_PLAIN, 4=CHAT_ENCRYPTED, 5=CHANNEL, 6=TRACE_REQ, 7=TRACE_RESP, 8=TYPING |
-| 12 | `payload` | bytes | opaque |
-| 13 | `seq` | uint32 | ANNOUNCE sequence; omitted when 0 |
-| 14 | `trace_metric` | array of int8 | optional TRACE link samples; metric meaning is payload-specific |
+| Key | Field          | Type               | Required | Notes                                             |
+| --: | -------------- | ------------------ | -------- | ------------------------------------------------- |
+|   1 | `version`      | uint8              | yes      | Must equal `3`                                    |
+|   2 | `id`           | bytes(16)          | yes      | Random end-to-end datagram ID                     |
+|   3 | `source`       | bytes(10)          | yes      | Originating NodeID                                |
+|   4 | `destination`  | bytes(10)          | yes      | Zero NodeID means broadcast                       |
+|   5 | `ttl`          | uint8              | yes      | Remaining BLEEdge hop budget                      |
+|   6 | `route`        | array of bytes(10) | no       | Explicit source route, including destination      |
+|   7 | `route_cursor` | uint8              | no       | Index of the next expected route hop; default `0` |
+|   8 | `path`         | array of bytes(10) | no       | Nodes visited so far; default empty               |
+|   9 | `protocol`     | uint16             | yes      | Payload protocol registry value                   |
+|  10 | `flags`        | uint16             | no       | Routing flags; default `0`                        |
+|  11 | `payload`      | bytes              | yes      | Opaque protocol-specific payload                  |
 
-> Note: the GATT frame `packet_id` (16 bytes) is the same value as packet key 3.
+### 6.1 Routing mode
 
-### 4.1 ANNOUNCE payload
+Routing mode is inferred:
 
-When `type == 2`, `payload` (key 12) is itself a CBOR map:
+* missing or empty `route` means TTL-limited flood routing;
+* non-empty `route` means source routing.
 
-| Key | Field | Type |
-| --- | --- | --- |
-| 1 | `node_id` | 8 bytes (= `public_key[:8]`) |
-| 2 | `caps` | uint8 (capability bitmask) |
-| 3 | `neighbors` | array of 8-byte NodeID |
-| 4 | `seq` | uint32 |
-| 5 | `timestamp` | int64 (unix seconds) |
-| 6 | `public_key` | 32 bytes (Ed25519) |
-| 7 | `signature` | 64 bytes (Ed25519) |
-| 8 | `description` | text string — free-form bio (**not** signed) |
-| 9 | `name` | text string — primary display label (**not** signed) |
-| 10 | `platform` | text string — OS/device string (**not** signed) |
+A source route contains each receiving node in order, including the final
+destination. For direct unicast delivery, use:
 
-Keys 8/9/10 mirror the [`NODE_INFO`](#21-gatt-service--characteristics) tail and
-carry the same meaning. `name` defaults to the deterministic
-[`DefaultNodeName`](#11-deterministic-bootstrap-name) and is user-overridable;
-an empty `name` means peers derive that default from `public_key`. `platform`
-is the auto OS/device string. None are covered by the signature and must never
-be used for routing or trust — they are informational only. Each is a CBOR
-**text** string (major type 3), so it decodes to a native string on every
-platform. They are `omitempty` on encode (Go); decoders treat any missing
-key as `""`.
-
-**Signed message.** `signature` is an Ed25519 signature, by the node's identity
-key, over a **fixed explicit byte layout** (not the CBOR — CBOR is not byte-stable
-across libraries). Every implementation builds it identically
-(`core.AnnounceSignedMessage` / `mesh::announceSignedMessage`):
-
-```
-public_key      [32]
-timestamp       [4]  uint32 little-endian (unix seconds, low 32 bits)
-caps            [1]
-seq             [4]  uint32 little-endian
-neighbor_count  [1]
-neighbors       [neighbor_count * 8]   each NodeID, in ANNOUNCE order
+```text
+route = [destination]
 ```
 
-A receiver **must**, before trusting an ANNOUNCE: check `public_key` is 32 bytes,
-check `node_id == public_key[:8]` and `packet.source == public_key[:8]`, then
-verify the signature. Any failure → drop as `bad-signature` and **do not relay**.
-(The ESP32 relay forwards opaque flood packets and on-track TRACE source-route
-packets without verifying; verifying endpoints reject forgeries.)
+For source-routed datagrams:
 
-### 4.2 Capabilities bitmask
+* `route[0]` is the first receiving hop;
+* `route[len(route)-1]` MUST equal `destination`;
+* `route_cursor` identifies the node that is expected to receive the datagram
+  next.
 
-| Bit | Flag | Name |
-| --- | --- | --- |
-| 0x01 | sender | `CapSender` |
-| 0x02 | receiver | `CapReceiver` |
-| 0x04 | relay | `CapRelay` |
-| 0x08 | gateway | `CapGateway` |
-| 0x10 | coded-phy | `CapCodedPHY` |
+### 6.2 TTL policy
 
-Conventional role sets:
-- Android: `sender | receiver | relay | coded-phy`
-- Linux: `receiver | gateway | coded-phy`
+TTL remains mandatory for every BLEEdge datagram. Deduplication suppresses
+ordinary duplicate deliveries, while TTL provides a hard propagation bound
+across cache expiry, node restarts, malformed traffic, and accidentally bridged
+BLEEdge scopes.
 
-`String()` renders flags pipe-joined (`sender|relay|...`) or `none`.
-
-### 4.3 Chat payloads (Android chat-app)
-
-The Android chat-app rides on top of the transport using two `payload_type`s; the
-mesh treats both as opaque `payload` and routes them like any other DATA packet
-(Go/firmware nodes still relay them without interpreting).
-
-- **`CHAT_PLAIN` (3)** — broadcast "channel" message. `payload` is UTF-8 text,
-  `destination = 0` (broadcast), FLOOD. Not encrypted.
-- **`CHAT_ENCRYPTED` (4)** — direct message, end-to-end encrypted to the
-  recipient's identity key. `payload` is a CBOR map:
-
-  | Key | Field | Type |
-  | --- | --- | --- |
-  | 1 | `sender_pub` | 32 bytes (sender's Ed25519 public key) |
-  | 2 | `iv` | 12 bytes (AES-GCM nonce) |
-  | 3 | `ciphertext` | bytes (AES-256-GCM, 16-byte tag appended) |
-
-  Key agreement: both identity keys are mapped from Ed25519 to X25519 (the
-  libsodium `crypto_sign_ed25519_*_to_curve25519` transform), then a
-  static↔static X25519 ECDH shared secret is run through HKDF-SHA256
-  (`info = "bleedge-chat-v1"`) to a 32-byte AES key. Because the secret is
-  symmetric, the recipient re-derives the key from `sender_pub` (carried in the
-  envelope) and its own private key. The sender's public key is learned from the
-  recipient's signed ANNOUNCE (key 6).
-
-  ESP32 relay nodes also consume encrypted direct messages addressed to their own
-  NodeID as remote-control commands. The command sender is authenticated by the
-  envelope's `sender_pub`: it must match a build-time or NVS-stored admin public
-  key, otherwise the node replies with `not authenticated`. Commands are firmware
-  local behavior (`help`, `sensors`, `stats`, `admins`, `admin.add`, `admin.remove`)
-  and are not interpreted by the routing layer.
-
-- **`TYPING` (8)** — ephemeral "peer is typing" hint. A unicast DATA packet with an
-  **empty** `payload`, addressed to the conversation peer. It is a pure client-side
-  affordance and carries no content: the routing layer treats it like any other DATA
-  packet for relaying, but it is **never ACKed** (routers skip ACK generation for
-  `TYPING`, alongside `TRACE_*`). The sender re-emits it every ~10 s while the user is
-  actively typing and stops on send / idle / leaving the chat. The receiver shows it
-  transiently and drops it on a timeout (~13 s) or immediately when a real message
-  arrives from that peer. The ESP32 relay emits one before replying to an admin command
-  so the sender sees activity during the slow key verification. No persistence, no
-  retransmit guarantees — drops are harmless.
-
-### 4.4 Channels — MeshCore-compatible (`CHANNEL`, payload_type 5)
-
-Group channels mirror MeshCore (`meshcore-cz/meshpkt`) so they can interoperate. A
-channel is identified by a 16-byte pre-shared key (PSK). The BLEEdge `payload` (key 12)
-**is** the MeshCore GRP_TXT payload, broadcast (`destination = 0`, FLOOD):
-
-```
-payload     = channelHash[1] | mac[2] | ciphertext[...]
-plaintext   = timestamp[4 LE] | flags[1] | "SenderName: MessageText"   (zero-padded to 16)
-ciphertext  = AES-128-ECB(secret, plaintext)
-mac         = HMAC-SHA256(key = secret16 ‖ zero16, ciphertext)[:2]
-channelHash = SHA-256(secret)[0]
+```text
+MAX_TTL           = 16
+DEFAULT_FLOOD_TTL = 5
+MAX_ROUTE_HOPS    = 16
+ANNOUNCE_TTL      = 5
 ```
 
-`flags`: upper 6 bits = text type (0 = plain), lower 2 = attempt count.
+TTL counts receiving hops:
 
-PSK derivation by channel kind:
-- **Public** — fixed PSK `8b3387e9c5cdea6ac9e5edbaa115cd72` (channelHash `0x11`).
-- **Named ("public hash")** — `secret = SHA-256(name)[:16]`.
-- **Secret** — a user-supplied 16-byte key (32 hex chars used raw; otherwise `SHA-256(passphrase)[:16]`).
+* `ttl = 1` reaches one directly connected peer and is not relayed further;
+* `ttl = 5` reaches nodes up to five BLEEdge hops away;
+* `ttl = 0` is invalid on reception;
+* an incoming datagram with `ttl > MAX_TTL` MUST be dropped; and
+* a source-routed datagram MUST use `ttl = len(route)` when originated.
 
-A receiver matches an inbound packet to a joined channel by `channelHash`, then confirms
-with the MAC (the hash is 1 byte, so collisions are resolved by which PSK's MAC verifies).
-Reference impls: Kotlin `core.ChannelCrypto` and Go `core.SealChannel`/`OpenChannel` (byte-identical). Broadcast → no per-message ACK.
+Applications MAY deliberately choose a smaller flood TTL for local-only traffic.
+They SHOULD use source routing rather than continually increasing flood TTL for
+larger known paths.
 
-### 4.5 Trace (`TRACE_REQ` payload_type 6, `TRACE_RESP` payload_type 7)
+### 6.3 Datagram flags
 
-Trace is a diagnostic round trip similar to `ping`/`traceroute`: the originator
-chooses a destination and optionally a specific source route. The request follows
-that path, each receiver records a link metric, and the destination sends a
-`TRACE_RESP` back along the reversed observed path.
+|      Bit | Name            | Meaning                                                      |
+| -------: | --------------- | ------------------------------------------------------------ |
+| `0x0001` | `ACK_REQUESTED` | Destination should return a BLEEdge ACK after local delivery |
 
-`TRACE_REQ` intentionally starts with the MeshCore TRACE payload layout so the
-diagnostic body can be made radio-compatible later:
+Rules:
 
-```
-payload = tag[4 LE] | auth_code[4 LE] | flags[1] | route_hashes[...]
-```
+* `ACK_REQUESTED` is valid only for unicast datagrams.
+* A BLEEdge ACK MUST NOT request another BLEEdge ACK.
+* Unknown flag bits MUST be ignored when forwarding.
+* Application-specific behavior MUST NOT be added to the routing engine.
+  Payload protocols decide whether a datagram needs `ACK_REQUESTED`.
 
-- `tag` is a random request identifier echoed by the response.
-- `auth_code` is opaque and forwarded/echoed; current BLEEdge does not validate
-  it cryptographically.
-- `flags & 0x03` selects each `route_hash` width: `0=1 byte`, `1=2 bytes`,
-  `2=4 bytes`, `3=8 bytes`.
-- BLEEdge uses 8-byte NodeID route hashes (`flags & 0x03 == 3`) for exact routes.
+### 6.4 Payload protocol registry
 
-MeshCore stores TRACE SNR samples in its outer path accumulator. BLEEdge keeps
-normal route loop detection in `trace` (key 10), so TRACE link samples live in
-packet key 14, `trace_metric`. The values are signed 8-bit samples whose unit is
-declared by the result payload. On macOS/CoreBluetooth the metric is `rssi` in
-dBm because CoreBluetooth does not expose LoRa SNR; future LoRa/Coded-PHY radio
-implementations may use `snr` encoded as MeshCore-style `int8 = SNR * 4`.
+|             Value | Name              | Payload                                                  |
+| ----------------: | ----------------- | -------------------------------------------------------- |
+|          `0x0000` | `BLEEDGE_CONTROL` | BLEEdge-native control message                           |
+|          `0x0001` | `MESHCORE_PACKET` | Complete encoded MeshCore packet                         |
+|          `0x0100` | `BLEEDGE_CHAT`    | Native messenger payload specified in `CHAT_PROTOCOL.md` |
+| `0x0002`–`0x00ff` | unassigned        | Reserved for future registered payload protocols         |
+| `0x0101`–`0x7fff` | unassigned        | Reserved for future registered payload protocols         |
+| `0x8000`–`0xffff` | experimental      | Private or unstable payload protocols                    |
 
-`TRACE_RESP` payload is a CBOR map with compact integer keys:
+Unknown protocol values MUST be forwarded as opaque payloads.
 
-| Key | Field | Type | Notes |
-| --- | --- | --- | --- |
-| 1 | `tag` | uint32 | copied from request |
-| 2 | `auth_code` | uint32 | copied from request |
-| 3 | `route` | array of 8-byte NodeID | requested source route |
-| 4 | `forward_nodes` | array of 8-byte NodeID | nodes that handled request |
-| 5 | `forward_samples` | array of int8 | request-leg `trace_metric` samples |
-| 6 | `return_nodes` | array of 8-byte NodeID | nodes that handled response; filled by final receiver |
-| 7 | `return_samples` | array of int8 | response-leg `trace_metric` samples; filled by final receiver |
-| 8 | `metric` | text | currently `rssi`; reserved value `snr` for SNR-capable radios |
-
-TRACE requests do not generate generic ACK packets. The trace response is the
-delivery confirmation. If no explicit route is supplied, a node first tries
-`SelectRoute(dst)` (section 5.5). If no route is known, the trace is not sent.
-TRACE packets must not be flood-relayed: only nodes on the selected source-route
-track may repeat the request or response.
+Encapsulated protocols MUST carry complete packets. BLEEdge MUST NOT copy
+selected inner fields into the BLEEdge header or partially reimplement inner
+packet semantics.
 
 ---
 
-## 5. Routing engine
+## 7. BLEEdge control protocol
 
-All nodes run the same decision logic (`core.Router.HandlePacket`). It is pure:
-given an incoming packet and the peer it arrived from, it returns a list of
-**actions** for the transport to execute (`deliver-local`, `relay-flood`,
-`relay-next-hop`, `send-ack`, `drop`).
+A control message is carried in a datagram with:
 
-### 5.1 Common checks (every packet)
+```text
+protocol = BLEEDGE_CONTROL
+```
 
-1. **Version**: `version != 2` → drop (`invalid-version`).
-2. **Allowlist** (optional): if a non-empty allowlist is configured and the
-   incoming peer is not in it → drop (`peer-not-allowed`).
-3. ANNOUNCE (`type==2`): **verify the signature and NodeID/pubkey binding**
-   (section 4.1) → drop `bad-signature` on failure; otherwise update local
-   [topology](#54-topology) then flood.
+The datagram `payload` is a CBOR map:
 
-### 5.2 FLOOD mode (`mode == 1`)
+| Key | Field  | Type     |
+| --: | ------ | -------- |
+|   1 | `kind` | uint8    |
+|   2 | `body` | CBOR map |
 
-1. **Dedup**: if `id` already in the seen-cache → drop (`duplicate`).
-2. **Loop**: if `LocalID` already appears in `trace` → drop (`loop`).
-3. **TTL**: if `ttl == 0` → drop (`ttl-exhausted`).
-4. Append `LocalID` to `trace`.
-5. **Deliver locally** if broadcast or `destination == LocalID`. For a *unicast*
-   DATA packet addressed to us, also emit an ACK (section 5.4), except
-   `TRACE_REQ` (which returns a `TRACE_RESP` instead) and `TYPING` (never ACKed).
-6. **Relay** if `ttl > 1` and (broadcast or not addressed to us): decrement TTL
-   and re-flood. The incoming peer is excluded from the relay set (split-horizon).
-   TRACE packets are never re-flooded.
+Control kinds:
 
-Apply **flood jitter** of a random 10–100 ms before relaying to reduce collisions.
+| Value | Name             | Purpose                                           |
+| ----: | ---------------- | ------------------------------------------------- |
+|     1 | `ANNOUNCE`       | Publish signed node metadata and direct neighbors |
+|     2 | `ACK`            | Confirm local delivery of one datagram            |
+|     3 | `TRACE_REQUEST`  | Request BLEEdge-native route diagnostics          |
+|     4 | `TRACE_RESPONSE` | Return BLEEdge-native route diagnostics           |
 
-### 5.3 SOURCE_ROUTE mode (`mode == 2`)
-
-1. Dedup, loop, TTL checks as above.
-2. If `route[route_cursor] != LocalID` → drop (`not-next-hop`).
-3. Append self to `trace`, increment `route_cursor`, decrement `ttl`.
-4. If `route_cursor >= len(route)` we are the destination → deliver locally
-   (+ ACK for DATA except `TRACE_REQ`). Otherwise relay to `route[route_cursor]`
-   (`relay-next-hop`).
-
-### 5.4 ACK (`type == 3`)
-
-ACKs are generated automatically for **unicast DATA** that is delivered locally,
-except `TRACE_REQ` and `TYPING` packets (both opt out of ACK):
-
-- `destination = original.source`, `ttl = len(trace)+1`.
-- If the inbound `trace` had >1 hop, the ACK is sent **SOURCE_ROUTE** along the
-  reversed trace (excluding self) **with the original `source` appended as the final
-  hop** — source-route delivery happens by route exhaustion and the originator is not
-  in the trace, so without the appended source the ACK would stop at the last relay.
-  If the `trace` had ≤1 hop, the ACK is **FLOOD**.
-- The originator records the ACK's own `id` in its dedup cache so a flood echo of
-  its own ACK is dropped rather than re-flooded. The same applies to *any* packet
-  a node originates (`MarkOriginated`).
-- The ACK `payload` (key 12) carries the 16-byte `id` of the DATA packet being
-  acked, so an originator can match a delivery confirmation to a specific outgoing
-  message. (Additive; relays/nodes that don't track per-message delivery ignore it.
-  Implemented in the Android router; the ESP32 relay also sets it when ACKing a DM
-  addressed to it. Go nodes currently leave the ACK payload empty.)
-
-### 5.5 Route selection
-
-`SelectRoute(dst)`:
-- If `dst` is a direct neighbor → send direct (no source route).
-- Else BFS over learned topology for a path; if found → SOURCE_ROUTE.
-- Else → fall back to FLOOD.
-
-The macOS app exposes this as `/route <nodeid>` and uses the same selection for
-`/trace <nodeid>` when no explicit `via` route is supplied. Trace requires a
-known route; it does not use the generic flood fallback.
+Unknown control kinds MUST be ignored after local delivery. Relays MAY forward
+unknown control kinds according to the outer BLEEdge routing rules.
 
 ---
 
-## 6. State tables & timing
+## 8. Signed `ANNOUNCE`
 
-| Table | Purpose | Size / TTL | Reap cadence |
-| --- | --- | --- | --- |
-| Dedup cache | drop already-seen `id` | 4096 entries, 5-min TTL, evict-oldest when full | 1 min |
-| Neighbor table | directly-connected peers | 60 s timeout | 10 s |
-| Topology | global graph from ANNOUNCEs | 90 s expiry | 15 s |
-| Reassembler | in-flight fragments | 10 s timeout | 5 s |
+An `ANNOUNCE` publishes a node's authoritative BLEEdge identity metadata,
+capabilities, and directly connected neighbors.
 
-- **ANNOUNCE interval: 15 s, TTL 3.**
-- Topology `Update` ignores stale ANNOUNCEs (`seq <= existing seq`).
-- **Neighbor learning from received traffic** (Go nodes + ESP32, **not** Android):
-  on every received packet, the directly-connected peer = last `trace` hop (or
-  `source` if trace empty) is upserted/touched as a neighbor. This lets an
-  inbound-only node (e.g. the ESP32 relay) report neighbors in its ANNOUNCE.
-  Android intentionally omits this to preserve its inbound peer-card display.
+Every field in the announce body except the signature itself is signed.
+
+### 8.1 Outer datagram
+
+An announce datagram MUST use:
+
+```text
+source      = announcing node NodeID
+destination = broadcast
+route       = omitted
+ttl         = ANNOUNCE_TTL  # 5
+protocol    = BLEEDGE_CONTROL
+flags       = 0
+kind        = ANNOUNCE
+```
+
+### 8.2 Announce body
+
+| Key | Field              | Type               | Required | Notes                                                                            |
+| --: | ------------------ | ------------------ | -------- | -------------------------------------------------------------------------------- |
+|   1 | `announce_version` | uint8              | yes      | Must equal `1`                                                                   |
+|   2 | `public_key`       | bytes(32)          | yes      | Ed25519 public key                                                               |
+|   3 | `epoch`            | uint64             | yes      | Persisted generation counter incremented before the first announce after startup |
+|   4 | `seq`              | uint32             | yes      | Monotonically increasing within one `epoch`                                      |
+|   5 | `timestamp`        | int64              | yes      | Unix seconds; use `0` when no reliable clock exists                              |
+|   6 | `caps`             | uint16             | yes      | Capability bitmask                                                               |
+|   7 | `neighbors`        | array of bytes(10) | yes      | Directly connected NodeIDs, sorted and unique                                    |
+|   8 | `name`             | text               | yes      | User-configured display name or empty string                                     |
+|   9 | `description`      | text               | yes      | Free-form description or empty string                                            |
+|  10 | `platform`         | text               | yes      | Platform string or empty string                                                  |
+|  11 | `signature`        | bytes(64)          | yes      | Ed25519 signature                                                                |
+
+Constraints:
+
+| Field         | Maximum encoded content length |
+| ------------- | -----------------------------: |
+| `neighbors`   |                    255 entries |
+| `name`        |                 64 UTF-8 bytes |
+| `description` |                255 UTF-8 bytes |
+| `platform`    |                 64 UTF-8 bytes |
+
+`neighbors` MUST be sorted lexicographically and MUST NOT contain duplicates.
+
+An empty `name` means that peers SHOULD display the deterministic fallback name
+derived from `public_key`.
+
+### 8.3 Announce signature message
+
+The Ed25519 signature MUST cover a fixed explicit binary layout rather than the
+CBOR encoding. This avoids cross-library differences in CBOR serialization.
+
+The signed byte sequence is:
+
+```text
+ascii("BLEEDGE-ANNOUNCE-V1\0")
+announce_version       [1]
+public_key             [32]
+epoch                  [8]   uint64 little-endian
+seq                    [4]   uint32 little-endian
+timestamp              [8]   int64 little-endian
+caps                   [2]   uint16 little-endian
+neighbor_count         [2]   uint16 little-endian
+neighbors              [neighbor_count * 10]
+name_length            [2]   uint16 little-endian
+name_utf8              [name_length]
+description_length     [2]   uint16 little-endian
+description_utf8       [description_length]
+platform_length        [2]   uint16 little-endian
+platform_utf8          [platform_length]
+```
+
+The signature is:
+
+```text
+signature = Ed25519.Sign(private_key, signed_bytes)
+```
+
+### 8.4 Announce verification
+
+Before accepting or relaying an announce, a verifying node MUST:
+
+1. decode the control payload and announce body;
+2. require `announce_version == 1`;
+3. require `public_key` to be exactly 32 bytes;
+4. derive `node_id = public_key[0:10]`;
+5. require outer datagram `source == node_id`;
+6. validate length limits;
+7. require the neighbor list to be sorted and unique;
+8. reconstruct the exact signed byte sequence;
+9. verify the Ed25519 signature; and
+10. reject the announce on any failure.
+
+A valid announce MAY then update topology state and MAY be flood-relayed.
+
+Nodes that cannot verify Ed25519 signatures MAY relay an opaque announce for
+constrained-device interoperability, but MUST NOT update trusted topology or
+display the announce as verified. Full implementations MUST verify announces
+before using them.
+
+### 8.5 Announce freshness
+
+A node MUST persist an unsigned 64-bit `epoch` counter alongside its identity.
+Before emitting the first announce after process or device startup, it MUST
+increment and persist `epoch`. It then emits a new announce every 15 seconds with
+an incremented in-memory `seq` value.
+
+Topology state stores `(public_key, epoch, seq, received_at)` per NodeID.
+
+An announce is newer only when:
+
+* its `epoch` is greater than the stored `epoch`; or
+* its `epoch` equals the stored `epoch` and its `seq` is greater than the stored
+  `seq`.
+
+An announce with a lower `epoch`, or with an equal `epoch` and non-increasing
+`seq`, is stale and MUST NOT replace newer topology state. This prevents replay
+of an older signed announce after a node restarts.
+
+`received_at`, not the signed sender timestamp, controls local expiry. Signed
+`timestamp` is informational because some devices do not have a reliable clock.
+
+Topology announcements expire after 90 seconds without a newer accepted
+announce.
+
+### 8.6 Capabilities
+
+|      Bit | Name        | Meaning                                         |
+| -------: | ----------- | ----------------------------------------------- |
+| `0x0001` | `SENDER`    | Can originate BLEEdge datagrams                 |
+| `0x0002` | `RECEIVER`  | Can consume locally delivered datagrams         |
+| `0x0004` | `RELAY`     | Can forward datagrams                           |
+| `0x0008` | `GATEWAY`   | Can inject or extract external protocol packets |
+| `0x0010` | `CODED_PHY` | Supports BLE Coded PHY mode                     |
+
+Unknown capability bits MUST be preserved when storing or forwarding announces
+and MUST be ignored by implementations that do not understand them.
 
 ---
 
-## 7. Conformance checklist
+## 9. ACK control message
 
-A new or modified implementation must:
+An ACK confirms local delivery of a specific BLEEdge datagram. It does not
+confirm delivery or interpretation by an encapsulated protocol beyond BLEEdge.
 
-- [ ] Derive an Ed25519 identity from a persisted 32-byte seed; `NodeID =
-      pubkey[:8]`; advertise the 8-byte NodeID under company ID `0xBEED`.
-- [ ] Expose the GATT service + 3 characteristics with the exact UUIDs above;
-      serve `NODE_INFO` as
-      `version|pubkey(32)|caps|descLen|desc|nameLen|name|platLen|platform`.
-- [ ] Carry `description`(8) / `name`(9) / `platform`(10) as text in ANNOUNCE and
-      the NODE_INFO tail; never sign them or trust them for routing. `name`
-      defaults to `DefaultNodeName(pubkey)` (§1.1) and is user-overridable; an
-      empty `name` means peers derive that default. `platform` is the auto OS
-      string; `description` is a free-form bio (default empty).
-- [ ] Encode/decode the 23-byte big-endian frame header; CRC-32/IEEE over the
-      full packet; fragment at `MAX_FRAME_SIZE = 200` (177 data bytes/frame).
-- [ ] CBOR-encode packets with **integer** keys 1–14 exactly as in section 4;
-      ANNOUNCE payload keys 1–7 including `public_key`(6) + `signature`(7).
-- [ ] Sign ANNOUNCE over the exact byte layout in section 4.1; on receive, verify
-      the signature + `node_id==pubkey[:8]` and drop `bad-signature` on failure.
-- [ ] Drop on version mismatch (`!= 2`), duplicate `id`, loop (self in trace), TTL 0.
-- [ ] Append self to `trace` and decrement TTL on every relay.
-- [ ] For TRACE, append the current link metric to packet key 14, return
-      `TRACE_RESP` instead of a generic ACK, and preserve the MeshCore-shaped
-      `TRACE_REQ` prefix. Do not flood-relay TRACE; only source-route hops on
-      the selected track may repeat it.
-- [ ] Exclude the inbound peer when re-flooding; apply 10–100 ms jitter.
-- [ ] Emit ANNOUNCE every 15 s with TTL 3 and the correct caps bitmask.
-- [ ] Honor dedup (4096 / 5 min), neighbor (60 s), topology (90 s) lifetimes.
-- [ ] Reproduce the cross-platform Ed25519 test vector (seed `0001…1f`):
-      pubkey `03a107bf…125531b8`, and a signature that Go/firmware both verify.
+### 9.1 ACK body
 
-When changing the wire format, bump `ProtocolVersion`, update this doc in the
-same change, and update `firmware/xiao_esp32c6/test/` cross-checks.
+| Key | Field      | Type      | Required |
+| --: | ---------- | --------- | -------- |
+|   1 | `acked_id` | bytes(16) | yes      |
+
+### 9.2 ACK generation
+
+When a node locally delivers a unicast datagram with `ACK_REQUESTED`, it creates
+an ACK datagram:
+
+```text
+source      = local NodeID
+destination = original.source
+route       = reverse(original.path excluding local destination) + [original.source]
+route_cursor = 0
+ttl         = len(route)
+protocol    = BLEEDGE_CONTROL
+flags       = 0
+kind        = ACK
+```
+
+The ACK uses source routing. For a directly delivered datagram, the ACK route is:
+
+```text
+[original.source]
+```
+
+An ACK MUST NOT itself request an ACK.
+
+Applications that already provide their own acknowledgement semantics SHOULD
+omit `ACK_REQUESTED`.
+
+---
+
+## 10. Routing engine
+
+All routing decisions use only the BLEEdge datagram envelope and, where needed,
+BLEEdge control messages.
+
+### 10.1 Common checks
+
+For every incoming datagram:
+
+1. decode CBOR;
+2. require `version == 3`;
+3. validate required field lengths and types;
+4. require `1 <= ttl <= MAX_TTL`;
+5. require `len(path) <= MAX_ROUTE_HOPS`;
+6. if `route` is present, require `1 <= len(route) <= MAX_ROUTE_HOPS`;
+7. apply an optional direct-peer allowlist;
+8. drop if `id` is already in the deduplication cache;
+9. drop if local NodeID already appears in `path`; and
+10. if the packet is an `ANNOUNCE`, perform announce verification before using or
+    relaying it.
+
+A node MUST mark every locally originated datagram ID as seen before sending it.
+
+### 10.2 Flood routing
+
+Flood routing applies when `route` is absent or empty.
+
+After common checks:
+
+1. append local NodeID to `path`;
+2. deliver locally if `destination` is broadcast or equals local NodeID;
+3. generate an ACK if local delivery is unicast and `ACK_REQUESTED` is set;
+4. if relay is needed, decrement `ttl`;
+5. relay only if the remaining TTL is greater than zero and the datagram is
+   broadcast or not addressed to the local node;
+6. exclude the incoming peer link when relaying; and
+7. apply random flood jitter of 10–100 ms.
+
+### 10.3 Source routing
+
+Source routing applies when `route` is non-empty.
+
+A receiver MUST:
+
+1. require `route_cursor < len(route)`;
+2. require `route[route_cursor] == local NodeID`;
+3. require `route[len(route)-1] == destination`;
+4. require `ttl == len(route) - route_cursor`;
+5. append local NodeID to `path`;
+6. decrement `ttl`;
+7. increment `route_cursor`;
+8. locally deliver when `route_cursor == len(route)` and generate an ACK when
+   `ACK_REQUESTED` is set; otherwise
+9. relay only to `route[route_cursor]`.
+
+A source-routed datagram MUST NOT be flood-relayed if its next hop is unavailable.
+
+### 10.4 Route selection
+
+To send a unicast datagram to `destination`:
+
+1. if destination is a direct neighbor, use `route = [destination]`;
+2. otherwise run BFS over the learned topology graph;
+3. if a path is known, use that complete route including destination; and
+4. if no path is known, MAY fall back to flood routing for protocols that permit
+   flooding.
+
+Applications MAY require an explicit known route and disable fallback flooding.
+
+---
+
+## 11. Native trace diagnostics
+
+Trace is a BLEEdge-native control operation. It is not encoded using MeshCore
+trace layouts.
+
+A trace request MUST be source-routed. It does not request a generic ACK.
+
+### 11.1 Trace metric identifiers
+
+| Value | Name       | Encoding                   |
+| ----: | ---------- | -------------------------- |
+|     0 | `UNKNOWN`  | sample value is `-32768`   |
+|     1 | `RSSI_DBM` | signed integer dBm         |
+|     2 | `SNR_Q4`   | signed SNR multiplied by 4 |
+
+### 11.2 `TRACE_REQUEST` body
+
+| Key | Field             | Type           | Required |
+| --: | ----------------- | -------------- | -------- |
+|   1 | `tag`             | uint32         | yes      |
+|   2 | `metric`          | uint8          | yes      |
+|   3 | `forward_samples` | array of int16 | yes      |
+
+Each receiving hop appends one inbound-link sample before forwarding or
+responding. If the requested metric is unavailable, append `-32768`.
+
+### 11.3 `TRACE_RESPONSE` body
+
+| Key | Field             | Type               | Required |
+| --: | ----------------- | ------------------ | -------- |
+|   1 | `tag`             | uint32             | yes      |
+|   2 | `metric`          | uint8              | yes      |
+|   3 | `forward_path`    | array of bytes(10) | yes      |
+|   4 | `forward_samples` | array of int16     | yes      |
+|   5 | `return_samples`  | array of int16     | yes      |
+
+At the trace destination:
+
+* `forward_path` is copied from the completed request `path`;
+* `forward_samples` is copied from the request;
+* `return_samples` starts empty; and
+* the response route is the reverse observed path excluding the destination,
+  followed by the original source.
+
+Each receiving hop appends one inbound-link sample to `return_samples`.
+
+---
+
+## 12. Topology and state tables
+
+| Table          | Purpose                        | Limit / expiry                                     | Reap cadence |
+| -------------- | ------------------------------ | -------------------------------------------------- | ------------ |
+| Dedup cache    | Drop already-seen datagram IDs | 4096 entries, 5-minute TTL, evict oldest when full | 1 minute     |
+| Neighbor table | Directly connected peers       | 60-second timeout                                  | 10 seconds   |
+| Topology table | Signed announce graph          | 90-second expiry                                   | 15 seconds   |
+| Reassembler    | In-flight frame groups         | 10-second timeout                                  | 5 seconds    |
+
+A node SHOULD learn direct neighbors from established BLE peer links. It SHOULD
+advertise only directly connected BLEEdge neighbors in `ANNOUNCE`.
+
+A node MUST NOT treat arbitrary entries from a received datagram `path` as its
+own direct neighbors.
+
+---
+
+## 13. MeshCore compatibility
+
+### 13.1 Complete MeshCore packet encapsulation
+
+BLEEdge can carry a complete encoded MeshCore packet without interpreting its
+contents.
+
+```text
+protocol = MESHCORE_PACKET
+payload  = complete encoded MeshCore packet
+```
+
+MeshCore adverts, complete channel packets, traces, acknowledgements,
+encryption, and routing remain MeshCore concerns. BLEEdge MUST NOT extract
+selected fields from a tunneled MeshCore packet into its own datagram envelope
+or partially reimplement the semantics of that tunneled packet.
+
+### 13.2 Native BLEEdge Chat channels
+
+BLEEdge Chat also defines a native `CHANNEL_TEXT` subtype. Its encrypted
+`channel_payload` intentionally mirrors the MeshCore `GRP_TXT` payload layout so
+BLEEdge applications can implement compatible channels directly and gateways
+can translate channel messages without inventing a second format.
+
+```text
+protocol = BLEEDGE_CHAT
+kind     = CHANNEL_TEXT
+body.channel_payload = MeshCore-compatible GRP_TXT payload
+```
+
+This is distinct from complete MeshCore packet encapsulation. Native
+`CHANNEL_TEXT` messages are valid BLEEdge Chat messages and MUST be encoded as
+described in `CHAT_PROTOCOL.md`.
+
+The routing engine treats both forms as opaque bytes. Compatibility logic belongs
+to payload adapters, not to the BLEEdge routing core.
+
+Future payload protocols MAY be assigned additional registry values without
+changing the BLEEdge routing engine. Their packet formats are outside the scope
+of this specification.
+
+---
+
+## 14. Security considerations
+
+### 14.1 What BLEEdge authenticates
+
+BLEEdge authenticates signed announces. A verified announce binds:
+
+* public key;
+* NodeID;
+* persisted announce epoch;
+* sequence number;
+* timestamp;
+* capabilities;
+* direct-neighbor list;
+* name;
+* description; and
+* platform string.
+
+Relays cannot alter these values without invalidating the signature.
+
+### 14.2 What BLEEdge does not authenticate
+
+The outer routing envelope is mutable during relay. TTL, route cursor, and path
+change hop by hop and are not end-to-end signed by BLEEdge.
+
+Application payload confidentiality, integrity, and authentication belong to the
+payload protocol. Encapsulated protocols retain their own security model.
+
+### 14.3 Metadata privacy
+
+Signed announcements are public within the reachable BLEEdge scope. A user MAY
+leave `name`, `description`, and `platform` empty to reduce exposed metadata.
+
+---
+
+## 15. Constants
+
+| Constant             |       Value |
+| -------------------- | ----------: |
+| `FRAME_VERSION`      |         `2` |
+| `DATAGRAM_VERSION`   |         `3` |
+| `NODE_INFO_VERSION`  |         `1` |
+| `ANNOUNCE_VERSION`   |         `1` |
+| `NODE_ID_BYTES`      |  `10` bytes |
+| `MAX_FRAME_SIZE`     | `200` bytes |
+| `MAX_FRAME_DATA`     | `177` bytes |
+| `MAX_TTL`            |   `16` hops |
+| `DEFAULT_FLOOD_TTL`  |    `5` hops |
+| `MAX_ROUTE_HOPS`     |   `16` hops |
+| `ANNOUNCE_INTERVAL`  |      `15 s` |
+| `ANNOUNCE_TTL`       |    `5` hops |
+| `FLOOD_JITTER`       | `10–100 ms` |
+| `REASSEMBLY_TIMEOUT` |      `10 s` |
+| `DEDUP_LIMIT`        |  `4096` IDs |
+| `DEDUP_TTL`          |     `5 min` |
+| `NEIGHBOR_TIMEOUT`   |      `60 s` |
+| `TOPOLOGY_TIMEOUT`   |      `90 s` |
+
+---
+
+## 16. Conformance checklist
+
+A conforming implementation MUST:
+
+* [ ] derive an Ed25519 identity from a persisted 32-byte seed;
+* [ ] derive the 10-byte NodeID as `public_key[0:10]`;
+* [ ] advertise the service UUID and, where supported, `0xBEED` manufacturer data;
+* [ ] expose `NODE_INFO`, `PACKET_IN`, and `PACKET_OUT` with the specified UUIDs;
+* [ ] encode `NODE_INFO` as `version | public_key | provisional_caps`;
+* [ ] encode frame version `2` with a hop-local `transfer_id`;
+* [ ] key reassembly by `(peer_link, transfer_id)`;
+* [ ] fragment at `MAX_FRAME_SIZE = 200`;
+* [ ] encode datagram version `3` using CBOR integer keys 1–11;
+* [ ] infer flood versus source routing from the presence of `route`;
+* [ ] route unknown protocols as opaque payloads;
+* [ ] use `BLEEDGE_CONTROL` for native announces, ACKs, and traces;
+* [ ] sign every announce field except the signature itself;
+* [ ] verify the exact announce signature layout before trusting topology data;
+* [ ] persist and increment `epoch` on startup and use `epoch` plus `seq` for announce freshness;
+* [ ] generate ACKs only when `ACK_REQUESTED` is set;
+* [ ] mark locally originated datagram IDs as seen before sending;
+* [ ] enforce `MAX_TTL`, `DEFAULT_FLOOD_TTL`, `MAX_ROUTE_HOPS`, and `ANNOUNCE_TTL`;
+* [ ] apply deduplication, loop detection, TTL checks, split-horizon flood relay,
+  and flood jitter; and
+* [ ] keep application-specific packet semantics out of the routing engine.
+
+---
+
+## 17. Migration from BLEEdge v2 proof-of-concept
+
+BLEEdge v3 intentionally removes the v2 packet taxonomy:
+
+* remove outer `type`;
+* remove outer `payload_type`;
+* remove outer `mode`;
+* remove outer `seq`;
+* remove outer `trace_metric`;
+* rename outer `trace` to `path`;
+* infer routing mode from `route`;
+* replace packet-specific ACK exceptions with `ACK_REQUESTED`;
+* move announce, ACK, and trace under `BLEEDGE_CONTROL`;
+* move MeshCore encapsulation and application-specific payload handling into
+  payload protocol adapters;
+* replace frame `packet_id` with hop-local `transfer_id`; and
+* remove mutable metadata strings from unsigned `NODE_INFO`;
+* increase NodeID width from 8 bytes to 10 bytes; and
+* replace replay-prone random `boot_id` freshness with persisted monotonic `epoch + seq`.
+
+Implementations SHOULD reject datagram versions other than `3` and frame
+versions other than `2` rather than attempting implicit compatibility.

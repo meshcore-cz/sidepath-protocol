@@ -1,0 +1,21 @@
+plugins {
+    id 'org.jetbrains.kotlin.jvm'
+    id 'java-library'
+}
+
+// BLEEdge core protocol — pure Kotlin/JVM, no Android dependencies, so it can be
+// published as a standalone library/SDK. Implements docs/PROTOCOL.md (datagram
+// v3, frame v2, BLEEDGE_CONTROL, routing engine, identity).
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+dependencies {
+    // CBOR datagram/control encoding (cross-language wire compatibility).
+    api "com.upokecenter:cbor:4.5.4"
+    // Ed25519 (RFC 8032) identity + signed ANNOUNCE, X25519 (RFC 7748) key
+    // conversion for payload-protocol crypto. Low-level BouncyCastle.
+    api "org.bouncycastle:bcprov-jdk18on:1.78.1"
+    testImplementation "junit:junit:4.13.2"
+}

@@ -8,14 +8,16 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
-import cz.arnal.bleedge.core.BLEEdgeUUIDs
-import cz.arnal.bleedge.core.NodeID
-import cz.arnal.bleedge.core.PHYMode
+import cz.arnal.bleedge.protocol.BLEEdge
+import cz.arnal.bleedge.protocol.NodeId
+import cz.arnal.bleedge.transport.BLEEDGE_MANUFACTURER_ID
+import cz.arnal.bleedge.transport.BLEEdgeUUIDs
+import cz.arnal.bleedge.transport.PHYMode
 
 private const val TAG = "BLEEdgeScanner"
 
-// Manufacturer company ID used to tag BLEEdge advertisements; payload is the 8-byte NodeID.
-private const val MANUFACTURER_ID = 0xBEED
+// Manufacturer company ID used to tag BLEEdge advertisements; payload is the 10-byte NodeID.
+private const val MANUFACTURER_ID = BLEEDGE_MANUFACTURER_ID
 
 /**
  * BLE scanner that discovers BLEEdge peers using LE Coded PHY extended scanning,
@@ -45,13 +47,13 @@ class BLEEdgeScanner(
      */
     fun startScan(
         phyMode: PHYMode,
-        onFound: (BluetoothDevice, Int, NodeID?) -> Unit,
+        onFound: (BluetoothDevice, Int, NodeId?) -> Unit,
         onFailed: ((Int) -> Unit)? = null,
     ) {
         val leScanner = adapter.bluetoothLeScanner
             ?: run { Log.e(TAG, "BLE scanner not available"); return }
 
-        val settings = if (phyMode == PHYMode.DEBUG_1M) {
+        val settings = if (phyMode == PHYMode.ONE_M) {
             ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
@@ -62,7 +64,7 @@ class BLEEdgeScanner(
                     when (phyMode) {
                         PHYMode.CODED_ONLY      -> BluetoothDevice.PHY_LE_CODED
                         PHYMode.CODED_PREFERRED -> ScanSettings.PHY_LE_ALL_SUPPORTED
-                        PHYMode.DEBUG_1M        -> ScanSettings.PHY_LE_ALL_SUPPORTED
+                        PHYMode.ONE_M           -> ScanSettings.PHY_LE_ALL_SUPPORTED
                     }
                 )
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -89,8 +91,9 @@ class BLEEdgeScanner(
                 val hasService = rec?.serviceUuids?.any { it == bleEdgeUuid } == true
                 if (mfg == null && !hasService) return // not a BLEEdge device
 
-                val nodeId = if (mfg != null && mfg.size >= 8) NodeID(mfg.copyOfRange(0, 8)) else null
-                Log.d(TAG, "BLEEdge result: ${result.device.address} rssi=${result.rssi} phy=${result.primaryPhy} node=${nodeId?.toHexString()}")
+                val nodeId = if (mfg != null && mfg.size >= BLEEdge.NODE_ID_BYTES)
+                    NodeId(mfg.copyOfRange(0, BLEEdge.NODE_ID_BYTES)) else null
+                Log.d(TAG, "BLEEdge result: ${result.device.address} rssi=${result.rssi} phy=${result.primaryPhy} node=${nodeId?.toHex()}")
                 onFound(result.device, result.rssi, nodeId)
             }
         }

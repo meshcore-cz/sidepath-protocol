@@ -4,8 +4,9 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.util.Log
-import cz.arnal.bleedge.core.NodeID
-import cz.arnal.bleedge.core.PHYMode
+import cz.arnal.bleedge.protocol.Capabilities
+import cz.arnal.bleedge.protocol.NodeId
+import cz.arnal.bleedge.transport.PHYMode
 
 private const val TAG = "BLEManager"
 
@@ -37,7 +38,7 @@ class BLEManager(
         Log.i(TAG, "  phyMode=$phyMode")
     }
 
-    fun createAdvertiser(nodeId: NodeID): BLEEdgeAdvertiser {
+    fun createAdvertiser(@Suppress("UNUSED_PARAMETER") nodeId: NodeId): BLEEdgeAdvertiser {
         return BLEEdgeAdvertiser(context, adapter).also { advertiser = it }
     }
 
@@ -47,16 +48,13 @@ class BLEManager(
 
     fun createGattServer(
         pubKey: ByteArray,
-        caps: cz.arnal.bleedge.core.Capabilities,
-        description: String,
-        name: String,
-        platform: String,
+        caps: Capabilities,
         onFrameReceived: (ByteArray, android.bluetooth.BluetoothDevice) -> Unit,
         onDeviceConnected: ((android.bluetooth.BluetoothDevice) -> Unit)? = null,
         onDeviceDisconnected: ((android.bluetooth.BluetoothDevice) -> Unit)? = null,
         onLog: ((String) -> Unit)? = null,
     ): BLEEdgeGattServer {
-        return BLEEdgeGattServer(context, pubKey, caps, description, name, platform, onFrameReceived,
+        return BLEEdgeGattServer(context, pubKey, caps, onFrameReceived,
             onDeviceConnected, onDeviceDisconnected, onLog).also { gattServer = it }
     }
 

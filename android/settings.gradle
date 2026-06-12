@@ -19,6 +19,8 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "BLEEdge"
+include ':bleedge-protocol'
+include ':bleedge-chat'
 include ':common'
-include ':debug-app'
+// ':debug-app' is parked on the v2 protocol and excluded from the v3 build.
 include ':chat-app'

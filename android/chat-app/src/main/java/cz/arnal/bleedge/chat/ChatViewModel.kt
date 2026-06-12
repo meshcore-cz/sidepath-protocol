@@ -24,13 +24,14 @@ import cz.arnal.bleedge.chat.data.MsgStatus
 import cz.arnal.bleedge.chat.data.channelPeerId
 import cz.arnal.bleedge.chat.data.channelPskHexOf
 import cz.arnal.bleedge.chat.data.isChannelPeer
-import cz.arnal.bleedge.core.ChannelCrypto
-import cz.arnal.bleedge.core.Crypto
-import cz.arnal.bleedge.core.Identity
-import cz.arnal.bleedge.core.NodeID
-import cz.arnal.bleedge.core.PHYMode
-import cz.arnal.bleedge.core.PayloadType
-import cz.arnal.bleedge.core.SEED_SIZE
+import cz.arnal.bleedge.chatproto.ChatChannel
+import cz.arnal.bleedge.chatproto.ChatKind
+import cz.arnal.bleedge.protocol.BLEEdge
+import cz.arnal.bleedge.protocol.Identity
+import cz.arnal.bleedge.protocol.NodeId
+import cz.arnal.bleedge.protocol.PayloadProtocol
+import cz.arnal.bleedge.protocol.TraceResponseBody
+import cz.arnal.bleedge.transport.PHYMode
 import cz.arnal.bleedge.service.BLEEdgeService
 import cz.arnal.bleedge.service.LogEntry
 import cz.arnal.bleedge.service.MeshStats
@@ -92,7 +93,7 @@ data class TraceUi(
     val tag: Int? = null,
     val startedAtMs: Long = 0L,
     val rttMs: Long? = null, // round-trip time once the response arrives
-    val result: cz.arnal.bleedge.core.TraceResult? = null,
+    val result: TraceResponseBody? = null,
     val error: String? = null,
 )
 
@@ -207,13 +208,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var outgoingTypingJob: Job? = null
     private var outgoingTypingPeer: String? = null
 
-    val nodeId: StateFlow<NodeID> = _service.flatMapLatest {
-        it?.nodeId ?: flowOf(NodeID(ByteArray(8)))
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, NodeID(ByteArray(8)))
+    val nodeId: StateFlow<NodeId> = _service.flatMapLatest {
+        it?.nodeId ?: flowOf(NodeId.BROADCAST)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, NodeId.BROADCAST)
 
     val phyMode: StateFlow<PHYMode> = _service.flatMapLatest {
-        it?.phyMode ?: flowOf(PHYMode.DEBUG_1M)
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, PHYMode.DEBUG_1M)
+        it?.phyMode ?: flowOf(PHYMode.ONE_M)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, PHYMode.ONE_M)
 
     val topology: StateFlow<List<TopologyEntry>> = _service.flatMapLatest {
         it?.knownTopology ?: flowOf(emptyList())
@@ -327,7 +328,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      */
     val advertisedNodes: StateFlow<List<AdvertisedNode>> =
         combine(topology, contacts, nodeId) { topo, contacts, me ->
-            val meHex = me.toHexString()
+            val meHex = me.toHex()
             val byHex = LinkedHashMap<String, AdvertisedNode>()
             contacts.forEach { c ->
                 if (c.nodeHex != meHex && c.pubKeyHex.length == 64) {
@@ -335,7 +336,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             topo.forEach { t ->
-                val hex = t.nodeId.toHexString()
+                val hex = t.nodeId.toHex()
                 if (hex != meHex && t.publicKey.size == 32) {
                     val desc = t.description.ifBlank { byHex[hex]?.description ?: "" }
                     byHex[hex] = AdvertisedNode(hex, desc, t.publicKey.toHex())
@@ -391,7 +392,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val nodeName = pref[NAME_KEY] ?: ""
         val retryDelay = pref[DM_RETRY_DELAY_KEY] ?: DEFAULT_DM_RETRY_DELAY_MS
         val maxTries = pref[DM_MAX_TRIES_KEY] ?: DEFAULT_DM_MAX_TRIES
-        val phy = PHYMode.fromString(pref[PHY_MODE_KEY] ?: PHYMode.DEBUG_1M.value)
+        val phy = PHYMode.fromString(pref[PHY_MODE_KEY] ?: PHYMode.ONE_M.value)
         _seedHex.value = seedHex
         _description.value = desc
         _name.value = nodeName
@@ -413,13 +414,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val ctx = getApplication<Application>()
         if (ctx.dataStore.data.first()[PUBLIC_SEEDED_KEY] == true) return
         ctx.dataStore.edit { it[PUBLIC_SEEDED_KEY] = true }
-        val pskHex = ChannelCrypto.PUBLIC_PSK.toHex()
+        val pskHex = ChatChannel.PUBLIC_SECRET.toHex()
         if (dao.channelByPsk(pskHex) == null) {
             dao.upsertChannel(
                 Channel(
                     pskHex = pskHex,
                     name = "Public",
-                    hashByte = ChannelCrypto.channelHash(ChannelCrypto.PUBLIC_PSK).toInt() and 0xFF,
+                    hashByte = ChatChannel.channelHash(ChatChannel.PUBLIC_SECRET).toInt() and 0xFF,
                     kind = ChannelKind.PUBLIC,
                 )
             )
@@ -454,13 +455,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * router picks the path automatically; pass an explicit hop list (NOT including this node) to
      * trace a route the user specified by hand or by picking nodes.
      */
-    fun startTrace(peerHex: String, route: List<NodeID> = emptyList()) {
+    fun startTrace(peerHex: String, route: List<NodeId> = emptyList()) {
         val service = _service.value
         if (service == null) {
             _trace.value = TraceUi(peerHex, running = false, error = "Mesh service not ready yet.")
             return
         }
-        val tag = service.sendTrace(NodeID.fromHex(peerHex), route)
+        val tag = service.sendTrace(NodeId.fromHex(peerHex), route)
         _trace.value = if (tag == null) {
             TraceUi(peerHex, running = false, error = if (route.isEmpty())
                 "No route to this node yet — try again once it's in the network."
@@ -474,23 +475,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Parses a manual route string like "d503fdbcb61c654f,be0d40fda9b839b5,d503fdbcb61c654f" into
      * NodeIDs. Accepts comma/space/newline separators; each token must be 16 hex chars (an 8-byte
-     * NodeID). Returns null if any token is malformed so the UI can show an error.
+     * NodeId). Returns null if any token is malformed so the UI can show an error.
      */
-    fun parseManualRoute(text: String): List<NodeID>? {
+    fun parseManualRoute(text: String): List<NodeId>? {
         val tokens = text.split(',', ' ', '\n', '\t').map { it.trim() }.filter { it.isNotEmpty() }
         if (tokens.isEmpty()) return null
         return tokens.map { tok ->
-            if (tok.length != 16 || tok.any { it.digitToIntOrNull(16) == null }) return null
-            NodeID.fromHex(tok.lowercase())
+            if (tok.length != BLEEdge.NODE_ID_BYTES * 2 || tok.any { it.digitToIntOrNull(16) == null }) return null
+            NodeId.fromHex(tok.lowercase())
         }
     }
 
     fun clearTrace() { _trace.value = null }
 
     private fun handleTraceResponse(msg: ReceivedMessage) {
-        val result = runCatching { cz.arnal.bleedge.core.TraceResult.decode(msg.payload) }.getOrNull() ?: return
+        val result = msg.traceResponse ?: return
         val cur = _trace.value ?: return
-        if (cur.tag == result.tag) {
+        if (cur.tag != null && cur.tag.toLong() == result.tag) {
             val rtt = (System.currentTimeMillis() - cur.startedAtMs).coerceAtLeast(0)
             _trace.value = cur.copy(running = false, rttMs = rtt, result = result)
         }
@@ -519,15 +520,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val acked = msg.ackedId ?: return
             val key = "ack:" + acked.toHex()
             if (!processed.add(key)) return
-            dao.updateDelivery(acked.toHex(), MsgStatus.DELIVERED, msg.trace.toRouteHex())
+            dao.updateDelivery(acked.toHex(), MsgStatus.DELIVERED, msg.path.toRouteHex())
             return
         }
-        when (msg.payloadType) {
-            PayloadType.CHAT_ENCRYPTED -> handleIncomingDm(msg)
-            PayloadType.CHANNEL -> handleIncomingChannel(msg)
-            PayloadType.TRACE_RESPONSE -> handleTraceResponse(msg)
-            PayloadType.TYPING -> showTyping(msg.fromNodeId.toHexString())
-            else -> return // TEXT_TEST / CHAT_PLAIN / other: not part of the chat model
+        if (msg.protocol == PayloadProtocol.BLEEDGE_CONTROL && msg.traceResponse != null) {
+            handleTraceResponse(msg); return
+        }
+        when (msg.chatKind) {
+            ChatKind.DIRECT_TEXT -> handleIncomingDm(msg)
+            ChatKind.CHANNEL_TEXT -> handleIncomingChannel(msg)
+            ChatKind.TYPING -> showTyping(msg.fromNodeId.toHex())
+            else -> return // PUBLIC_TEXT / other: not part of the direct/channel chat model
         }
     }
 
@@ -548,46 +551,46 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun handleIncomingDm(msg: ReceivedMessage) {
-        if (!processed.add(msg.packetId.toHex())) return
-        val peer = msg.fromNodeId.toHexString()
+        if (!processed.add(msg.datagramId.toHex())) return
+        val peer = msg.fromNodeId.toHex()
         // A real message means they're no longer typing — drop the indicator at once.
         clearTyping(peer)
         dao.insertMessage(
             Message(
-                id = msg.packetId.toHex().ifEmpty { newId() },
+                id = msg.datagramId.toHex().ifEmpty { newId() },
                 peerHex = peer,
                 senderHex = peer,
                 incoming = true,
                 text = msg.text ?: "[unable to decrypt]",
                 timestampMs = msg.timestampMs,
                 status = MsgStatus.DELIVERED,
-                routeHex = msg.trace.toRouteHex(),
+                routeHex = msg.path.toRouteHex(),
                 read = false,
             )
         )
-        // Learn the sender's public key from the DM envelope so we can reply even if the
-        // node isn't (yet) in our topology.
-        learnContact(peer, Crypto.envelopeSenderPubKey(msg.payload))
+        // The service already verified outer.source == sender_public_key[:10]; save the
+        // sender's key so we can reply even if the node isn't (yet) in our topology.
+        learnContact(peer, msg.senderPublicKey)
     }
 
     private suspend fun handleIncomingChannel(msg: ReceivedMessage) {
-        if (!processed.add(msg.packetId.toHex())) return
-        if (msg.payload.isEmpty()) return
-        val hashByte = msg.payload[0].toInt() and 0xFF
+        if (!processed.add(msg.datagramId.toHex())) return
+        val channelPayload = msg.channelPayload ?: return
+        val hashByte = ChatChannel.payloadChannelHash(channelPayload) ?: return
         // Try every joined channel whose hash matches; the MAC tells us which one decrypts.
         for (ch in dao.channelsByHash(hashByte)) {
-            val decoded = ChannelCrypto.open(ch.pskHex.hexToBytes(), msg.payload) ?: continue
+            val decoded = ChatChannel.decodePayload(ch.pskHex.hexToBytes(), channelPayload) ?: continue
             dao.insertMessage(
                 Message(
-                    id = msg.packetId.toHex().ifEmpty { newId() },
+                    id = msg.datagramId.toHex().ifEmpty { newId() },
                     peerHex = channelPeerId(ch.pskHex),
-                    senderHex = msg.fromNodeId.toHexString(),
-                    senderName = decoded.sender,
+                    senderHex = msg.fromNodeId.toHex(),
+                    senderName = decoded.senderLabel,
                     incoming = true,
                     text = decoded.text,
                     timestampMs = msg.timestampMs,
                     status = MsgStatus.DELIVERED,
-                    routeHex = msg.trace.toRouteHex(),
+                    routeHex = msg.path.toRouteHex(),
                     read = false,
                 )
             )
@@ -597,7 +600,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Saves/updates a contact's public key. Prefers an explicit key, else the topology key. */
     private suspend fun learnContact(nodeHex: String, pub: ByteArray?) {
-        val topo = topology.value.firstOrNull { it.nodeId.toHexString() == nodeHex }
+        val topo = topology.value.firstOrNull { it.nodeId.toHex() == nodeHex }
         val key = pub?.takeIf { it.size == 32 } ?: topo?.publicKey?.takeIf { it.size == 32 } ?: return
         val desc = topo?.description ?: dao.contactByNode(nodeHex)?.description ?: ""
         dao.upsertContact(Contact(nodeHex, key.toHex(), desc))
@@ -626,7 +629,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     channelHash = ch?.hashByte ?: 0,
                     pskHex = psk,
                 )
-            } else if (peerHex == nodeId.value.toHexString()) {
+            } else if (peerHex == nodeId.value.toHex()) {
                 // Our own profile (opened from the avatar): use our local identity/settings.
                 ProfileInfo(
                     peerHex = peerHex,
@@ -648,7 +651,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     nodeHex = peerHex,
                     pubKeyHex = publicKeyHex(peerHex, byNode, t),
                     isContact = byNode[peerHex] != null,
-                    online = t.any { it.nodeId.toHexString() == peerHex },
+                    online = t.any { it.nodeId.toHex() == peerHex },
                     description = nodeDescription(peerHex, byNode, t),
                     platform = nodePlatform(peerHex, t),
                 )
@@ -662,7 +665,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun renameContact(nodeHex: String, newName: String) {
         viewModelScope.launch {
             val pub = dao.contactByNode(nodeHex)?.pubKeyHex
-                ?: topology.value.firstOrNull { it.nodeId.toHexString() == nodeHex }
+                ?: topology.value.firstOrNull { it.nodeId.toHex() == nodeHex }
                     ?.publicKey?.takeIf { it.size == 32 }?.toHex()
                 ?: ""
             dao.upsertContact(Contact(nodeHex, pub, newName.trim()))
@@ -692,7 +695,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         outgoingTypingJob?.cancel()
         outgoingTypingPeer = peerHex
         outgoingTypingJob = viewModelScope.launch {
-            val dst = NodeID.fromHex(peerHex)
+            val dst = NodeId.fromHex(peerHex)
             while (isActive) {
                 _service.value?.sendTyping(dst)
                 delay(10_000)
@@ -716,7 +719,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val service = _service.value ?: return
         stopTyping(peerHex)
         viewModelScope.launch {
-            val dst = NodeID.fromHex(peerHex)
+            val dst = NodeId.fromHex(peerHex)
             // Resolve the recipient's key from the saved contact (learned from a received DM
             // or the picker), falling back to topology inside the service.
             val pub = dao.contactByNode(peerHex)?.pubKeyHex?.takeIf { it.length == 64 }?.hexToBytes()
@@ -725,7 +728,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 Message(
                     id = id?.toHex() ?: newId(),
                     peerHex = peerHex,
-                    senderHex = nodeId.value.toHexString(),
+                    senderHex = nodeId.value.toHex(),
                     incoming = false,
                     text = body,
                     timestampMs = System.currentTimeMillis(),
@@ -743,14 +746,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             // The channel sender label is our display name (deterministic name or override),
             // matching what everyone shows for us elsewhere — not the free-form description.
-            val myLabel = myName.value.ifBlank { shortHex(nodeId.value.toHexString()) }
-            val payload = ChannelCrypto.seal(pskHex.hexToBytes(), myLabel, body)
-            val id = service.sendChannelMessage(payload)
+            val myLabel = myName.value.ifBlank { shortHex(nodeId.value.toHex()) }
+            val id = service.sendChannel(pskHex.hexToBytes(), myLabel, body)
             dao.insertMessage(
                 Message(
                     id = id.toHex(),
                     peerHex = channelPeerId(pskHex),
-                    senderHex = nodeId.value.toHexString(),
+                    senderHex = nodeId.value.toHex(),
                     senderName = myLabel,
                     incoming = false,
                     text = body,
@@ -763,12 +765,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- channel management --------------------------------------------------
 
-    fun joinPublic() = joinChannelPsk(ChannelCrypto.PUBLIC_PSK, "Public", ChannelKind.PUBLIC)
+    fun joinPublic() = joinChannelPsk(ChatChannel.PUBLIC_SECRET, "Public", ChannelKind.PUBLIC)
 
     fun joinNamedChannel(name: String) {
         val n = name.trim()
         if (n.isEmpty()) return
-        joinChannelPsk(ChannelCrypto.deriveChannelSecret(n), n, ChannelKind.NAMED)
+        joinChannelPsk(ChatChannel.namedSecret(n), n, ChannelKind.NAMED)
     }
 
     fun joinSecretChannel(name: String, secret: String) {
@@ -777,7 +779,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (s.isEmpty()) return
         // A 32-hex-char secret is taken as the raw 16-byte PSK; anything else is hashed.
         val psk = if (s.length == 32 && s.all { it.lowercaseChar() in "0123456789abcdef" }) s.hexToBytes()
-        else ChannelCrypto.deriveChannelSecret(s)
+        else ChatChannel.namedSecret(s)
         joinChannelPsk(psk, n, ChannelKind.SECRET)
     }
 
@@ -804,7 +806,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             return true
         }
         MeshCoreUri.parseContact(uri)?.let { c ->
-            val nodeHex = c.publicKeyHex.take(16)
+            val nodeHex = c.publicKeyHex.take(BLEEdge.NODE_ID_BYTES * 2)
             viewModelScope.launch { dao.upsertContact(Contact(nodeHex, c.publicKeyHex, c.name)) }
             _pendingOpenPeer.value = nodeHex
             return true
@@ -818,7 +820,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 Channel(
                     pskHex = psk.toHex(),
                     name = name,
-                    hashByte = ChannelCrypto.channelHash(psk).toInt() and 0xFF,
+                    hashByte = ChatChannel.channelHash(psk).toInt() and 0xFF,
                     kind = kind,
                 )
             )
@@ -877,7 +879,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Replaces the identity seed (64 hex chars) and restarts the mesh node. */
     fun applySeed(hex: String): Boolean {
         val clean = hex.trim().lowercase()
-        if (clean.length != SEED_SIZE * 2 || !clean.all { it in "0123456789abcdef" }) return false
+        if (clean.length != BLEEdge.SEED_BYTES * 2 || !clean.all { it in "0123456789abcdef" }) return false
         viewModelScope.launch {
             getApplication<Application>().dataStore.edit { it[SEED_KEY] = clean }
             _seedHex.value = clean
@@ -915,8 +917,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun nameForHex(hex: String): String =
         displayName(hex, contacts.value.associateBy { it.nodeHex }, topology.value)
 
-    /** This node's own NodeID as hex — used to exclude self from route pickers. */
-    fun myNodeHex(): String = nodeId.value.toHexString()
+    /** This node's own NodeId as hex — used to exclude self from route pickers. */
+    fun myNodeHex(): String = nodeId.value.toHex()
 
     // ---- helpers -------------------------------------------------------------
 
@@ -932,31 +934,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         // Prefer the node's real name carried on the wire (ANNOUNCE/NODE_INFO); if it hasn't sent
         // one (e.g. ESP32, or not yet learned), derive the deterministic default from its pubkey.
-        topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.name?.takeIf { it.isNotBlank() }?.let { return it }
+        topo.firstOrNull { it.nodeId.toHex() == peerHex }?.name?.takeIf { it.isNotBlank() }?.let { return it }
         val derived = nameFromPubKey(publicKeyHex(peerHex, contacts, topo))
         return derived.ifBlank { shortHex(peerHex) }
     }
 
     /** The node's OS/device string (from its ANNOUNCE / NODE_INFO), or "". */
     private fun nodePlatform(peerHex: String, topo: List<TopologyEntry>): String =
-        topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.platform?.takeIf { it.isNotBlank() } ?: ""
+        topo.firstOrNull { it.nodeId.toHex() == peerHex }?.platform?.takeIf { it.isNotBlank() } ?: ""
 
     /** The node's own free-form description (from its ANNOUNCE / NODE_INFO), or "" — profile only. */
     private fun nodeDescription(peerHex: String, contacts: Map<String, Contact>, topo: List<TopologyEntry>): String {
         contacts[peerHex]?.description?.takeIf { it.isNotBlank() }?.let { return it }
-        return topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.description?.takeIf { it.isNotBlank() } ?: ""
+        return topo.firstOrNull { it.nodeId.toHex() == peerHex }?.description?.takeIf { it.isNotBlank() } ?: ""
     }
 
     /** The node's 32-byte Ed25519 key (hex), from a saved contact or the live topology, or "". */
     private fun publicKeyHex(peerHex: String, contacts: Map<String, Contact>, topo: List<TopologyEntry>): String {
         contacts[peerHex]?.pubKeyHex?.takeIf { it.length == 64 }?.let { return it }
-        topo.firstOrNull { it.nodeId.toHexString() == peerHex }?.publicKey
+        topo.firstOrNull { it.nodeId.toHex() == peerHex }?.publicKey
             ?.takeIf { it.size == 32 }?.let { return it.toHex() }
         return ""
     }
 
     private fun generateSeedHex(): String =
-        ByteArray(SEED_SIZE).also { SecureRandom().nextBytes(it) }.toHex()
+        ByteArray(BLEEdge.SEED_BYTES).also { SecureRandom().nextBytes(it) }.toHex()
 
     private fun newId(): String = ByteArray(16).also { SecureRandom().nextBytes(it) }.toHex()
 }
@@ -966,4 +968,4 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 fun String.hexToBytes(): ByteArray = ByteArray(length / 2) { substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 fun shortHex(hex: String): String = if (hex.length >= 8) "node ${hex.take(8)}" else hex
-private fun List<NodeID>.toRouteHex(): String = joinToString(",") { it.toHexString() }
+private fun List<NodeId>.toRouteHex(): String = joinToString(",") { it.toHex() }

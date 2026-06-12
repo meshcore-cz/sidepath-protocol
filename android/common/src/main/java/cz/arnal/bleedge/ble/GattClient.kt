@@ -11,11 +11,12 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import cz.arnal.bleedge.core.BLEEdgeUUIDs
-import cz.arnal.bleedge.core.Capabilities
-import cz.arnal.bleedge.core.NodeID
-import cz.arnal.bleedge.core.PHY
-import cz.arnal.bleedge.core.PHYMode
+import cz.arnal.bleedge.protocol.Capabilities
+import cz.arnal.bleedge.protocol.NodeId
+import cz.arnal.bleedge.transport.BLEEdgeUUIDs
+import cz.arnal.bleedge.transport.NodeInfo
+import cz.arnal.bleedge.transport.PHY
+import cz.arnal.bleedge.transport.PHYMode
 
 private const val TAG = "BLEEdgeGattClient"
 private const val KEEPALIVE_MS = 10_000L
@@ -36,7 +37,7 @@ class BLEEdgeGattClient(
     private val onPhyUpdate: (txPhy: Int, rxPhy: Int) -> Unit,
     private val onFrameReceived: (ByteArray) -> Unit,
     /** Return false to abort (deterministic connection rule). [peerPubKey] is the full 32-byte key. */
-    private val onNodeInfoRead: ((peerNodeId: NodeID, peerPubKey: ByteArray, peerCaps: Capabilities, peerName: String, peerPlatform: String) -> Boolean)? = null,
+    private val onNodeInfoRead: ((peerNodeId: NodeId, peerPubKey: ByteArray, peerCaps: Capabilities) -> Boolean)? = null,
     private val onDisconnected: (() -> Unit)? = null,
     val onLog: ((addr: String, msg: String) -> Unit)? = null,
     initialRssi: Int = 0,
@@ -51,11 +52,9 @@ class BLEEdgeGattClient(
     private val writeQueue = ArrayDeque<ByteArray>()
     private var writeInProgress = false
 
-    var peerNodeId: NodeID? = null; private set
+    var peerNodeId: NodeId? = null; private set
+    var peerPublicKey: ByteArray = ByteArray(0); private set
     var peerCaps: Capabilities = Capabilities(0); private set
-    var peerDescription: String = ""; private set
-    var peerName: String = ""; private set
-    var peerPlatform: String = ""; private set
     var txPhy: PHY = PHY.UNKNOWN; private set
     var rxPhy: PHY = PHY.UNKNOWN; private set
     var rssi: Int = initialRssi; private set
@@ -237,35 +236,20 @@ class BLEEdgeGattClient(
         }
 
         private fun handleNodeInfo(gatt: BluetoothGatt, data: ByteArray) {
-            if (data.size < 34) return
             if (intentionalDisconnect) { gatt.disconnect(); return }
-            // version(1)+pubkey(32)+caps(1)+descLen|desc|nameLen|name|platLen|platform; NodeID = pubkey[:8]
-            val pubKey = data.copyOfRange(1, 33)
-            val nodeId = NodeID.fromPubKey(pubKey)
-            val caps = Capabilities(data[33].toInt() and 0xFF)
-            // Read the length-prefixed trailers (desc, name, platform) in order; any missing.
-            var off = 34
-            fun readStr(): String {
-                if (off >= data.size) return ""
-                val n = data[off].toInt() and 0xFF
-                off++
-                if (off + n > data.size) return ""
-                val s = String(data, off, n, Charsets.UTF_8)
-                off += n
-                return s
+            // NODE_INFO (§4.2): version(1) | public_key(32) | provisional_caps(2 LE). NodeID = pubkey[:10].
+            val info = NodeInfo.decode(data) ?: run {
+                onLog?.invoke(gatt.device.address, "NODE_INFO malformed (${data.size} bytes)")
+                gatt.disconnect(); return
             }
-            val description = readStr()
-            val name = readStr()
-            val platform = readStr()
-            peerDescription = description
-            peerName = name
-            peerPlatform = platform
+            val nodeId = info.nodeId
+            peerPublicKey = info.publicKey
             peerNodeId = nodeId
-            peerCaps = caps
-            Log.i(TAG, "NODE_INFO peer=${nodeId.toHexString()} caps=$caps name=$name platform=$platform")
-            onLog?.invoke(gatt.device.address, "peer=${nodeId.toHexString()} caps=$caps name=$name")
-            if (onNodeInfoRead != null && !onNodeInfoRead.invoke(nodeId, pubKey, caps, name, platform)) {
-                Log.i(TAG, "Aborting connection to ${nodeId.toHexString()} per deterministic rule")
+            peerCaps = info.provisionalCaps
+            Log.i(TAG, "NODE_INFO peer=${nodeId.toHex()} caps=${info.provisionalCaps}")
+            onLog?.invoke(gatt.device.address, "peer=${nodeId.toHex()} caps=${info.provisionalCaps}")
+            if (onNodeInfoRead != null && !onNodeInfoRead.invoke(nodeId, info.publicKey, info.provisionalCaps)) {
+                Log.i(TAG, "Aborting connection to ${nodeId.toHex()} per deterministic rule")
                 gatt.disconnect()
                 return
             }
@@ -324,7 +308,7 @@ class BLEEdgeGattClient(
             onLog?.invoke(addr, "subscribed to PACKET_OUT, requesting PHY")
             startKeepalive()
             val phyMask = when (phyMode) {
-                PHYMode.DEBUG_1M        -> BluetoothDevice.PHY_LE_1M_MASK
+                PHYMode.ONE_M           -> BluetoothDevice.PHY_LE_1M_MASK
                 PHYMode.CODED_ONLY,
                 PHYMode.CODED_PREFERRED -> BluetoothDevice.PHY_LE_CODED_MASK
             }
@@ -370,5 +354,3 @@ class BLEEdgeGattClient(
         }
     }
 }
-
-private fun NodeID.toHexString() = bytes.joinToString("") { "%02x".format(it) }

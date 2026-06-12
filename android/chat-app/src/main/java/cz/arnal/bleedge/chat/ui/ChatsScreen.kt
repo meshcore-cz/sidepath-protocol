@@ -74,9 +74,9 @@ fun ChatsScreen(
             TopAppBar(
                 navigationIcon = {
                     // Tapping your own avatar opens your profile (Settings is in the ⋮ menu).
-                    IconButton(onClick = { onOpenProfile(myNode.toHexString()) }) {
+                    IconButton(onClick = { onOpenProfile(myNode.toHex()) }) {
                         Avatar(
-                            seed = myNode.toHexString(),
+                            seed = myNode.toHex(),
                             label = myName.ifBlank { "Me" },
                             identiconKey = myPubKeyHex,
                             size = 32,

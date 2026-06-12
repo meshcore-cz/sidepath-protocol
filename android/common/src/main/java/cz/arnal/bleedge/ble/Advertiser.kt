@@ -9,9 +9,10 @@ import android.bluetooth.le.AdvertisingSetParameters
 import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
-import cz.arnal.bleedge.core.BLEEdgeUUIDs
-import cz.arnal.bleedge.core.NodeID
-import cz.arnal.bleedge.core.PHYMode
+import cz.arnal.bleedge.protocol.NodeId
+import cz.arnal.bleedge.transport.BLEEDGE_MANUFACTURER_ID
+import cz.arnal.bleedge.transport.BLEEdgeUUIDs
+import cz.arnal.bleedge.transport.PHYMode
 
 private const val TAG = "BLEEdgeAdvertiser"
 
@@ -26,7 +27,7 @@ class BLEEdgeAdvertiser(
     private var advertisingSet: AdvertisingSet? = null
     private var activeCallback: AdvertisingSetCallback? = null
 
-    fun startAdvertising(nodeId: NodeID, phyMode: PHYMode, onLog: ((String) -> Unit)? = null) {
+    fun startAdvertising(nodeId: NodeId, phyMode: PHYMode, onLog: ((String) -> Unit)? = null) {
         val leAdvertiser = adapter.bluetoothLeAdvertiser
             ?: run {
                 Log.e(TAG, "LE advertiser not available")
@@ -34,7 +35,7 @@ class BLEEdgeAdvertiser(
                 return
             }
 
-        if (phyMode == PHYMode.DEBUG_1M) {
+        if (phyMode == PHYMode.ONE_M) {
             startLegacyAdvertising(leAdvertiser, nodeId, onLog)
         } else {
             startExtendedAdvertising(leAdvertiser, nodeId, onLog)
@@ -43,7 +44,7 @@ class BLEEdgeAdvertiser(
 
     private fun startExtendedAdvertising(
         leAdvertiser: android.bluetooth.le.BluetoothLeAdvertiser,
-        nodeId: NodeID,
+        nodeId: NodeId,
         onLog: ((String) -> Unit)? = null,
     ) {
         val params = AdvertisingSetParameters.Builder()
@@ -59,7 +60,7 @@ class BLEEdgeAdvertiser(
             .addServiceUuid(ParcelUuid(BLEEdgeUUIDs.SERVICE))
             // Manufacturer data moved to primary data since setScannable(false) means
             // scan response must be null per Android API contract.
-            .addManufacturerData(0xBEED, nodeId.bytes)
+            .addManufacturerData(BLEEDGE_MANUFACTURER_ID, nodeId.bytes)
             .setIncludeDeviceName(false)
             .build()
 
@@ -87,7 +88,7 @@ class BLEEdgeAdvertiser(
 
     private fun startLegacyAdvertising(
         leAdvertiser: android.bluetooth.le.BluetoothLeAdvertiser,
-        nodeId: NodeID,
+        nodeId: NodeId,
         onLog: ((String) -> Unit)? = null,
     ) {
         val params = AdvertisingSetParameters.Builder()
@@ -104,7 +105,7 @@ class BLEEdgeAdvertiser(
             .build()
 
         val scanResponse = AdvertiseData.Builder()
-            .addManufacturerData(0xBEED, nodeId.bytes)
+            .addManufacturerData(BLEEDGE_MANUFACTURER_ID, nodeId.bytes)
             .build()
 
         val callback = object : AdvertisingSetCallback() {

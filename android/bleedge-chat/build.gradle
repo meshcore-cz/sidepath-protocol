@@ -1,0 +1,19 @@
+plugins {
+    id 'org.jetbrains.kotlin.jvm'
+    id 'java-library'
+}
+
+// BLEEdge Chat protocol — pure Kotlin/JVM, no Android dependencies. Implements
+// docs/CHAT_PROTOCOL.md (PUBLIC_TEXT, DIRECT_TEXT, TYPING, CHANNEL_TEXT) as a
+// BLEEDGE_CHAT (0x0100) payload protocol on top of :bleedge-protocol.
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+dependencies {
+    api project(':bleedge-protocol')
+    api "com.upokecenter:cbor:4.5.4"
+    api "org.bouncycastle:bcprov-jdk18on:1.78.1"
+    testImplementation "junit:junit:4.13.2"
+}

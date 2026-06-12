@@ -5,7 +5,9 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
-@Database(entities = [Message::class, Contact::class, Channel::class], version = 2, exportSchema = false)
+// v3: NodeIDs widened 8→10 bytes (protocol v3), so old peer/contact ids are stale —
+// destructive migration wipes the v2 store. See docs/PROTOCOL.md migration §17.
+@Database(entities = [Message::class, Contact::class, Channel::class], version = 3, exportSchema = false)
 abstract class ChatDatabase : RoomDatabase() {
     abstract fun chatDao(): ChatDao
 

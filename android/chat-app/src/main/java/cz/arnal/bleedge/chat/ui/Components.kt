@@ -381,7 +381,7 @@ fun MessageDetailsSheet(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 repeatSamples.forEachIndexed { i, s ->
-                    val via = s.forwarderId?.let { vm.nameForHex(it.toHexString()) }
+                    val via = s.forwarderId?.let { vm.nameForHex(it.toHex()) }
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
                             "${i + 1}. ${formatClock(s.timestampMs)}${if (via != null) "  · via $via" else ""}",

@@ -64,15 +64,15 @@ fun NetworkScreen(
     val stats by vm.stats.collectAsState()
     val running by vm.isRunning.collectAsState()
     val lastPacketAt by vm.lastPacketAtMs.collectAsState()
-    val myHex = myNode.toHexString()
+    val myHex = myNode.toHex()
 
     // Identicons are drawn from a node's 32-byte public key; learn it from the live topology.
     val pubKeys = remember(topology) {
         topology.filter { it.publicKey.size == 32 }
-            .associate { it.nodeId.toHexString() to it.publicKey.toHex() }
+            .associate { it.nodeId.toHex() to it.publicKey.toHex() }
     }
     // A direct peer is always reachable, so the Trace button targets the first one.
-    val traceTarget = peers.firstOrNull()?.nodeId?.toHexString()
+    val traceTarget = peers.firstOrNull()?.nodeId?.toHex()
 
     Scaffold(
         topBar = {
@@ -96,7 +96,7 @@ fun NetworkScreen(
         },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
     ) { padding ->
-        val others = topology.filter { it.nodeId.toHexString() != myHex }
+        val others = topology.filter { it.nodeId.toHex() != myHex }
         LazyColumn(Modifier.fillMaxSize().padding(padding)) {
             item { ConnectionBanner(status, peers.size, others.size) }
 
@@ -137,8 +137,8 @@ fun NetworkScreen(
             } else {
                 // Keys must be unique across the whole list; a peer is usually also in the
                 // topology below, so namespace the keys to avoid a collision crash.
-                items(peers, key = { "peer:${it.nodeId.toHexString()}" }) { peer ->
-                    PeerRow(peer, pubKeys[peer.nodeId.toHexString()]) { onOpenProfile(peer.nodeId.toHexString()) }
+                items(peers, key = { "peer:${it.nodeId.toHex()}" }) { peer ->
+                    PeerRow(peer, pubKeys[peer.nodeId.toHex()]) { onOpenProfile(peer.nodeId.toHex()) }
                 }
             }
 
@@ -148,8 +148,8 @@ fun NetworkScreen(
             if (others.isEmpty()) {
                 item { EmptyLine("No nodes learned yet.") }
             } else {
-                items(others, key = { "topo:${it.nodeId.toHexString()}" }) { node ->
-                    TopologyRow(node, node.publicKey.takeIf { it.size == 32 }?.toHex()) { onOpenProfile(node.nodeId.toHexString()) }
+                items(others, key = { "topo:${it.nodeId.toHex()}" }) { node ->
+                    TopologyRow(node, node.publicKey.takeIf { it.size == 32 }?.toHex()) { onOpenProfile(node.nodeId.toHex()) }
                 }
             }
 
@@ -253,18 +253,17 @@ fun lastPacketLabel(atMs: Long?): String {
 private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
     // Prefer the name the peer advertises on the wire; fall back to the derived default.
     val label = peer.name.ifBlank { nameFromPubKey(pubKeyHex ?: "") }
-        .ifBlank { peer.nodeId.toHexString().take(16) }
+        .ifBlank { peer.nodeId.toHex().take(16) }
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = peer.nodeId.toHexString(), label = label, identiconKey = pubKeyHex, onClick = onClick)
+        Avatar(seed = peer.nodeId.toHex(), label = label, identiconKey = pubKeyHex, onClick = onClick)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(label, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            val platform = peer.platform.ifBlank { "unknown platform" }
             Text(
-                "${peer.nodeId.toHexString().take(16)} · $platform",
+                peer.nodeId.toHex().take(20),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -283,19 +282,19 @@ private fun PeerRow(peer: PeerInfo, pubKeyHex: String?, onClick: () -> Unit) {
 @Composable
 private fun TopologyRow(node: TopologyEntry, pubKeyHex: String?, onClick: () -> Unit) {
     val label = node.name.ifBlank { nameFromPubKey(pubKeyHex ?: "") }
-        .ifBlank { node.nodeId.toHexString().take(16) }
+        .ifBlank { node.nodeId.toHex().take(16) }
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = node.nodeId.toHexString(), label = label, size = 36, identiconKey = pubKeyHex, onClick = onClick)
+        Avatar(seed = node.nodeId.toHex(), label = label, size = 36, identiconKey = pubKeyHex, onClick = onClick)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(label, fontWeight = FontWeight.Medium, maxLines = 1)
             val nb = node.neighborIds.size
             val platform = node.platform.ifBlank { "unknown platform" }
             Text(
-                "${node.nodeId.toHexString().take(16)} · $platform · $nb neighbor${if (nb == 1) "" else "s"}",
+                "${node.nodeId.toHex().take(16)} · $platform · $nb neighbor${if (nb == 1) "" else "s"}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

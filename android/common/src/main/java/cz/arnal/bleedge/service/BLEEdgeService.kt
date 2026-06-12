@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.BluetoothDevice
+import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.Build
@@ -17,38 +18,39 @@ import cz.arnal.bleedge.ble.BLEEdgeGattServer
 import cz.arnal.bleedge.ble.BLEEdgeScanner
 import cz.arnal.bleedge.ble.BLEManager
 import cz.arnal.bleedge.ble.BLEPeerLink
-import cz.arnal.bleedge.core.Action
-import cz.arnal.bleedge.core.ActionType
-import cz.arnal.bleedge.core.DropReason
-import cz.arnal.bleedge.core.defaultNodeName
-import cz.arnal.bleedge.core.AnnouncePayload
-import cz.arnal.bleedge.core.ANDROID_CAPABILITIES
-import cz.arnal.bleedge.core.Capabilities
-import cz.arnal.bleedge.core.Crypto
-import cz.arnal.bleedge.core.Frame
-import cz.arnal.bleedge.core.Identity
-import cz.arnal.bleedge.core.NodeID
-import cz.arnal.bleedge.core.isBroadcast
-import cz.arnal.bleedge.core.Packet
-import cz.arnal.bleedge.core.PacketType
-import cz.arnal.bleedge.core.PayloadType
-import cz.arnal.bleedge.core.PHY
-import cz.arnal.bleedge.core.PHYMode
-import cz.arnal.bleedge.core.PROTOCOL_VERSION
-import cz.arnal.bleedge.core.Reassembler
-import cz.arnal.bleedge.core.Router
-import cz.arnal.bleedge.core.RoutingMode
-import cz.arnal.bleedge.core.TRACE_HASH_WIDTH_8
-import cz.arnal.bleedge.core.TRACE_METRIC_RSSI
-import cz.arnal.bleedge.core.TracePayload
-import cz.arnal.bleedge.core.TraceResult
-import cz.arnal.bleedge.core.decodeTracePayload
-import cz.arnal.bleedge.core.encodeTracePayload
-import cz.arnal.bleedge.core.fragmentPacket
-import cz.arnal.bleedge.core.newPacketID
-import cz.arnal.bleedge.core.randomTraceTag
-import cz.arnal.bleedge.core.traceFlagsForHashWidth
-import cz.arnal.bleedge.core.traceRouteData
+import cz.arnal.bleedge.chatproto.Chat
+import cz.arnal.bleedge.chatproto.ChatChannel
+import cz.arnal.bleedge.chatproto.ChatContext
+import cz.arnal.bleedge.chatproto.ChatDirectText
+import cz.arnal.bleedge.chatproto.ChatKind
+import cz.arnal.bleedge.chatproto.ChatPublicText
+import cz.arnal.bleedge.chatproto.ChatTyping
+import cz.arnal.bleedge.protocol.AckBody
+import cz.arnal.bleedge.protocol.Action
+import cz.arnal.bleedge.protocol.ActionType
+import cz.arnal.bleedge.protocol.AnnounceBody
+import cz.arnal.bleedge.protocol.BLEEdge
+import cz.arnal.bleedge.protocol.Capabilities
+import cz.arnal.bleedge.protocol.ControlKind
+import cz.arnal.bleedge.protocol.ControlMessage
+import cz.arnal.bleedge.protocol.Datagram
+import cz.arnal.bleedge.protocol.DatagramFlags
+import cz.arnal.bleedge.protocol.DropReason
+import cz.arnal.bleedge.protocol.Frame
+import cz.arnal.bleedge.protocol.Identity
+import cz.arnal.bleedge.protocol.NeighborEntry as ProtoNeighbor
+import cz.arnal.bleedge.protocol.NodeId
+import cz.arnal.bleedge.protocol.PayloadProtocol
+import cz.arnal.bleedge.protocol.Reassembler
+import cz.arnal.bleedge.protocol.Router
+import cz.arnal.bleedge.protocol.TopoNode
+import cz.arnal.bleedge.protocol.TraceMetric
+import cz.arnal.bleedge.protocol.TraceRequestBody
+import cz.arnal.bleedge.protocol.TraceResponseBody
+import cz.arnal.bleedge.protocol.defaultNodeName
+import cz.arnal.bleedge.transport.ANDROID_CAPABILITIES
+import cz.arnal.bleedge.transport.PHY
+import cz.arnal.bleedge.transport.PHYMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -61,82 +63,79 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
 
 private const val TAG = "BLEEdgeService"
 private const val NOTIFICATION_CHANNEL = "bleedge"
 private const val NOTIFICATION_ID = 1
-// Sentinel for "RSSI not measurable" (e.g. inbound GATT-server peers).
-const val RSSI_UNKNOWN = Int.MIN_VALUE
+private const val EPOCH_PREFS = "bleedge_node"
+private const val EPOCH_KEY = "announce_epoch"
 
-// Payload types of our own flooded messages whose repeats we track (chat broadcasts/DMs).
-private val floodRepeatTypes = setOf(
-    PayloadType.CHANNEL, PayloadType.CHAT_PLAIN, PayloadType.CHAT_ENCRYPTED, PayloadType.TEXT_TEST,
-)
+/** Sentinel for "RSSI not measurable" (e.g. inbound GATT-server peers). */
+const val RSSI_UNKNOWN = Int.MIN_VALUE
 
 // ---- UI data models ---------------------------------------------------------
 
 data class PeerInfo(
-    val nodeId: NodeID,
+    val nodeId: NodeId,
     val rssi: Int,
     val txPhy: PHY,
     val rxPhy: PHY,
     val caps: Capabilities,
-    val phyInvalid: Boolean = false,
-    val incoming: Boolean = false,  // true = peer connected TO us (server side)
-    val description: String = "",   // free-form bio (NODE_INFO or ANNOUNCE)
-    val name: String = "",          // primary display label (NODE_INFO or ANNOUNCE)
-    val platform: String = "",      // OS/device string (NODE_INFO or ANNOUNCE)
-)
-
-data class ReceivedMessage(
-    val fromNodeId: NodeID,
-    val payload: ByteArray,
-    val timestampMs: Long = System.currentTimeMillis(),
-    val isAck: Boolean = false,
-    val payloadType: PayloadType = PayloadType.TEXT_TEST,
-    val trace: List<NodeID> = emptyList(), // hop path the packet took to reach us (route detail)
-    val text: String? = null,              // decoded/decrypted text for chat payloads
-    val ackedId: ByteArray? = null,        // for ACKs: id of the DATA packet being acked
-    val packetId: ByteArray = ByteArray(0),
+    val incoming: Boolean = false,
+    val name: String = "",
+    val publicKey: ByteArray = ByteArray(0),
 )
 
 /**
- * A successfully decoded BLEEdge packet captured for the Rx Log — only genuine packets land here
- * (frame-decode/reassembly/packet-decode failures are dropped). Carries an overview plus the full
- * raw bytes so the UI can show a per-packet detail/hex view on tap.
+ * A locally delivered datagram surfaced to the UI. For BLEEDGE_CHAT payloads the
+ * service has already verified/decrypted what it can: DIRECT_TEXT and PUBLIC_TEXT
+ * carry [text]; CHANNEL_TEXT carries [channelPayload] for the app to decode with
+ * its joined channel secrets; TYPING sets [isTyping].
  */
+data class ReceivedMessage(
+    val fromNodeId: NodeId,
+    val datagramId: ByteArray,
+    val protocol: Int,
+    val chatKind: Int? = null,
+    val text: String? = null,
+    val senderPublicKey: ByteArray? = null,
+    val isAck: Boolean = false,
+    val ackedId: ByteArray? = null,
+    val isTyping: Boolean = false,
+    val channelPayload: ByteArray? = null,
+    val traceResponse: TraceResponseBody? = null,
+    val path: List<NodeId> = emptyList(),
+    val timestampMs: Long = System.currentTimeMillis(),
+)
+
+/** A decoded datagram captured for the Rx Log. */
 data class RxPacket(
     val timestampMs: Long,
-    val type: PacketType,
-    val payloadType: PayloadType,
+    val protocol: Int,
+    val chatKind: Int?,       // for BLEEDGE_CHAT: the chat message kind (ChatKind.*)
+    val controlKind: Int?,    // for BLEEDGE_CONTROL: the control message kind (ControlKind.*)
     val id: ByteArray,
-    val source: NodeID,
-    val destination: NodeID,
-    val mode: RoutingMode,
+    val source: NodeId,
+    val destination: NodeId,
+    val sourceRouted: Boolean,
+    val routeCursor: Int,
     val ttl: Int,
-    val trace: List<NodeID>,
-    val route: List<NodeID>,
+    val flags: Int,
+    val ackRequested: Boolean,
+    val path: List<NodeId>,
+    val route: List<NodeId>,
     val payloadSize: Int,
-    val raw: ByteArray,        // full decoded packet bytes (CBOR)
-    val forUs: Boolean,        // addressed to us or broadcast (vs. overheard/relayed)
+    val raw: ByteArray,
+    val forUs: Boolean,
 )
 
-/**
- * One "repeat" of one of our own flooded messages heard back on the radio — a relay rebroadcast
- * it. We drop these as duplicates, but recording them (with the receiving link's RSSI) lets the UI
- * show how many times, and how strongly, a broadcast propagated.
- */
 data class RepeatSample(
     val timestampMs: Long,
-    val rssi: Int,  // RSSI of the link the repeat arrived on, or RSSI_UNKNOWN (inbound peers)
-    val forwarderId: NodeID? = null, // the node that forwarded this echo to us (last trace hop / source)
+    val rssi: Int,
+    val forwarderId: NodeId? = null,
 )
 
-/**
- * Delivery progress for one outgoing DM, keyed by its original packet-id hex. Tracks how many
- * times it was sent, whether an ACK came back, and whether all tries were exhausted — surfaced in
- * the message's status/details and used to mark unacked DMs as failed.
- */
 data class DmDelivery(
     val attemptsSent: Int,
     val maxTries: Int,
@@ -153,28 +152,23 @@ data class LogEntry(
 )
 
 data class NeighborEntry(
-    val nodeId: NodeID,
+    val nodeId: NodeId,
     val rssi: Int,
-    val txPhy: PHY,
-    val rxPhy: PHY,
     val caps: Capabilities,
-    val description: String = "",
     val name: String = "",
-    val platform: String = "",
 )
 
 data class TopologyEntry(
-    val nodeId: NodeID,
+    val nodeId: NodeId,
     val caps: Capabilities,
-    val neighborIds: List<NodeID>,
-    val lastAnnounceMs: Long = 0L, // wall-clock time the last ANNOUNCE from this node was seen
-    val description: String = "",
+    val neighborIds: List<NodeId>,
+    val lastAnnounceMs: Long = 0L,
     val name: String = "",
+    val description: String = "",
     val platform: String = "",
-    val publicKey: ByteArray = ByteArray(0), // 32-byte Ed25519 key (for chat encryption)
+    val publicKey: ByteArray = ByteArray(0),
 )
 
-/** Running mesh activity counters, surfaced on the Network page. */
 data class MeshStats(
     val packetsReceived: Int = 0,
     val packetsSent: Int = 0,
@@ -197,31 +191,31 @@ class BLEEdgeService : Service() {
     private lateinit var reassembler: Reassembler
     private lateinit var bleManager: BLEManager
     private var bleGattServer: BLEEdgeGattServer? = null
-    // Outgoing connections: BLE MAC hex → link (we are GattClient)
+
+    // Outgoing connections (we are GATT client): BLE MAC hex -> link.
     private val peers = ConcurrentHashMap<String, BLEPeerLink>()
-    // Incoming connections: BLE MAC hex → NodeID (peer is GattClient to our GattServer)
-    // NodeID is null until the peer's first packet arrives and reveals pkt.source.
-    private val serverPeers = ConcurrentHashMap<String, NodeID?>()
-    // BluetoothDevice objects for server-side peers (needed to send notifications back)
+    // Incoming connections (peer is client to our server): BLE MAC hex -> direct peer NodeId (or null).
+    private val serverPeers = ConcurrentHashMap<String, NodeId?>()
     private val serverPeerDevices = ConcurrentHashMap<String, BluetoothDevice>()
-    private var announceSeq = 0
+
+    private var identity: Identity? = null
+    private var epoch: Long = 0
+    private var announceSeq: Long = 0
+
     private var bleAdvertiser: BLEEdgeAdvertiser? = null
     private var bleScanner: BLEEdgeScanner? = null
 
-    // Local Ed25519 identity (set in initialize); NodeID = identity.nodeId.
-    private var identity: Identity? = null
+    private var nodeName: String = ""
+    private var nodeDescription: String = ""
+    private var nodePlatform: String = ""
 
-    // StateFlows consumed by the UI
-    private val _nodeId = MutableStateFlow(NodeID(ByteArray(8)))
-    val nodeId: StateFlow<NodeID> = _nodeId.asStateFlow()
+    private val _nodeId = MutableStateFlow(NodeId.BROADCAST)
+    val nodeId: StateFlow<NodeId> = _nodeId.asStateFlow()
 
-    /** Newest-first ring of decoded packets seen on the radio, for the Rx Log. */
     private val _rxPackets = MutableStateFlow<List<RxPacket>>(emptyList())
     val rxPackets: StateFlow<List<RxPacket>> = _rxPackets.asStateFlow()
     private val maxRxPackets = 300
 
-    // Repeats of our own flooded messages heard back, keyed by packet id hex. originatedFloodIds
-    // remembers which ids are ours (and when) so we can attribute incoming echoes to a message.
     private val originatedFloodIds = ConcurrentHashMap<String, Long>()
     private val _floodRepeats = MutableStateFlow<Map<String, List<RepeatSample>>>(emptyMap())
     val floodRepeats: StateFlow<Map<String, List<RepeatSample>>> = _floodRepeats.asStateFlow()
@@ -229,13 +223,12 @@ class BLEEdgeService : Service() {
     private val _bleMacAddress = MutableStateFlow("")
     val bleMacAddress: StateFlow<String> = _bleMacAddress.asStateFlow()
 
-    private val _phyMode = MutableStateFlow(PHYMode.DEBUG_1M)
+    private val _phyMode = MutableStateFlow(PHYMode.ONE_M)
     val phyMode: StateFlow<PHYMode> = _phyMode.asStateFlow()
 
     private val _codedPhySupported = MutableStateFlow(false)
     val codedPhySupported: StateFlow<Boolean> = _codedPhySupported.asStateFlow()
 
-    // True when the device doesn't support the requested PHY and 1M fallback is active
     private val _phyFallback = MutableStateFlow(false)
     val phyFallback: StateFlow<Boolean> = _phyFallback.asStateFlow()
 
@@ -251,13 +244,10 @@ class BLEEdgeService : Service() {
     private val _connectedPeers = MutableStateFlow<List<PeerInfo>>(emptyList())
     val connectedPeers: StateFlow<List<PeerInfo>> = _connectedPeers.asStateFlow()
 
-    // ---- Direct-message delivery retry ----
-    // DMs expect an ACK; if none arrives within [dmRetryDelayMs], the same payload is re-sent (with
-    // a fresh packet id) up to [dmMaxTries] times total. Each attempt id maps back to the ORIGINAL
-    // id so the ACK still resolves the original message row (translation is invisible to the UI).
+    // ---- DM delivery retry ----
     @Volatile private var dmRetryDelayMs: Long = 3000
     @Volatile private var dmMaxTries: Int = 3
-    private val pendingDms = ConcurrentHashMap<String, PendingDm>()   // key = original id hex
+    private val pendingDms = ConcurrentHashMap<String, PendingDm>()    // key = original id hex
     private val attemptToOriginal = ConcurrentHashMap<String, String>() // attempt id hex -> original id hex
     private val _dmDeliveries = MutableStateFlow<Map<String, DmDelivery>>(emptyMap())
     val dmDeliveries: StateFlow<Map<String, DmDelivery>> = _dmDeliveries.asStateFlow()
@@ -266,12 +256,14 @@ class BLEEdgeService : Service() {
         _dmDeliveries.update { m -> m[idHex]?.let { m + (idHex to f(it)) } ?: m }
     }
 
+    /** A direct message awaiting ACK. The text/recipient are stored (not the sealed bytes) because
+     *  each retry uses a fresh datagram id and the AEAD AAD binds to that id, so it must be re-sealed. */
     private class PendingDm(
         val originalIdHex: String,
-        val payload: ByteArray,
-        val payloadType: PayloadType,
-        val dest: NodeID,
-        val ttl: Byte,
+        val text: String,
+        val recipientPub: ByteArray,
+        val dest: NodeId,
+        val floodTtl: Int,
         var attemptsSent: Int,
         var job: Job? = null,
     )
@@ -291,7 +283,7 @@ class BLEEdgeService : Service() {
     private val _stats = MutableStateFlow(MeshStats())
     val stats: StateFlow<MeshStats> = _stats.asStateFlow()
 
-    private var allowlist = mutableSetOf<String>() // hex NodeID strings
+    private var allowlist = mutableSetOf<String>()
 
     override fun onCreate() {
         super.onCreate()
@@ -299,22 +291,17 @@ class BLEEdgeService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification("BLEEdge running"))
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
-
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
-        bleManager.stopAll()
+        if (::bleManager.isInitialized) bleManager.stopAll()
         scope.cancel()
         super.onDestroy()
     }
 
-    /** The auto OS/device string carried as the `platform` field. */
     fun defaultPlatform(): String = "Android ${Build.VERSION.RELEASE} (${Build.MODEL})"
 
-    /** Initialize the BLE node with the given config. Call once after binding. */
     fun initialize(
         identity: Identity,
         requestedPhyMode: PHYMode,
@@ -326,69 +313,61 @@ class BLEEdgeService : Service() {
     ) {
         setDmRetry(dmRetryDelayMs, dmMaxTries)
         this.identity = identity
-        val nodeId = identity.nodeId
-        // Reset all runtime state so the UI starts clean every time the service initialises.
-        peers.clear()
-        serverPeers.clear()
-        serverPeerDevices.clear()
+        val localId = identity.nodeId
+
+        peers.clear(); serverPeers.clear(); serverPeerDevices.clear()
         _connectedPeers.value = emptyList()
         _receivedMessages.value = emptyList()
         _routingLog.value = emptyList()
         _neighborTable.value = emptyList()
         _knownTopology.value = emptyList()
 
-        _nodeId.value = nodeId
+        _nodeId.value = localId
         this.allowlist = allowlist.toMutableSet()
 
+        // §8.5: increment + persist the epoch before the first announce after startup.
+        val prefs = getSharedPreferences(EPOCH_PREFS, Context.MODE_PRIVATE)
+        epoch = prefs.getLong(EPOCH_KEY, 0) + 1
+        prefs.edit().putLong(EPOCH_KEY, epoch).apply()
+        announceSeq = 0
+
+        nodeDescription = description
+        nodePlatform = defaultPlatform()
+        nodeName = name.ifBlank { defaultNodeName(identity.publicKey) }
+
         router = Router(identity)
-        router.description = description
-        router.platform = defaultPlatform()
-        router.name = name.ifBlank { defaultNodeName(identity.publicKey) }
         router.allowlist.addAll(allowlist)
-        reassembler = Reassembler(scope)
+        reassembler = Reassembler()
 
         bleManager = BLEManager(this, requestedPhyMode)
         bleManager.logCapabilities()
         _codedPhySupported.value = bleManager.isLeCodedPhySupported
         _bleMacAddress.value = bleManager.adapter.address ?: ""
-        log(
-            "BLE caps: codedPhy=${bleManager.isLeCodedPhySupported} " +
-                "extAdv=${bleManager.isLeExtendedAdvertisingSupported} " +
-                "multiAdv=${bleManager.isMultipleAdvertisementSupported} " +
-                "maxAdvDataLen=${bleManager.adapter.leMaximumAdvertisingDataLength}",
-            LogTag.SYS,
-        )
+        log("BLE caps: codedPhy=${bleManager.isLeCodedPhySupported} extAdv=${bleManager.isLeExtendedAdvertisingSupported} multiAdv=${bleManager.isMultipleAdvertisementSupported}", LogTag.SYS)
 
-        // Auto-fallback: if Coded PHY was requested but this hardware doesn't support it,
-        // drop to 1m so advertising and scanning actually work.
-        val effectivePhy = if (!bleManager.isLeCodedPhySupported && requestedPhyMode != PHYMode.DEBUG_1M) {
+        val effectivePhy = if (!bleManager.isLeCodedPhySupported && requestedPhyMode != PHYMode.ONE_M) {
             log("WARNING: LE Coded PHY not supported — falling back to 1m", LogTag.PHY)
-            PHYMode.DEBUG_1M
-        } else {
-            requestedPhyMode
-        }
+            PHYMode.ONE_M
+        } else requestedPhyMode
         _phyMode.value = effectivePhy
         _phyFallback.value = effectivePhy != requestedPhyMode
 
-        val caps = ANDROID_CAPABILITIES
         val gattServer = bleManager.createGattServer(
             pubKey = identity.publicKey,
-            caps = caps,
-            description = router.description,
-            name = router.name,
-            platform = router.platform,
+            caps = ANDROID_CAPABILITIES,
             onFrameReceived = { frame, device -> handleIncomingFrame(frame, device) },
             onDeviceConnected = { device ->
                 val addrHex = device.address.replace(":", "")
-                serverPeers[addrHex] = null // connected, NodeID not yet known
+                serverPeers[addrHex] = null
                 serverPeerDevices[addrHex] = device
-                log("device connected addr=${device.address} (NodeID unknown until first packet)", LogTag.SERVER)
+                log("device connected addr=${device.address}", LogTag.SERVER)
             },
             onDeviceDisconnected = { device ->
                 val addrHex = device.address.replace(":", "")
-                val nodeId = serverPeers.remove(addrHex)
+                val nid = serverPeers.remove(addrHex)
                 serverPeerDevices.remove(addrHex)
-                log("device disconnected addr=${device.address} node=${nodeId?.toHexString() ?: "unknown"}", LogTag.SERVER)
+                nid?.let { router.neighbors.remove(it) }
+                log("device disconnected addr=${device.address} node=${nid?.toHex() ?: "unknown"}", LogTag.SERVER)
                 updatePeersState()
             },
             onLog = { msg -> log(msg, LogTag.SERVER) },
@@ -396,14 +375,11 @@ class BLEEdgeService : Service() {
         gattServer.start()
         bleGattServer = gattServer
 
-        bleAdvertiser = bleManager.createAdvertiser(nodeId)
-        bleAdvertiser!!.startAdvertising(nodeId, effectivePhy) { msg ->
-            log("advertiser: $msg", LogTag.SYS)
-        }
+        bleAdvertiser = bleManager.createAdvertiser(localId)
+        bleAdvertiser!!.startAdvertising(localId, effectivePhy) { msg -> log("advertiser: $msg", LogTag.SYS) }
         _advertisingActive.value = true
 
         bleScanner = bleManager.createScanner()
-        log("scanner starting phyMode=$effectivePhy", LogTag.SCAN)
         bleScanner!!.startScan(
             phyMode = effectivePhy,
             onFound = { device, rssi, advNodeId -> handleFoundDevice(device, rssi, advNodeId) },
@@ -412,43 +388,24 @@ class BLEEdgeService : Service() {
         _scanningActive.value = true
         _isRunning.value = true
 
-        // Periodic ANNOUNCE
-        scope.launch {
-            while (true) {
-                delay(15_000)
-                sendAnnounce()
-            }
-        }
+        scope.launch { while (true) { delay(BLEEdge.ANNOUNCE_INTERVAL_MS); sendAnnounce() } }
+        scope.launch { while (true) { delay(2_000); refreshTopologyState() } }
 
-        // Periodic UI refresh
-        scope.launch {
-            while (true) {
-                delay(2_000)
-                refreshTopologyState()
-            }
-        }
-
-        log("node started id=${nodeId.toHexString()} requested-phy=$requestedPhyMode effective-phy=$effectivePhy codedPhy=${_codedPhySupported.value}", LogTag.SYS)
+        log("node started id=${localId.toHex()} epoch=$epoch requested-phy=$requestedPhyMode effective-phy=$effectivePhy", LogTag.SYS)
     }
 
-    private fun handleFoundDevice(device: BluetoothDevice, rssi: Int, advNodeId: NodeID?) {
-        val peerHex = device.address.replace(":", "")
-        if (peers.containsKey(peerHex)) return // already connecting / connected to this MAC
+    // ---- discovery / connection ----------------------------------------------
 
+    private fun handleFoundDevice(device: BluetoothDevice, rssi: Int, advNodeId: NodeId?) {
+        val peerHex = device.address.replace(":", "")
+        if (peers.containsKey(peerHex)) return
         val localId = _nodeId.value
 
-        // We learn the peer's NodeID directly from its advertisement. Discovery over
-        // Coded PHY is often asymmetric (one side hears the other but not vice-versa),
-        // so we do NOT gate on the NodeID ordering here: whoever discovers a peer simply
-        // connects. If both sides happen to connect, the duplicate link is collapsed
-        // deterministically (the larger NodeID drops its outgoing) in collapseDuplicateLink().
         if (advNodeId != null) {
-            val advHex = advNodeId.toHexString()
-            if (advHex == localId.toHexString()) return // our own advertisement
-            // Already connected to this node on some other MAC (outgoing or incoming)?
-            if (peers.values.any { it.peerId.toHexString() == advHex }) return
-            if (serverPeers.values.any { it?.toHexString() == advHex }) return
-            log("scan found node=$advHex addr=${device.address} rssi=$rssi — connecting", LogTag.SCAN)
+            if (advNodeId == localId) return
+            if (peers.values.any { it.peerId == advNodeId }) return
+            if (serverPeers.values.any { it == advNodeId }) return
+            log("scan found node=${advNodeId.toHex()} addr=${device.address} rssi=$rssi — connecting", LogTag.SCAN)
         } else {
             log("scan found addr=${device.address} rssi=$rssi (no adv nodeId) — connecting", LogTag.SCAN)
         }
@@ -457,452 +414,389 @@ class BLEEdgeService : Service() {
             context = this,
             phyMode = _phyMode.value,
             initialRssi = rssi,
-            onPhyUpdate = { txPhy, rxPhy ->
-                updatePeerPhy(peerHex, txPhy, rxPhy)
-            },
-            onFrameReceived = { frame ->
-                handleIncomingFrame(frame, device)
-            },
+            onPhyUpdate = { _, _ -> updatePeersState() },
+            onFrameReceived = { frame -> handleIncomingFrame(frame, device) },
             onDisconnected = {
                 val link = peers.remove(peerHex)
                 if (link != null) {
-                    log("peer disconnected addr=$peerHex node=${link.peerId.toHexString()}", LogTag.PEER)
+                    link.peerId?.let { router.neighbors.remove(it) }
+                    log("peer disconnected addr=$peerHex node=${link.peerId?.toHex()}", LogTag.PEER)
                     updatePeersState()
                 }
             },
-            onLog = { addr, msg ->
-                log("gatt addr=$addr $msg", LogTag.GATT)
-            },
-            onNodeInfoRead = { peerId, peerPubKey, caps, peerName, peerPlatform ->
-                val peerHex16 = peerId.toHexString()
-                // Learn the peer's full 32-byte key + name/platform from the handshake so the UI can
-                // show a proper identicon and the real name/platform before its first signed ANNOUNCE.
-                router.topology.learnPublicKey(peerId, peerPubKey, caps, name = peerName, platform = peerPlatform)
+            onLog = { addr, msg -> log("gatt addr=$addr $msg", LogTag.GATT) },
+            onNodeInfoRead = { peerId, peerPubKey, caps ->
+                router.neighbors.upsert(ProtoNeighbor(id = peerId, publicKey = peerPubKey, rssi = rssi, provisionalCaps = caps))
                 refreshTopologyState()
-                // Reject only a genuine duplicate of THIS same outgoing link (same NodeID
-                // already connected out on a different MAC — e.g. address rotation).
-                val dupOutgoing = peers.entries.any { (key, link) ->
-                    key != peerHex && link.peerId.toHexString() == peerHex16
-                }
-                // If we ALSO have an inbound link from this peer and we are the larger
-                // NodeID, the inbound link wins — drop this redundant outgoing one.
-                val haveInbound = serverPeers.values.any { it?.toHexString() == peerHex16 }
-                val keepNew: Boolean
+                val dupOutgoing = peers.entries.any { (key, link) -> key != peerHex && link.peerId == peerId }
+                val haveInbound = serverPeers.values.any { it == peerId }
                 when {
                     dupOutgoing -> {
-                        log("peer=$peerHex16 already connected outbound on another link; dropping addr=$peerHex", LogTag.PEER)
-                        peers.remove(peerHex)
-                        keepNew = false
+                        log("peer=${peerId.toHex()} already outbound on another link; dropping addr=$peerHex", LogTag.PEER)
+                        peers.remove(peerHex); false
                     }
-                    haveInbound && !localId.isLessThan(peerId) -> {
-                        log("peer=$peerHex16 already inbound and we are larger — keeping inbound, dropping outgoing", LogTag.PEER)
-                        peers.remove(peerHex)
-                        keepNew = false
+                    haveInbound && localId >= peerId -> {
+                        log("peer=${peerId.toHex()} inbound and we are larger — keeping inbound", LogTag.PEER)
+                        peers.remove(peerHex); false
                     }
                     else -> {
-                        log("connected to peer=$peerHex16 caps=$caps", LogTag.PEER)
-                        // Send an announce immediately so the server side learns our NodeID
-                        // without waiting for the 15-second periodic cycle.
+                        log("connected to peer=${peerId.toHex()} caps=$caps", LogTag.PEER)
                         scope.launch { sendAnnounce() }
-                        updatePeersState()
-                        keepNew = true
+                        updatePeersState(); true
                     }
                 }
-                keepNew
             },
         )
-        val link = BLEPeerLink(client)
-
-        // Add to map before connecting so duplicate scan results for the same MAC
-        // are suppressed. UI is NOT updated here — peer only appears once NodeID
-        // is known (inside onNodeInfoRead below).
-        peers[peerHex] = link
-
-        scope.launch(Dispatchers.Main) {
-            client.connect(device)
-        }
+        peers[peerHex] = BLEPeerLink(client)
+        scope.launch(Dispatchers.Main) { client.connect(device) }
     }
 
-    private fun handleIncomingFrame(frame: ByteArray, device: BluetoothDevice) {
+    // ---- receive path --------------------------------------------------------
+
+    private fun handleIncomingFrame(frameBytes: ByteArray, device: BluetoothDevice) {
         if (!_isRunning.value) return
-        val f = runCatching { cz.arnal.bleedge.core.Frame.decode(frame) }.getOrElse {
-            log("decode frame error: ${it.message}")
-            return
-        }
-        val data = runCatching { reassembler.addFrame(f) }.getOrElse {
-            log("reassemble error: ${it.message}")
-            return
-        } ?: return // incomplete
-
-        var pkt = runCatching { Packet.decode(data) }.getOrElse {
-            log("decode packet error: ${it.message}")
-            return
-        }
-
-        log("rx id=${pkt.id.take(4).toHexString()} type=${pkt.type} src=${pkt.source.toHexString()} dst=${pkt.destination.toHexString()} ttl=${pkt.ttl} mode=${pkt.mode} trace=${pkt.trace.map { it.toHexString().take(8) }}", LogTag.ROUTER)
-
-        // Capture the decoded packet for the Rx Log (only genuine, fully-decoded packets reach here).
-        val forUs = pkt.destination.isBroadcast() ||
-            pkt.destination.toHexString() == _nodeId.value.toHexString()
-        val rx = RxPacket(
-            timestampMs = System.currentTimeMillis(),
-            type = pkt.type,
-            payloadType = pkt.payloadType,
-            id = pkt.id,
-            source = pkt.source,
-            destination = pkt.destination,
-            mode = pkt.mode,
-            ttl = pkt.ttl.toInt() and 0xFF,
-            trace = pkt.trace,
-            route = pkt.route,
-            payloadSize = pkt.payload.size,
-            raw = data,
-            forUs = forUs,
-        )
-        _rxPackets.update { (listOf(rx) + it).take(maxRxPackets) }
-
-        // A reception of one of OUR own flooded messages is a repeat (a relay rebroadcast it).
-        // Count it and capture the RSSI of the link it arrived on (unknown for inbound peers).
-        val idHex = pkt.id.toHexString()
-        if (originatedFloodIds.containsKey(idHex)) {
-            val rssi = peers[device.address.replace(":", "")]?.rssi ?: RSSI_UNKNOWN
-            // The node that forwarded this echo to us = the last trace hop (or the source).
-            val forwarder = pkt.trace.lastOrNull() ?: pkt.source.takeIf { !it.isBroadcast() }
-            val sample = RepeatSample(System.currentTimeMillis(), rssi, forwarder)
-            _floodRepeats.update { m -> m + (idHex to ((m[idHex] ?: emptyList()) + sample)) }
-        }
-
-        // Register server-side peers from their first packet.
-        // Also handles devices that connected before this session started
-        // (onDeviceConnected was never called for them, so they're absent from serverPeers).
+        val frame = runCatching { Frame.decode(frameBytes) }.getOrElse { log("decode frame error: ${it.message}"); return }
         val addrHex = device.address.replace(":", "")
-        val isOutgoing = peers.containsKey(addrHex) ||
-            peers.values.any { it.peerId.toHexString() == pkt.source.toHexString() }
-        if (!isOutgoing && !pkt.source.isBroadcast()) {
-            if (!serverPeers.containsKey(addrHex)) {
-                // Device connected before our session — register it now.
-                serverPeers[addrHex] = pkt.source
-                serverPeerDevices[addrHex] = device
-                log("late-registered server peer addr=${device.address} node=${pkt.source.toHexString()}", LogTag.SERVER)
-                updatePeersState()
-                collapseDuplicateLink(pkt.source)
-            } else if (serverPeers[addrHex] == null) {
-                serverPeers[addrHex] = pkt.source
-                log("identified server peer addr=${device.address} node=${pkt.source.toHexString()}", LogTag.SERVER)
-                updatePeersState()
-                collapseDuplicateLink(pkt.source)
-            }
+        val data = runCatching { reassembler.addFrame(addrHex, frame) }.getOrElse { return } ?: return
+        val dg = runCatching { Datagram.decode(data) }.getOrElse { log("decode datagram error: ${it.message}"); return }
+
+        // The directly connected peer that relayed this to us is the last path hop, or the
+        // source when the originator is our direct neighbor (originators don't append themselves).
+        val directPeer = dg.path.lastOrNull() ?: dg.source.takeIf { !it.isBroadcast() && it != _nodeId.value }
+        learnNeighbor(directPeer, addrHex, device)
+
+        val forUs = dg.isBroadcast || dg.destination == _nodeId.value
+        val chatKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CHAT) Chat.peekKind(dg.payload) else null
+        val controlKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CONTROL)
+            runCatching { ControlMessage.decode(dg.payload).kind }.getOrNull() else null
+        _rxPackets.update {
+            (listOf(RxPacket(
+                timestampMs = System.currentTimeMillis(),
+                protocol = dg.protocol, chatKind = chatKind, controlKind = controlKind,
+                id = dg.id, source = dg.source, destination = dg.destination,
+                sourceRouted = dg.isSourceRouted, routeCursor = dg.routeCursor, ttl = dg.ttl,
+                flags = dg.flags, ackRequested = dg.ackRequested(),
+                path = dg.path, route = dg.route, payloadSize = dg.payload.size, raw = data, forUs = forUs,
+            )) + it).take(maxRxPackets)
         }
 
-        // Identify the incoming peer's NodeID for loop prevention in the router
-        val incomingPeer = peers.values.firstOrNull {
-            it.peerId.toHexString() == pkt.source.toHexString()
-        }?.peerId ?: serverPeers[addrHex]
+        // A reception of one of our own flooded messages is a repeat (a relay rebroadcast it).
+        val idHex = dg.id.toHex()
+        if (originatedFloodIds.containsKey(idHex)) {
+            val rssi = peers[addrHex]?.rssi ?: RSSI_UNKNOWN
+            _floodRepeats.update { m -> m + (idHex to ((m[idHex] ?: emptyList()) + RepeatSample(System.currentTimeMillis(), rssi, directPeer))) }
+        }
 
-        pkt = recordTraceMetric(pkt, incomingPeer)
-        val actions = router.handlePacket(pkt, incomingPeer)
+        val actions = router.handle(dg, directPeer)
         _stats.update { s ->
             s.copy(
                 packetsReceived = s.packetsReceived + 1,
-                duplicatesDropped = s.duplicatesDropped +
-                    actions.count { it.type == ActionType.DROP && it.reason == DropReason.DUPLICATE },
+                duplicatesDropped = s.duplicatesDropped + actions.count { it.type == ActionType.DROP && it.reason == DropReason.DUPLICATE },
             )
         }
         executeActions(actions)
     }
 
-    /**
-     * When we end up with both an outgoing (client) link AND an inbound (server) link to
-     * the same peer — which can happen if both sides discover each other — collapse them
-     * to one. The node with the larger NodeID drops its outgoing client link and relies on
-     * the inbound one, so both sides deterministically converge on the same single link.
-     */
-    private fun collapseDuplicateLink(peerId: NodeID) {
-        val hex = peerId.toHexString()
-        val hasInbound = serverPeers.values.any { it?.toHexString() == hex }
-        val outEntry = peers.entries.firstOrNull { it.value.peerId.toHexString() == hex }
-        if (hasInbound && outEntry != null && !_nodeId.value.isLessThan(peerId)) {
-            log("collapsing duplicate link to peer=$hex — dropping our outgoing (we are larger)", LogTag.PEER)
-            outEntry.value.disconnect()
-            peers.remove(outEntry.key)
-            updatePeersState()
+    private fun learnNeighbor(directPeer: NodeId?, addrHex: String, device: BluetoothDevice) {
+        if (directPeer == null) return
+        // Register/refresh inbound server peers so we can notify them back.
+        val isOutgoing = peers[addrHex]?.peerId == directPeer || peers.values.any { it.peerId == directPeer }
+        if (!isOutgoing) {
+            if (serverPeers[addrHex] != directPeer) {
+                serverPeers[addrHex] = directPeer
+                serverPeerDevices[addrHex] = device
+                updatePeersState()
+            }
+            val existing = router.neighbors.get(directPeer)
+            if (existing == null) {
+                router.neighbors.upsert(ProtoNeighbor(id = directPeer, rssi = RSSI_UNKNOWN))
+            } else {
+                router.neighbors.touch(directPeer)
+            }
+        } else {
+            router.neighbors.touch(directPeer)
         }
     }
 
     private fun executeActions(actions: List<Action>) {
         for (action in actions) {
             when (action.type) {
-                ActionType.DELIVER_LOCAL -> deliverLocal(action.packet)
-                ActionType.RELAY_FLOOD   -> {
+                ActionType.DELIVER_LOCAL -> deliverLocal(action.datagram)
+                ActionType.RELAY_FLOOD -> {
                     val jitter = router.floodJitterMs()
-                    scope.launch {
-                        delay(jitter)
-                        relayFlood(action)
-                    }
+                    scope.launch { delay(jitter); relayFlood(action) }
                 }
                 ActionType.RELAY_NEXT_HOP -> relayNextHop(action)
-                ActionType.SEND_ACK       -> sendAck(action)
-                ActionType.DROP           -> log("drop reason=${action.reason} src=${action.packet.source.toHexString()} id=${action.packet.id.take(4).toHexString()}", LogTag.ROUTER)
+                ActionType.SEND_ACK -> sendBuiltAck(action)
+                ActionType.DROP -> log("drop reason=${action.reason} src=${action.datagram.source.toHex()} id=${action.datagram.id.take(4).toHex()}", LogTag.ROUTER)
             }
         }
     }
 
-    private fun deliverLocal(pkt: Packet) {
-        if (pkt.type == PacketType.ACK) {
-            log("ACK received from=${pkt.source.toHexString()} acks=${pkt.payload.take(4).toHexString()}", LogTag.MSG)
-            // Translate a retry attempt's id back to the original DM id (and stop retrying it).
-            val acked = resolveDmAck(pkt.payload.takeIf { it.isNotEmpty() })
-            appendMessage(
-                ReceivedMessage(
-                    fromNodeId = pkt.source,
-                    payload = pkt.payload,
-                    isAck = true,
-                    trace = pkt.trace,
-                    ackedId = acked,
-                    packetId = pkt.id,
-                )
-            )
-            return
+    private fun deliverLocal(dg: Datagram) {
+        when (dg.protocol) {
+            PayloadProtocol.BLEEDGE_CONTROL -> deliverControl(dg)
+            PayloadProtocol.BLEEDGE_CHAT -> deliverChat(dg)
+            else -> appendMessage(ReceivedMessage(dg.source, dg.id, dg.protocol, path = dg.path))
         }
-        if (pkt.type == PacketType.ANNOUNCE) {
-            log("ANNOUNCE delivered locally from=${pkt.source.toHexString()}", LogTag.ROUTER)
-            return
-        }
-        if (pkt.payloadType == PayloadType.TRACE_REQUEST) {
-            returnTrace(pkt)
-            return
-        }
-        val deliveredPkt = if (pkt.payloadType == PayloadType.TRACE_RESPONSE) {
-            runCatching {
-                val result = TraceResult.decode(pkt.payload).copy(
-                    returnNodes = pkt.trace,
-                    returnSamples = pkt.traceMetric,
-                )
-                pkt.copy(payload = result.encode())
-            }.getOrDefault(pkt)
-        } else {
-            pkt
-        }
-        // Decode chat payloads to text. Encrypted DMs are opened with our identity;
-        // an undecryptable envelope (not for us / corrupt) yields null text.
-        val text: String? = when (deliveredPkt.payloadType) {
-            PayloadType.CHAT_ENCRYPTED -> identity?.let { Crypto.openChat(deliveredPkt.payload, it) }
-            PayloadType.CHAT_PLAIN, PayloadType.TEXT_TEST ->
-                runCatching { String(deliveredPkt.payload, Charsets.UTF_8) }.getOrNull()
-            else -> null
-        }
-        log("MSG delivered from=${deliveredPkt.source.toHexString()} type=${deliveredPkt.payloadType} len=${deliveredPkt.payload.size} hops=${deliveredPkt.trace.size} trace=${deliveredPkt.trace.map { it.toHexString().take(8) }}", LogTag.MSG)
-        val incoming = ReceivedMessage(
-            fromNodeId = deliveredPkt.source,
-            payload = deliveredPkt.payload,
-            payloadType = deliveredPkt.payloadType,
-            trace = deliveredPkt.trace,
-            text = text,
-            packetId = deliveredPkt.id,
-        )
-        appendMessage(incoming)
-        maybeNotifyIncomingMessage(incoming)
     }
 
-    private fun maybeNotifyIncomingMessage(msg: ReceivedMessage) {
-        val text = msg.text ?: return
-        when (msg.payloadType) {
-            PayloadType.CHAT_ENCRYPTED,
-            PayloadType.CHAT_PLAIN,
-            PayloadType.TEXT_TEST,
-            PayloadType.CHANNEL,
-            -> {
-                val peerHex = msg.fromNodeId.toHexString()
-                if (MessageNotifier.isConversationActive(peerHex)) return
-                val sender = peerHex.take(8)
-                MessageNotifier.show(
-                    context = this,
-                    sender = "BLEEdge · $sender",
-                    text = text,
-                    notificationId = sender.hashCode(),
-                )
+    private fun deliverControl(dg: Datagram) {
+        val ctrl = runCatching { ControlMessage.decode(dg.payload) }.getOrNull() ?: return
+        when (ctrl.kind) {
+            ControlKind.ANNOUNCE -> { /* topology already updated + verified in the router */ }
+            ControlKind.ACK -> {
+                val acked = runCatching { AckBody.decode(ctrl.body).ackedId }.getOrNull()
+                val resolved = resolveDmAck(acked)
+                log("ACK from=${dg.source.toHex()} acks=${acked?.take(4)?.toHex()}", LogTag.MSG)
+                appendMessage(ReceivedMessage(dg.source, dg.id, dg.protocol, isAck = true, ackedId = resolved, path = dg.path))
+            }
+            ControlKind.TRACE_REQUEST -> respondToTrace(dg, ctrl)
+            ControlKind.TRACE_RESPONSE -> {
+                val body = runCatching { TraceResponseBody.decode(ctrl.body) }.getOrNull()
+                appendMessage(ReceivedMessage(dg.source, dg.id, dg.protocol, traceResponse = body, path = dg.path))
             }
             else -> Unit
         }
     }
 
-    private fun recordTraceMetric(pkt: Packet, incomingPeer: NodeID?): Packet {
-        if (pkt.type != PacketType.DATA) return pkt
-        if (pkt.payloadType != PayloadType.TRACE_REQUEST && pkt.payloadType != PayloadType.TRACE_RESPONSE) return pkt
-        return pkt.copy(traceMetric = pkt.traceMetric + rssiForPeer(incomingPeer).coerceIn(-128, 127).toByte())
+    private fun deliverChat(dg: Datagram) {
+        val id = identity ?: return
+        val ctx = ChatContext(dg.id, dg.source, dg.destination)
+        val msg = when (Chat.peekKind(dg.payload)) {
+            ChatKind.PUBLIC_TEXT -> ChatPublicText.open(dg.payload, ctx)?.let {
+                ReceivedMessage(dg.source, dg.id, dg.protocol, ChatKind.PUBLIC_TEXT, it.text, it.senderPublicKey, path = dg.path)
+            }
+            ChatKind.DIRECT_TEXT -> ChatDirectText.open(id, dg.payload, ctx)?.let {
+                ReceivedMessage(dg.source, dg.id, dg.protocol, ChatKind.DIRECT_TEXT, it.text, it.senderPublicKey, path = dg.path)
+            }
+            ChatKind.TYPING -> ChatTyping.open(dg.payload, ctx)?.let {
+                ReceivedMessage(dg.source, dg.id, dg.protocol, ChatKind.TYPING, isTyping = true, senderPublicKey = it.senderPublicKey, path = dg.path)
+            }
+            ChatKind.CHANNEL_TEXT -> ChatChannel.channelPayload(dg.payload)?.let {
+                ReceivedMessage(dg.source, dg.id, dg.protocol, ChatKind.CHANNEL_TEXT, channelPayload = it, path = dg.path)
+            }
+            else -> null
+        } ?: return
+        appendMessage(msg)
+        maybeNotify(msg)
     }
 
-    private fun rssiForPeer(id: NodeID?): Int {
-        val hex = id?.toHexString() ?: return 0
-        peers.values.firstOrNull { it.peerId.toHexString() == hex }?.let { return it.rssi }
-        neighborTable.value.firstOrNull { it.nodeId.toHexString() == hex }?.let {
-            return if (it.rssi == RSSI_UNKNOWN) 0 else it.rssi
-        }
-        return 0
+    private fun maybeNotify(msg: ReceivedMessage) {
+        val text = msg.text ?: return
+        if (msg.isTyping) return
+        val peerHex = msg.fromNodeId.toHex()
+        if (MessageNotifier.isConversationActive(peerHex)) return
+        val sender = peerHex.take(8)
+        MessageNotifier.show(this, "BLEEdge · $sender", text, sender.hashCode())
     }
 
-    private fun returnTrace(req: Packet) {
-        val tracePayload = runCatching { decodeTracePayload(req.payload) }.getOrElse {
-            log("trace response error: ${it.message}", LogTag.ROUTER)
-            return
-        }
-        val result = TraceResult(
-            tag = tracePayload.tag,
-            authCode = tracePayload.authCode,
-            route = req.route,
-            forwardNodes = req.trace,
-            forwardSamples = req.traceMetric,
-            metric = TRACE_METRIC_RSSI,
+    // ---- trace ---------------------------------------------------------------
+
+    private fun respondToTrace(req: Datagram, ctrl: ControlMessage) {
+        val body = runCatching { TraceRequestBody.decode(ctrl.body) }.getOrNull() ?: return
+        // The request's path is the forward path; build a reverse source route to the origin.
+        val forwardPath = req.path
+        val hopsBack = forwardPath.dropLast(1).reversed() // exclude us (last path entry)
+        val route = hopsBack + req.source
+        val resp = TraceResponseBody(
+            tag = body.tag, metric = body.metric, forwardPath = forwardPath,
+            forwardSamples = body.forwardSamples, returnSamples = emptyList(),
         )
-        val route = reverseTraceRoute(req.trace, req.source)
-        val pkt = Packet(
-            version = PROTOCOL_VERSION,
-            type = PacketType.DATA,
-            id = newPacketID(),
-            source = _nodeId.value,
-            destination = req.source,
-            mode = RoutingMode.SOURCE_ROUTE,
-            ttl = (route.size + 1).toByte(),
-            route = route,
-            payloadType = PayloadType.TRACE_RESPONSE,
-            payload = result.encode(),
+        val dg = Datagram(
+            source = _nodeId.value, destination = req.source, ttl = route.size, route = route, routeCursor = 0,
+            protocol = PayloadProtocol.BLEEDGE_CONTROL, payload = resp.toControl().encode(),
         )
-        router.markOriginated(pkt.id)
-        transmitToRoute(pkt)
+        router.markOriginated(dg.id)
+        transmitToFirstHop(dg)
     }
 
-    private fun reverseTraceRoute(trace: List<NodeID>, dst: NodeID): List<NodeID> {
-        val hops = if (trace.isNotEmpty()) trace.dropLast(1) else emptyList()
-        val route = hops.reversed().toMutableList()
-        if (route.lastOrNull()?.toHexString() != dst.toHexString()) route += dst
-        return route
+    /** Sends a source-routed trace request. Returns the tag, or null if no route is known. */
+    fun sendTrace(destination: NodeId, explicitRoute: List<NodeId> = emptyList()): Int? {
+        val route = if (explicitRoute.isNotEmpty()) {
+            explicitRoute.toMutableList().also { if (it.lastOrNull() != destination) it += destination }
+        } else router.selectRoute(destination) ?: return null
+        val tag = Random.nextInt().toLong() and 0xFFFFFFFFL
+        val body = TraceRequestBody(tag, TraceMetric.RSSI_DBM, emptyList())
+        val dg = Datagram(
+            source = _nodeId.value, destination = destination, ttl = route.size, route = route, routeCursor = 0,
+            protocol = PayloadProtocol.BLEEDGE_CONTROL, payload = body.toControl().encode(),
+        )
+        router.markOriginated(dg.id)
+        transmitToFirstHop(dg)
+        _stats.update { it.copy(tracesSent = it.tracesSent + 1) }
+        return tag.toInt()
     }
 
-    // Send frames to all connected peers (both outgoing and server-side), optionally
-    // excluding one NodeID (used to avoid echoing back to the source of a flood).
-    private fun sendFramesToAll(frames: List<cz.arnal.bleedge.core.Frame>, exclude: NodeID? = null) {
-        val excludeHex = exclude?.toHexString()
-        for ((_, link) in peers) {
-            if (link.peerId.toHexString() == excludeHex) continue
-            for (frame in frames) link.sendFrame(frame.encode())
+    // ---- transmit ------------------------------------------------------------
+
+    private fun framesFor(dg: Datagram): List<Frame> = Frame.fragment(dg.encode(), BLEEdge.MAX_FRAME_SIZE)
+
+    private fun sendFramesToAll(frames: List<Frame>, exclude: NodeId? = null) {
+        for (link in peers.values) {
+            if (link.peerId != null && link.peerId == exclude) continue
+            for (f in frames) link.sendFrame(f.encode())
         }
         val server = bleGattServer ?: return
-        for ((addrHex, nodeId) in serverPeers) {
-            if (nodeId == null) continue
-            if (nodeId.toHexString() == excludeHex) continue
+        for ((addrHex, nid) in serverPeers) {
+            if (nid == null || nid == exclude) continue
             val device = serverPeerDevices[addrHex] ?: continue
-            for (frame in frames) server.notifyFrameTo(frame.encode(), device)
+            for (f in frames) server.notifyFrameTo(f.encode(), device)
         }
     }
 
-    // Send frames to a specific peer by NodeID, checking both outgoing and server-side maps.
-    private fun sendFramesToPeer(frames: List<cz.arnal.bleedge.core.Frame>, nodeId: NodeID): Boolean {
-        val nodeHex = nodeId.toHexString()
-        val link = peers.values.firstOrNull { it.peerId.toHexString() == nodeHex }
-        if (link != null) {
-            for (frame in frames) link.sendFrame(frame.encode())
-            return true
+    private fun sendFramesToPeer(frames: List<Frame>, nodeId: NodeId): Boolean {
+        peers.values.firstOrNull { it.peerId == nodeId }?.let { link ->
+            for (f in frames) link.sendFrame(f.encode()); return true
         }
         val server = bleGattServer ?: return false
-        val entry = serverPeers.entries.firstOrNull { (_, nid) -> nid?.toHexString() == nodeHex }
-        if (entry != null) {
-            val device = serverPeerDevices[entry.key] ?: return false
-            for (frame in frames) server.notifyFrameTo(frame.encode(), device)
-            return true
-        }
-        return false
+        val entry = serverPeers.entries.firstOrNull { it.value == nodeId } ?: return false
+        val device = serverPeerDevices[entry.key] ?: return false
+        for (f in frames) server.notifyFrameTo(f.encode(), device)
+        return true
     }
 
     private fun relayFlood(action: Action) {
-        val data = runCatching { action.packet.encode() }.getOrElse { return }
-        val frames = fragmentPacket(data, 512, action.packet.id)
-        sendFramesToAll(frames, exclude = action.nextHop)
+        sendFramesToAll(framesFor(action.datagram), exclude = action.excludePeer)
         _stats.update { it.copy(floodRelays = it.floodRelays + 1) }
     }
 
     private fun relayNextHop(action: Action) {
         val nh = action.nextHop ?: return
-        val data = runCatching { action.packet.encode() }.getOrElse { return }
-        val frames = fragmentPacket(data, 512, action.packet.id)
-        if (!sendFramesToPeer(frames, nh)) {
-            log("relay-next-hop: peer ${nh.toHexString()} not connected — dropping", LogTag.ROUTER)
-        } else {
-            log("relay-next-hop → ${nh.toHexString().take(8)} frames=${frames.size}", LogTag.ROUTER)
+        if (!sendFramesToPeer(framesFor(action.datagram), nh)) {
+            log("relay-next-hop: peer ${nh.toHex()} not connected — dropping", LogTag.ROUTER)
         }
     }
 
-    private fun sendAck(action: Action) {
+    private fun sendBuiltAck(action: Action) {
         val nh = action.nextHop ?: return
-        val data = runCatching { action.packet.encode() }.getOrElse { return }
-        val frames = fragmentPacket(data, 512, action.packet.id)
-        if (!sendFramesToPeer(frames, nh)) {
-            // Flood as fallback
-            sendFramesToAll(frames)
-        }
-        log("send ACK to=${nh.toHexString().take(8)} route=${action.packet.route.map { it.toHexString().take(8) }}", LogTag.MSG)
+        val frames = framesFor(action.datagram)
+        if (!sendFramesToPeer(frames, nh)) sendFramesToAll(frames)
         _stats.update { it.copy(acksSent = it.acksSent + 1) }
     }
 
-    private fun sendAnnounce() {
-        announceSeq++
-        val pkt = router.buildAnnounce(ANDROID_CAPABILITIES, announceSeq)
-        // Record our own packet so a flood echo doesn't get re-flooded back out.
-        router.markOriginated(pkt.id)
-        val data = runCatching { pkt.encode() }.getOrElse { return }
-        val frames = fragmentPacket(data, 512, pkt.id)
-        val nOut = peers.size
-        val nIn = serverPeers.count { it.value != null }
-        log("ANNOUNCE seq=$announceSeq → $nOut outgoing + $nIn server peers frames=${frames.size}", LogTag.ROUTER)
-        sendFramesToAll(frames)
+    private fun transmitToFirstHop(dg: Datagram) {
+        val firstHop = dg.route.firstOrNull() ?: return
+        if (!sendFramesToPeer(framesFor(dg), firstHop)) {
+            log("source-route: first hop ${firstHop.toHex()} not connected — dropping", LogTag.ROUTER)
+        }
     }
 
-    /** Send a text message to destination (or broadcast if dst is zero). */
-    fun sendMessage(text: String, destination: NodeID, ttl: Byte = 4) {
-        sendData(text.toByteArray(Charsets.UTF_8), PayloadType.TEXT_TEST, destination, ttl)
+    /** Originates and transmits a datagram (flood or source-routed). */
+    private fun transmit(dg: Datagram, trackFloodRepeat: Boolean = false) {
+        if (trackFloodRepeat && !dg.isSourceRouted) {
+            if (originatedFloodIds.size > 300) {
+                originatedFloodIds.entries.sortedBy { it.value }.take(100).forEach { originatedFloodIds.remove(it.key) }
+            }
+            originatedFloodIds[dg.id.toHex()] = System.currentTimeMillis()
+        }
+        if (dg.isSourceRouted) transmitToFirstHop(dg) else sendFramesToAll(framesFor(dg))
+        _stats.update { it.copy(packetsSent = it.packetsSent + 1) }
     }
+
+    private fun sendAnnounce() {
+        val id = identity ?: return
+        if (!::router.isInitialized) return
+        announceSeq++
+        val body = AnnounceBody.create(
+            identity = id, epoch = epoch, seq = announceSeq, timestamp = System.currentTimeMillis() / 1000,
+            caps = ANDROID_CAPABILITIES, neighbors = router.neighbors.ids(),
+            name = nodeName, description = nodeDescription, platform = nodePlatform,
+        )
+        val dg = router.newBroadcast(PayloadProtocol.BLEEDGE_CONTROL, body.toControl().encode(), BLEEdge.ANNOUNCE_TTL)
+        log("ANNOUNCE epoch=$epoch seq=$announceSeq neighbors=${router.neighbors.ids().size}", LogTag.ROUTER)
+        sendFramesToAll(framesFor(dg))
+    }
+
+    // ---- public send API -----------------------------------------------------
 
     /**
-     * Sends a chat message. Direct messages (non-broadcast) are end-to-end encrypted to
-     * the recipient's public key (learned from its ANNOUNCE); broadcast goes out as
-     * plaintext on the public channel. Returns the originated packet id (16 bytes) so the
-     * caller can match the later delivery ACK, or null if it couldn't be sent (e.g. an
-     * encrypted DM to a node whose public key we haven't learned yet).
+     * Sends a chat text. Broadcast → signed PUBLIC_TEXT. Unicast → encrypted DIRECT_TEXT
+     * (ACK_REQUESTED, with retry). Returns the originated datagram id, or null if a DM
+     * recipient's public key isn't known.
      */
-    fun sendChat(text: String, destination: NodeID, recipientPub: ByteArray? = null, ttl: Byte = 4): ByteArray? {
-        if (destination.isBroadcast()) {
-            return sendData(text.toByteArray(Charsets.UTF_8), PayloadType.CHAT_PLAIN, destination, ttl)
-        }
+    fun sendChat(text: String, destination: NodeId, recipientPub: ByteArray? = null, floodTtl: Int = BLEEdge.DEFAULT_FLOOD_TTL): ByteArray? {
+        if (!Chat.run { text.toByteArray(Charsets.UTF_8).size <= MAX_TEXT_BYTES }) return null
         val id = identity ?: return null
-        // Prefer an explicitly supplied key (e.g. learned from a received DM envelope or a
-        // saved contact); fall back to the key from the peer's signed ANNOUNCE (topology).
-        val pub = recipientPub?.takeIf { it.size == 32 } ?: router.topology.getNode(destination)?.publicKey
+        if (destination.isBroadcast()) {
+            val dgId = Datagram.newDatagramId()
+            val ctx = ChatContext(dgId, id.nodeId, NodeId.BROADCAST)
+            val payload = ChatPublicText.build(id, ctx, text, System.currentTimeMillis() / 1000)
+            val dg = Datagram(id = dgId, source = id.nodeId, destination = NodeId.BROADCAST, ttl = floodTtl,
+                protocol = PayloadProtocol.BLEEDGE_CHAT, payload = payload)
+            router.markOriginated(dg.id)
+            transmit(dg, trackFloodRepeat = true)
+            return dg.id
+        }
+        val pub = recipientPub?.takeIf { it.size == 32 } ?: router.publicKeyFor(destination)
         if (pub == null || pub.size != 32) {
-            log("sendChat: no public key known for ${destination.toHexString()} — cannot encrypt", LogTag.MSG)
+            log("sendChat: no public key for ${destination.toHex()} — cannot encrypt", LogTag.MSG)
             return null
         }
-        val envelope = runCatching { Crypto.sealChat(text, id, pub) }.getOrElse {
-            log("sendChat: encryption failed: ${it.message}", LogTag.MSG)
-            return null
-        }
-        return startDmDelivery(envelope, PayloadType.CHAT_ENCRYPTED, destination, ttl)
+        return startDmDelivery(text, pub, destination, floodTtl)
     }
 
-    /** Tunes DM delivery retry (settings). [maxTries] includes the first send; 1 disables retry. */
+    /** Sends a MeshCore-compatible channel message sealed with [secret]. Returns the datagram id. */
+    fun sendChannel(secret: ByteArray, senderLabel: String, text: String, floodTtl: Int = BLEEdge.DEFAULT_FLOOD_TTL): ByteArray {
+        val id = identity!!
+        val dgId = Datagram.newDatagramId()
+        val payload = ChatChannel.build(secret, senderLabel, text, System.currentTimeMillis() / 1000)
+        val dg = Datagram(id = dgId, source = id.nodeId, destination = NodeId.BROADCAST, ttl = floodTtl,
+            protocol = PayloadProtocol.BLEEDGE_CHAT, payload = payload)
+        router.markOriginated(dg.id)
+        transmit(dg, trackFloodRepeat = true)
+        return dg.id
+    }
+
+    /** Sends an ephemeral signed typing hint (no ACK). Best-effort. */
+    fun sendTyping(destination: NodeId) {
+        if (destination.isBroadcast()) return
+        val id = identity ?: return
+        val route = router.selectRoute(destination)
+        val dgId = Datagram.newDatagramId()
+        val ctx = ChatContext(dgId, id.nodeId, destination)
+        val payload = ChatTyping.build(id, ctx, System.currentTimeMillis() / 1000)
+        val dg = if (route != null)
+            Datagram(id = dgId, source = id.nodeId, destination = destination, ttl = route.size, route = route,
+                protocol = PayloadProtocol.BLEEDGE_CHAT, payload = payload)
+        else
+            Datagram(id = dgId, source = id.nodeId, destination = destination, ttl = BLEEdge.DEFAULT_FLOOD_TTL,
+                protocol = PayloadProtocol.BLEEDGE_CHAT, payload = payload)
+        router.markOriginated(dg.id)
+        transmit(dg)
+    }
+
     fun setDmRetry(retryDelayMs: Long, maxTries: Int) {
         dmRetryDelayMs = retryDelayMs.coerceAtLeast(500)
         dmMaxTries = maxTries.coerceIn(1, 10)
     }
 
-    /** Sends a DM and registers it for ACK-driven retry; returns the (original) packet id. */
-    private fun startDmDelivery(payload: ByteArray, payloadType: PayloadType, dest: NodeID, ttl: Byte): ByteArray {
-        val firstId = sendData(payload, payloadType, dest, ttl)
-        val origHex = firstId.toHexString()
-        val pending = PendingDm(origHex, payload, payloadType, dest, ttl, attemptsSent = 1)
+    /** Seals + sends one DIRECT_TEXT attempt (fresh id each time; AAD binds to it). Returns the id. */
+    private fun sendDirectAttempt(text: String, recipientPub: ByteArray, dest: NodeId, floodTtl: Int): ByteArray {
+        val id = identity!!
+        val route = router.selectRoute(dest)
+        val dgId = Datagram.newDatagramId()
+        val ctx = ChatContext(dgId, id.nodeId, dest)
+        val payload = ChatDirectText.seal(id, recipientPub, ctx, text, System.currentTimeMillis() / 1000)
+        val dg = if (route != null)
+            Datagram(id = dgId, source = id.nodeId, destination = dest, ttl = route.size, route = route,
+                protocol = PayloadProtocol.BLEEDGE_CHAT, flags = DatagramFlags.ACK_REQUESTED, payload = payload)
+        else
+            Datagram(id = dgId, source = id.nodeId, destination = dest, ttl = floodTtl,
+                protocol = PayloadProtocol.BLEEDGE_CHAT, flags = DatagramFlags.ACK_REQUESTED, payload = payload)
+        router.markOriginated(dg.id)
+        transmit(dg)
+        return dg.id
+    }
+
+    private fun startDmDelivery(text: String, recipientPub: ByteArray, dest: NodeId, floodTtl: Int): ByteArray {
+        val firstId = sendDirectAttempt(text, recipientPub, dest, floodTtl)
+        val origHex = firstId.toHex()
+        val pending = PendingDm(origHex, text, recipientPub, dest, floodTtl, attemptsSent = 1)
         pendingDms[origHex] = pending
         attemptToOriginal[origHex] = origHex
         _dmDeliveries.update { m ->
-            (m + (origHex to DmDelivery(attemptsSent = 1, maxTries = dmMaxTries)))
-                .entries.toList().takeLast(300).associate { it.key to it.value }
+            (m + (origHex to DmDelivery(attemptsSent = 1, maxTries = dmMaxTries))).entries.toList().takeLast(300).associate { it.key to it.value }
         }
         scheduleDmRetry(pending)
         return firstId
@@ -912,7 +806,7 @@ class BLEEdgeService : Service() {
         if (dmMaxTries <= 1) return
         p.job = scope.launch {
             delay(dmRetryDelayMs)
-            if (pendingDms[p.originalIdHex] !== p) return@launch // already acked/cleared
+            if (pendingDms[p.originalIdHex] !== p) return@launch
             if (p.attemptsSent >= dmMaxTries) {
                 log("DM ${p.originalIdHex.take(8)} unacked after ${p.attemptsSent} tries — giving up", LogTag.MSG)
                 pendingDms.remove(p.originalIdHex)
@@ -920,174 +814,40 @@ class BLEEdgeService : Service() {
                 updateDelivery(p.originalIdHex) { it.copy(failed = true) }
                 return@launch
             }
-            val newId = sendData(p.payload, p.payloadType, p.dest, p.ttl)
+            val newId = sendDirectAttempt(p.text, p.recipientPub, p.dest, p.floodTtl)
             p.attemptsSent += 1
-            attemptToOriginal[newId.toHexString()] = p.originalIdHex
+            attemptToOriginal[newId.toHex()] = p.originalIdHex
             updateDelivery(p.originalIdHex) { it.copy(attemptsSent = p.attemptsSent) }
-            log("DM ${p.originalIdHex.take(8)} retry ${p.attemptsSent}/$dmMaxTries as ${newId.toHexString().take(8)}", LogTag.MSG)
             scheduleDmRetry(p)
         }
     }
 
-    /** Resolves a received ACK against pending DMs; returns the ORIGINAL id to surface, or null. */
     private fun resolveDmAck(ackedRaw: ByteArray?): ByteArray? {
         if (ackedRaw == null) return null
-        val origHex = attemptToOriginal[ackedRaw.toHexString()] ?: return ackedRaw
+        val origHex = attemptToOriginal[ackedRaw.toHex()] ?: return ackedRaw
         pendingDms.remove(origHex)?.job?.cancel()
         attemptToOriginal.entries.removeAll { it.value == origHex }
         updateDelivery(origHex) { it.copy(acked = true) }
         return origHex.hexToByteArray()
     }
 
-    /**
-     * Broadcasts a pre-built MeshCore-compatible channel payload (GRP_TXT, see
-     * core.ChannelCrypto) to the whole mesh. The caller seals the message with the
-     * channel PSK; the transport just floods it. Returns the packet id.
-     */
-    fun sendChannelMessage(payload: ByteArray, ttl: Byte = 4): ByteArray =
-        sendData(payload, PayloadType.CHANNEL, NodeID.BROADCAST, ttl)
-
-    /**
-     * Sends an ephemeral "I'm typing" hint to [destination]. Carries no payload and is never
-     * ACKed (the router skips ACK for [PayloadType.TYPING]); the recipient shows it transiently
-     * and drops it on a timeout or when a real message arrives. Best-effort — fire and forget.
-     */
-    fun sendTyping(destination: NodeID) {
-        if (destination.isBroadcast()) return
-        sendData(ByteArray(0), PayloadType.TYPING, destination, ttl = 4)
-    }
-
-    /** Sends a source-routed trace request. Returns the trace tag, or null if no route is known. */
-    fun sendTrace(destination: NodeID, explicitRoute: List<NodeID> = emptyList()): Int? {
-        val route = if (explicitRoute.isNotEmpty()) {
-            val r = explicitRoute.toMutableList()
-            if (r.lastOrNull()?.toHexString() != destination.toHexString()) r += destination
-            r
-        } else {
-            val (selected, found) = router.selectRoute(destination)
-            if (!found) return null
-            selected ?: listOf(destination)
-        }
-        val tag = randomTraceTag()
-        val payload = encodeTracePayload(
-            TracePayload(
-                tag = tag,
-                authCode = 0,
-                flags = traceFlagsForHashWidth(TRACE_HASH_WIDTH_8),
-                routeData = traceRouteData(route, TRACE_HASH_WIDTH_8),
-            )
-        )
-        val pkt = Packet(
-            version = PROTOCOL_VERSION,
-            type = PacketType.DATA,
-            id = newPacketID(),
-            source = _nodeId.value,
-            destination = destination,
-            mode = RoutingMode.SOURCE_ROUTE,
-            ttl = (route.size + 2).toByte(),
-            route = route,
-            routeCursor = 0,
-            payloadType = PayloadType.TRACE_REQUEST,
-            payload = payload,
-        )
-        router.markOriginated(pkt.id)
-        transmitToRoute(pkt)
-        _stats.update { it.copy(tracesSent = it.tracesSent + 1) }
-        return tag
-    }
-
-    /** Updates this node's free-form bio and re-announces it immediately. */
     fun setDescription(description: String) {
         if (!::router.isInitialized) return
-        router.description = description
-        log("description set to '${router.description}'", LogTag.SYS)
+        nodeDescription = description
         scope.launch { sendAnnounce() }
     }
 
-    /**
-     * Updates this node's primary display name and re-announces it. Blank resets to the
-     * deterministic default derived from the public key. The NODE_INFO characteristic keeps
-     * the old name until the radio restarts, but the new name reaches peers via ANNOUNCE.
-     */
     fun setName(name: String) {
         if (!::router.isInitialized) return
         val pub = identity?.publicKey ?: return
-        router.name = name.ifBlank { defaultNodeName(pub) }
-        log("name set to '${router.name}'", LogTag.SYS)
+        nodeName = name.ifBlank { defaultNodeName(pub) }
         scope.launch { sendAnnounce() }
     }
 
-    /** Builds, originates and transmits a DATA packet. Returns the packet id. */
-    private fun sendData(payload: ByteArray, payloadType: PayloadType, destination: NodeID, ttl: Byte): ByteArray {
-        val (route, found) = router.selectRoute(destination)
-
-        val pkt = if (!destination.isBroadcast() && found && route != null) {
-            Packet(
-                version = PROTOCOL_VERSION,
-                type = PacketType.DATA,
-                id = newPacketID(),
-                source = _nodeId.value,
-                destination = destination,
-                mode = RoutingMode.SOURCE_ROUTE,
-                ttl = ttl,
-                route = route,
-                routeCursor = 0,
-                payloadType = payloadType,
-                payload = payload,
-            )
-        } else {
-            Packet(
-                version = PROTOCOL_VERSION,
-                type = PacketType.DATA,
-                id = newPacketID(),
-                source = _nodeId.value,
-                destination = destination,
-                mode = RoutingMode.FLOOD,
-                ttl = ttl,
-                payloadType = payloadType,
-                payload = payload,
-            )
-        }
-
-        // Record our own packet so a flood echo doesn't get re-flooded back out.
-        router.markOriginated(pkt.id)
-        // Remember our own *flooded* chat messages so we can count the repeats we hear back.
-        if (pkt.mode == RoutingMode.FLOOD && payloadType in floodRepeatTypes) {
-            if (originatedFloodIds.size > 300) {
-                originatedFloodIds.entries.sortedBy { it.value }.take(100).forEach { originatedFloodIds.remove(it.key) }
-            }
-            originatedFloodIds[pkt.id.toHexString()] = System.currentTimeMillis()
-        }
-        val data = runCatching { pkt.encode() }.getOrElse { return pkt.id }
-        val frames = fragmentPacket(data, 512, pkt.id)
-        if (pkt.mode == RoutingMode.SOURCE_ROUTE) {
-            val firstHop = pkt.route.firstOrNull()
-            if (firstHop != null) sendFramesToPeer(frames, firstHop) else sendFramesToAll(frames)
-        } else {
-            sendFramesToAll(frames)
-        }
-        log("MSG sent dst=${destination.toHexString()} mode=${pkt.mode} type=$payloadType len=${payload.size}", LogTag.MSG)
-        _stats.update { it.copy(packetsSent = it.packetsSent + 1) }
-        return pkt.id
-    }
-
-    private fun transmitToRoute(pkt: Packet) {
-        val data = runCatching { pkt.encode() }.getOrElse { return }
-        val frames = fragmentPacket(data, 512, pkt.id)
-        val firstHop = pkt.route.firstOrNull()
-        if (firstHop != null) {
-            if (!sendFramesToPeer(frames, firstHop)) {
-                log("trace/source-route: first hop ${firstHop.toHexString()} not connected — dropping", LogTag.ROUTER)
-            }
-        }
-    }
-
     fun clearData() {
-        // Recreate the router to wipe dedup cache, neighbor table, and topology.
         val id = identity ?: return
         router = Router(id)
         router.allowlist.addAll(allowlist)
-        // Clear all displayed state.
         _receivedMessages.value = emptyList()
         _routingLog.value = emptyList()
         _neighborTable.value = emptyList()
@@ -1105,140 +865,63 @@ class BLEEdgeService : Service() {
         if (_phyMode.value == mode) return
         _phyMode.value = mode
         log("PHY mode changed to ${mode.value}", LogTag.SYS)
-        // Re-apply immediately if the radios are running, so the user doesn't have to
-        // manually stop/start the service for the new PHY to take effect.
-        if (_isRunning.value) {
-            stopBLE()
-            startBLE()
-        }
+        if (_isRunning.value) { stopBLE(); startBLE() }
     }
 
     fun stopBLE() {
         bleAdvertiser?.stopAdvertising()
         bleScanner?.stopScan()
         peers.values.forEach { it.disconnect() }
-        peers.clear()
-        serverPeers.clear()
-        serverPeerDevices.clear()
+        peers.clear(); serverPeers.clear(); serverPeerDevices.clear()
         _connectedPeers.value = emptyList()
-        _advertisingActive.value = false
-        _scanningActive.value = false
-        _isRunning.value = false
+        _advertisingActive.value = false; _scanningActive.value = false; _isRunning.value = false
         log("BLE stopped", LogTag.SYS)
     }
 
     fun startBLE() {
-        val nodeId = _nodeId.value
+        val localId = _nodeId.value
         val phyMode = _phyMode.value
-        bleAdvertiser?.startAdvertising(nodeId, phyMode) { msg ->
-            log("advertiser: $msg", LogTag.SYS)
-        }
+        bleAdvertiser?.startAdvertising(localId, phyMode) { msg -> log("advertiser: $msg", LogTag.SYS) }
         _advertisingActive.value = true
-        log("scanner starting phyMode=$phyMode", LogTag.SCAN)
         bleScanner?.startScan(
             phyMode = phyMode,
             onFound = { device, rssi, advNodeId -> handleFoundDevice(device, rssi, advNodeId) },
             onFailed = { errorCode -> log("scan FAILED errorCode=$errorCode", LogTag.SCAN) },
         )
-        _scanningActive.value = true
-        _isRunning.value = true
+        _scanningActive.value = true; _isRunning.value = true
         log("BLE started", LogTag.SYS)
     }
 
-    // ---- State helpers -------------------------------------------------------
-
-    private fun updatePeerPhy(peerHex: String, txPhy: Int, rxPhy: Int) {
-        val txP = PHY.fromAndroid(txPhy)
-        val rxP = PHY.fromAndroid(rxPhy)
-        log("peer=$peerHex phy-update tx=$txP rx=$rxP", LogTag.PHY)
-
-        if (_phyMode.value == PHYMode.CODED_ONLY &&
-            (txP != PHY.PHY_CODED || rxP != PHY.PHY_CODED)
-        ) {
-            log("WARNING: peer=$peerHex not on Coded PHY (coded-only mode) — marking INVALID", LogTag.PHY)
-        }
-        updatePeersState()
-    }
+    // ---- state helpers -------------------------------------------------------
 
     private fun updatePeersState() {
-        val seenNodeIds = mutableSetOf<String>()
+        val seen = mutableSetOf<String>()
         val list = mutableListOf<PeerInfo>()
-
-        // Outgoing connections (we are GattClient) — full info available.
         for (link in peers.values) {
-            val nodeHex = link.peerId.toHexString()
-            if (link.peerId.isBroadcast()) continue // NodeID not yet read
-            if (seenNodeIds.add(nodeHex)) {
-                val phyKnown = link.txPhy != PHY.UNKNOWN && link.rxPhy != PHY.UNKNOWN
-                val phyInvalid = phyKnown && _phyMode.value == PHYMode.CODED_ONLY &&
-                    (link.txPhy != PHY.PHY_CODED || link.rxPhy != PHY.PHY_CODED)
-                // Keep the neighbor table populated from the rich client-side link info so
-                // the Neighbors tab and route selection have real data to work with.
-                router.neighbors.upsert(
-                    cz.arnal.bleedge.core.NeighborEntry(
-                        id = link.peerId,
-                        rssi = link.rssi,
-                        txPhy = link.txPhy,
-                        rxPhy = link.rxPhy,
-                        caps = link.caps,
-                        phyInvalid = phyInvalid,
-                        description = link.description,
-                        name = link.name,
-                        platform = link.platform,
-                    )
-                )
-                list.add(PeerInfo(
-                    nodeId = link.peerId,
-                    rssi = link.rssi,
-                    txPhy = link.txPhy,
-                    rxPhy = link.rxPhy,
-                    caps = link.caps,
-                    phyInvalid = phyInvalid,
-                    description = router.descriptionFor(link.peerId),
-                    name = router.nameFor(link.peerId),
-                    platform = router.platformFor(link.peerId),
-                ))
-            }
+            val pid = link.peerId ?: continue
+            if (!seen.add(pid.toHex())) continue
+            router.neighbors.upsert(ProtoNeighbor(id = pid, publicKey = link.publicKey, rssi = link.rssi, provisionalCaps = link.caps))
+            list += PeerInfo(pid, link.rssi, link.txPhy, link.rxPhy, link.caps, name = router.nameFor(pid), publicKey = link.publicKey)
         }
-
-        // Incoming connections (peer is GattClient to our GattServer). The server side
-        // can't read NODE_INFO or RSSI, so caps come from the peer's ANNOUNCE (topology)
-        // and RSSI is reported as unknown (Int.MIN_VALUE → shown as "n/a" in the UI).
-        for ((_, nodeId) in serverPeers) {
-            if (nodeId == null || nodeId.isBroadcast()) continue // NodeID not yet known
-            val nodeHex = nodeId.toHexString()
-            if (!seenNodeIds.add(nodeHex)) continue // already listed via outgoing connection
-            val nb = router.neighbors.get(nodeId)
-            val topoCaps = router.topology.allNodes()
-                .firstOrNull { it.id.toHexString() == nodeHex }?.caps
-            list.add(PeerInfo(
-                nodeId = nodeId,
-                rssi = nb?.rssi ?: RSSI_UNKNOWN,
-                txPhy = nb?.txPhy ?: PHY.UNKNOWN,
-                rxPhy = nb?.rxPhy ?: PHY.UNKNOWN,
-                caps = nb?.caps ?: topoCaps ?: Capabilities(0),
-                phyInvalid = false,
-                incoming = true,
-                description = router.descriptionFor(nodeId),
-                name = router.nameFor(nodeId),
-                platform = router.platformFor(nodeId),
-            ))
+        for (nid in serverPeers.values) {
+            if (nid == null || nid.isBroadcast()) continue
+            if (!seen.add(nid.toHex())) continue
+            val nb = router.neighbors.get(nid)
+            val caps = nb?.provisionalCaps ?: router.topology.getNode(nid)?.caps ?: Capabilities(0)
+            list += PeerInfo(nid, nb?.rssi ?: RSSI_UNKNOWN, PHY.UNKNOWN, PHY.UNKNOWN, caps, incoming = true,
+                name = router.nameFor(nid), publicKey = router.publicKeyFor(nid) ?: ByteArray(0))
         }
-
-        // Show only the list once we have at least one known node (suppresses transient zeros)
-        _connectedPeers.value = list.filter { !it.nodeId.isBroadcast() }
+        _connectedPeers.value = list
     }
 
     private fun refreshTopologyState() {
-        _neighborTable.value = router.neighbors.all().map { n ->
-            NeighborEntry(n.id, n.rssi, n.txPhy, n.rxPhy, n.caps,
-                router.descriptionFor(n.id), router.nameFor(n.id), router.platformFor(n.id))
+        router.neighbors.reap(); router.topology.reap()
+        _neighborTable.value = router.neighbors.all().map {
+            NeighborEntry(it.id, it.rssi, it.provisionalCaps, router.nameFor(it.id))
         }
         _knownTopology.value = router.topology.allNodes().map { tn ->
-            TopologyEntry(tn.id, tn.caps, tn.neighbors, tn.lastSeenMs, tn.description,
-                router.nameFor(tn.id), tn.platform, tn.publicKey)
+            TopologyEntry(tn.id, tn.caps, tn.neighbors, tn.receivedAtMs, router.nameFor(tn.id), tn.description, tn.platform, tn.publicKey)
         }
-        // Refresh peer RSSI values which are updated by the GattClient keepalive
         updatePeersState()
     }
 
@@ -1253,27 +936,19 @@ class BLEEdgeService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL,
-                "BLEEdge",
-                NotificationManager.IMPORTANCE_LOW,
-            )
-            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            nm.createNotificationChannel(channel)
+            val channel = NotificationChannel(NOTIFICATION_CHANNEL, "BLEEdge", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
         }
     }
 
     private fun buildNotification(text: String): Notification =
         NotificationCompat.Builder(this, NOTIFICATION_CHANNEL)
-            .setContentTitle("BLEEdge")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .build()
+            .setContentTitle("BLEEdge").setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_dialog_info).build()
 }
 
 // ---- Extensions -------------------------------------------------------------
 
-private fun ByteArray.toHexString() = joinToString("") { "%02x".format(it) }
-private fun List<Byte>.toHexString() = toByteArray().toHexString()
+private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 private fun ByteArray.take(n: Int) = copyOfRange(0, minOf(n, size))
 private fun String.hexToByteArray() = ByteArray(length / 2) { substring(it * 2, it * 2 + 2).toInt(16).toByte() }

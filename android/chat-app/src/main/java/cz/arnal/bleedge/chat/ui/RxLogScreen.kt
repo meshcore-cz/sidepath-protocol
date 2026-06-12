@@ -47,7 +47,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.ChatViewModel
 import cz.arnal.bleedge.chat.ProfileInfo
-import cz.arnal.bleedge.core.isBroadcast
+import cz.arnal.bleedge.chatproto.ChatKind
+import cz.arnal.bleedge.protocol.ControlKind
+import cz.arnal.bleedge.protocol.PayloadProtocol
 import cz.arnal.bleedge.service.PeerInfo
 import cz.arnal.bleedge.service.RxPacket
 import kotlinx.coroutines.delay
@@ -102,7 +104,7 @@ fun RxLogScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenProfile: (String) -
                         p = p,
                         vm = vm,
                         peers = peers,
-                        myNodeHex = myNode.toHexString(),
+                        myNodeHex = myNode.toHex(),
                         nowMs = nowMs,
                     ) { detail = p }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
@@ -139,7 +141,7 @@ private fun PacketRow(
     val ageMs = (nowMs - p.timestampMs).coerceAtLeast(0)
     val freshAlpha = ((7_000L - ageMs).coerceIn(0L, 7_000L).toFloat() / 7_000f) * 0.13f
     val typeColor = packetColor(p)
-    val isMine = p.source.toHexString() == myNodeHex
+    val isMine = p.source.toHex() == myNodeHex
     val direct = directPeerFor(p, peers)
     val bg = typeColor.copy(alpha = freshAlpha)
     BoxWithConstraints(
@@ -160,7 +162,7 @@ private fun PacketRow(
                 if (isMine) MineChip()
                 Text(timeFmt.format(Date(p.timestampMs)), style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace)
                 Text(
-                    "${vm.nameForHex(p.source.toHexString())} → ${destLabel(p, vm)}",
+                    "${vm.nameForHex(p.source.toHex())} → ${destLabel(p, vm)}",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
@@ -175,7 +177,7 @@ private fun PacketRow(
                     TypePill(p)
                     if (isMine) MineChip()
                     Text(
-                        "${vm.nameForHex(p.source.toHexString())} → ${destLabel(p, vm)}",
+                        "${vm.nameForHex(p.source.toHex())} → ${destLabel(p, vm)}",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium,
                         maxLines = 1,
@@ -200,7 +202,7 @@ private fun PacketRow(
 /** Short colored label naming the packet's nature (payload type for DATA, else the packet type). */
 @Composable
 private fun TypePill(p: RxPacket) {
-    val label = if (p.type.name == "DATA") p.payloadType.name else p.type.name
+    val label = packetLabel(p)
     val color = packetColor(p)
     Surface(
         color = color.copy(alpha = 0.18f),
@@ -242,29 +244,72 @@ private fun MineChip() {
     }
 }
 
+private fun controlKindName(k: Int?): String = when (k) {
+    ControlKind.ANNOUNCE -> "ANNOUNCE"
+    ControlKind.ACK -> "ACK"
+    ControlKind.TRACE_REQUEST -> "TRACE_REQUEST"
+    ControlKind.TRACE_RESPONSE -> "TRACE_RESPONSE"
+    else -> "UNKNOWN"
+}
+
+private fun chatKindName(k: Int?): String = when (k) {
+    ChatKind.PUBLIC_TEXT -> "PUBLIC_TEXT"
+    ChatKind.DIRECT_TEXT -> "DIRECT_TEXT"
+    ChatKind.TYPING -> "TYPING"
+    ChatKind.CHANNEL_TEXT -> "CHANNEL_TEXT"
+    else -> "UNKNOWN"
+}
+
+private fun protocolName(proto: Int): String = when (proto) {
+    PayloadProtocol.BLEEDGE_CONTROL -> "BLEEDGE_CONTROL"
+    PayloadProtocol.MESHCORE_PACKET -> "MESHCORE_PACKET"
+    PayloadProtocol.BLEEDGE_CHAT -> "BLEEDGE_CHAT"
+    else -> "UNKNOWN"
+}
+
+/** The packet's payload subtype (control/chat kind), or null for protocols without one. */
+private fun subtypeName(p: RxPacket): String? = when (p.protocol) {
+    PayloadProtocol.BLEEDGE_CONTROL -> controlKindName(p.controlKind)
+    PayloadProtocol.BLEEDGE_CHAT -> chatKindName(p.chatKind)
+    else -> null
+}
+
+/** Compact pill label: `CONTROL:ANNOUNCE`, `CHAT:CHANNEL_TEXT`, `MESHCORE`, or a raw protocol id. */
+private fun packetLabel(p: RxPacket): String = when (p.protocol) {
+    PayloadProtocol.BLEEDGE_CONTROL -> "CONTROL:${controlKindName(p.controlKind)}"
+    PayloadProtocol.BLEEDGE_CHAT -> "CHAT:${chatKindName(p.chatKind)}"
+    PayloadProtocol.MESHCORE_PACKET -> "MESHCORE"
+    else -> "0x%04x".format(p.protocol)
+}
+
 @Composable
 private fun packetColor(p: RxPacket): Color =
     when {
-        p.type.name == "ACK" -> Color(0xFF2E7D32)
-        p.type.name == "ANNOUNCE" -> Color(0xFF546E7A)
-        p.payloadType.name.contains("TRACE") -> Color(0xFF6A1B9A)
-        p.payloadType.name == "CHANNEL" -> Color(0xFF00838F)
-        p.payloadType.name.contains("CHAT") -> MaterialTheme.colorScheme.primary
-        p.payloadType.name == "TYPING" -> Color(0xFFEF6C00)
+        p.controlKind == ControlKind.ACK -> Color(0xFF2E7D32)
+        p.controlKind == ControlKind.ANNOUNCE -> Color(0xFF546E7A)
+        p.controlKind == ControlKind.TRACE_REQUEST || p.controlKind == ControlKind.TRACE_RESPONSE -> Color(0xFF6A1B9A)
+        p.protocol == PayloadProtocol.BLEEDGE_CONTROL -> Color(0xFF546E7A)
+        p.chatKind == ChatKind.CHANNEL_TEXT -> Color(0xFF00838F)
+        p.chatKind == ChatKind.TYPING -> Color(0xFFEF6C00)
+        p.protocol == PayloadProtocol.BLEEDGE_CHAT -> MaterialTheme.colorScheme.primary
+        p.protocol == PayloadProtocol.MESHCORE_PACKET -> Color(0xFF8D6E63)
         else -> MaterialTheme.colorScheme.secondary
     }
 
+private fun routingLabel(p: RxPacket): String =
+    if (p.sourceRouted) "source-route ${p.routeCursor}/${p.route.size}" else "flood"
+
 private fun packetMeta(p: RxPacket): String =
-    "${p.mode} · ttl ${p.ttl} · ${p.payloadSize}B" +
-        if (p.trace.isNotEmpty()) " · ${p.trace.size} hop${if (p.trace.size == 1) "" else "s"}" else ""
+    "${routingLabel(p)} · ttl ${p.ttl} · ${p.payloadSize}B" +
+        if (p.path.isNotEmpty()) " · ${p.path.size} hop${if (p.path.size == 1) "" else "s"}" else ""
 
 private fun directPeerFor(p: RxPacket, peers: List<PeerInfo>): PeerInfo? {
-    val directHex = (p.trace.lastOrNull() ?: p.source).toHexString()
-    return peers.firstOrNull { it.nodeId.toHexString() == directHex }
+    val directHex = (p.path.lastOrNull() ?: p.source).toHex()
+    return peers.firstOrNull { it.nodeId.toHex() == directHex }
 }
 
 private fun destLabel(p: RxPacket, vm: ChatViewModel): String =
-    if (p.destination.isBroadcast()) "broadcast" else vm.nameForHex(p.destination.toHexString())
+    if (p.destination.isBroadcast()) "broadcast" else vm.nameForHex(p.destination.toHex())
 
 @Composable
 private fun PacketDetailDialog(
@@ -274,9 +319,9 @@ private fun PacketDetailDialog(
     onOpenProfile: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sourceHex = p.source.toHexString()
+    val sourceHex = p.source.toHex()
     val profile by remember(sourceHex) { vm.profileFor(sourceHex) }.collectAsState()
-    val peer = peers.firstOrNull { it.nodeId.toHexString() == sourceHex }
+    val peer = peers.firstOrNull { it.nodeId.toHex() == sourceHex }
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
@@ -288,15 +333,17 @@ private fun PacketDetailDialog(
                     Spacer(Modifier.width(4.dp))
                 }
                 Field("Time", timeFmt.format(Date(p.timestampMs)))
-                Field("Type", p.type.name)
-                Field("Payload", "${p.payloadType.name} (${p.payloadSize} bytes)")
-                Field("Packet id", p.id.toHexLower())
-                Field("Source", "${vm.nameForHex(p.source.toHexString())}\n${p.source.toHexString()}")
+                Field("Protocol", "${protocolName(p.protocol)} (0x%04x)".format(p.protocol))
+                subtypeName(p)?.let { Field("Subtype", it) }
+                Field("Datagram id", p.id.toHexLower())
+                Field("Source", "${vm.nameForHex(p.source.toHex())}\n${p.source.toHex()}")
                 Field("Destination", if (p.destination.isBroadcast()) "broadcast" else
-                    "${vm.nameForHex(p.destination.toHexString())}\n${p.destination.toHexString()}")
-                Field("Routing", "${p.mode} · ttl ${p.ttl} · ${if (p.forUs) "for us" else "overheard"}")
-                if (p.route.isNotEmpty()) Field("Route", p.route.joinToString(" → ") { it.toHexString().take(16) })
-                if (p.trace.isNotEmpty()) Field("Trace", p.trace.joinToString(" → ") { it.toHexString().take(16) })
+                    "${vm.nameForHex(p.destination.toHex())}\n${p.destination.toHex()}")
+                Field("Routing", "${routingLabel(p)} · ttl ${p.ttl} · ${if (p.forUs) "for us" else "overheard"}")
+                Field("Flags", if (p.ackRequested) "ACK_REQUESTED" else if (p.flags == 0) "none" else "0x%04x".format(p.flags))
+                if (p.route.isNotEmpty()) Field("Route", p.route.joinToString(" → ") { "${vm.nameForHex(it.toHex())} (${it.toHex().take(20)})" })
+                if (p.path.isNotEmpty()) Field("Path", p.path.joinToString(" → ") { "${vm.nameForHex(it.toHex())} (${it.toHex().take(20)})" })
+                Field("Payload", "${p.payloadSize} bytes")
 
                 Spacer(Modifier.width(4.dp))
                 Text("Raw packet (${p.raw.size} bytes)", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
@@ -346,7 +393,7 @@ private fun PeerProfileBox(profile: ProfileInfo, peer: PeerInfo?, onClick: () ->
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                val platform = profile.platform.ifBlank { peer?.platform.orEmpty() }
+                val platform = profile.platform
                 if (platform.isNotBlank() || peer != null) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         SignalDot(peer?.rssi, "rssi")

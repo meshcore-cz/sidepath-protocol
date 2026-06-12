@@ -1,15 +1,16 @@
-package cz.arnal.bleedge.core
+package cz.arnal.bleedge.protocol
 
 import java.security.MessageDigest
 
-// Deterministic "bootstrap" node names. A node's name is a real wire field
-// (AnnouncePayload key 9 / NODE_INFO), user-overridable, but a fresh identity gets a
-// default derived purely from its public key — so a node always has a friendly, stable
-// label and peers can show the same default until they receive the on-wire name (e.g.
-// the ESP32 relay sends an empty name on purpose and everyone derives this).
-//
-// The algorithm MUST match the Go (core/nodename.go) and C++ ports. Input is MD5 of the
-// lowercase hex of the 32-byte public key. Specified in docs/PROTOCOL.md.
+/**
+ * Deterministic human-readable fallback name derived purely from a node's
+ * 32-byte Ed25519 public key (§3.1). This is a UI fallback only — never used for
+ * routing, authorization, or trust. A user-configured name distributed through a
+ * signed ANNOUNCE takes precedence.
+ *
+ * Algorithm: MD5 of the lowercase ASCII hex of the public key, indexed into word
+ * tables to produce a varied three-token name. Must match other platforms.
+ */
 private val nameWords = listOf(
     "barrel", "cedar", "ember", "harbor", "lantern", "meadow", "pebble", "quartz",
     "ripple", "summit", "thistle", "willow", "anchor", "brook", "copper", "dune",
@@ -25,13 +26,9 @@ private val numberWords = listOf(
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
 )
 
-/**
- * Deterministic, varied three-token bootstrap name derived from a 32-byte Ed25519 public
- * key (e.g. "barrel-two-return", "five-meadow-one", "cedar-pine-eight"). Returns "" if
- * [publicKey] is not 32 bytes.
- */
+/** Deterministic three-token fallback name, or "" if [publicKey] is not 32 bytes. */
 fun defaultNodeName(publicKey: ByteArray): String {
-    if (publicKey.size != 32) return ""
+    if (publicKey.size != BLEEdge.PUBLIC_KEY_BYTES) return ""
     return defaultNodeNameFromHex(publicKey.joinToString("") { "%02x".format(it.toInt() and 0xFF) })
 }
 

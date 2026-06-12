@@ -1,6 +1,6 @@
 package cz.arnal.bleedge.chat
 
-import cz.arnal.bleedge.core.defaultNodeNameFromHex
+import cz.arnal.bleedge.protocol.defaultNodeNameFromHex
 
 /**
  * The deterministic bootstrap name derived from a node's public key hex. Delegates to the
