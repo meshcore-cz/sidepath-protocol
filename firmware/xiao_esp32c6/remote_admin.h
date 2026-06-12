@@ -262,6 +262,16 @@ static void cborEmitUintAdmin(std::vector<uint8_t>& o, uint64_t v) {
   }
 }
 
+static void cborEmitArrayHeaderAdmin(std::vector<uint8_t>& o, size_t n) {
+  if (n < 24) o.push_back(0x80 | (uint8_t)n);
+  else { o.push_back(0x98); o.push_back((uint8_t)n); }
+}
+
+static void cborEmitMapHeaderAdmin(std::vector<uint8_t>& o, size_t n) {
+  if (n < 24) o.push_back(0xa0 | (uint8_t)n);
+  else { o.push_back(0xb8); o.push_back((uint8_t)n); }
+}
+
 static void cborEmitIntAdmin(std::vector<uint8_t>& o, int64_t v) {
   if (v >= 0) { cborEmitUintAdmin(o, (uint64_t)v); return; }
   uint64_t n = (uint64_t)(-1 - v);
@@ -282,6 +292,78 @@ static void cborEmitTextAdmin(std::vector<uint8_t>& o, const String& s) {
   else if (n < 0x100) { o.push_back(0x78); o.push_back((uint8_t)n); }
   else { o.push_back(0x79); o.push_back((uint8_t)(n >> 8)); o.push_back((uint8_t)n); }
   o.insert(o.end(), (const uint8_t*)s.c_str(), (const uint8_t*)s.c_str() + n);
+}
+
+using AdminRoute = std::vector<std::array<uint8_t, mesh::NODE_ID_LEN>>;
+
+static bool cborReadNodeArrayAdmin(const uint8_t* p, size_t len, AdminRoute& out) {
+  out.clear();
+  if (len < 1 || (p[0] >> 5) != 4) return false;
+  uint8_t count = p[0] & 0x1f;
+  if (count >= 24 || count > mesh::MAX_ROUTE_HOPS) return false;
+  size_t pos = 1;
+  for (uint8_t i = 0; i < count; i++) {
+    size_t itemLen = cborItemLenAdmin(p + pos, len - pos);
+    if (!itemLen) return false;
+    const uint8_t* node = nullptr;
+    size_t nodeLen = 0;
+    if (!cborReadBstrAdmin(p + pos, itemLen, node, nodeLen) || nodeLen != mesh::NODE_ID_LEN) return false;
+    std::array<uint8_t, mesh::NODE_ID_LEN> id{};
+    memcpy(id.data(), node, mesh::NODE_ID_LEN);
+    out.push_back(id);
+    pos += itemLen;
+  }
+  return pos == len;
+}
+
+static bool readDatagramPathAdmin(const std::vector<uint8_t>& dg, AdminRoute& path) {
+  path.clear();
+  if (dg.empty() || (dg[0] >> 5) != 5) return false;
+  uint8_t count = dg[0] & 0x1f;
+  if (count >= 24) return false;
+  size_t pos = 1;
+  for (uint8_t i = 0; i < count; i++) {
+    size_t keyLen = cborItemLenAdmin(dg.data() + pos, dg.size() - pos);
+    if (!keyLen) return false;
+    size_t valuePos = pos + keyLen;
+    size_t valueLen = cborItemLenAdmin(dg.data() + valuePos, dg.size() - valuePos);
+    if (!valueLen) return false;
+    uint64_t key = 0;
+    if (!cborUintAdmin(dg.data() + pos, keyLen, key)) return false;
+    if (key == mesh::KEY_PATH) {
+      return cborReadNodeArrayAdmin(dg.data() + valuePos, valueLen, path);
+    }
+    pos = valuePos + valueLen;
+  }
+  return true;
+}
+
+static AdminRoute buildReturnRouteAdmin(const std::vector<uint8_t>& receivedDg,
+                                        const uint8_t source[mesh::NODE_ID_LEN]) {
+  AdminRoute path;
+  if (!readDatagramPathAdmin(receivedDg, path)) path.clear();
+  AdminRoute route;
+  if (path.size() + 1 <= mesh::MAX_ROUTE_HOPS) {
+    for (size_t i = path.size(); i > 0; i--) route.push_back(path[i - 1]);
+  } else {
+    size_t keep = mesh::MAX_ROUTE_HOPS - 1;
+    for (size_t i = path.size(); i > path.size() - keep; i--) route.push_back(path[i - 1]);
+  }
+  std::array<uint8_t, mesh::NODE_ID_LEN> src{};
+  memcpy(src.data(), source, mesh::NODE_ID_LEN);
+  route.push_back(src);
+  return route;
+}
+
+static void cborEmitRouteAdmin(std::vector<uint8_t>& o, const AdminRoute& route) {
+  cborEmitArrayHeaderAdmin(o, route.size());
+  for (const auto& hop : route) cborEmitBstrAdmin(o, hop.data(), hop.size());
+}
+
+static void sendAdminDatagramRoute(const std::vector<uint8_t>& dg, const AdminRoute& route,
+                                   uint16_t fallbackConn) {
+  if (!route.empty() && sendToNode(dg, route.front().data())) return;
+  sendFramesToConn(dg, fallbackConn);
 }
 
 struct DirectChatBody {
@@ -573,15 +655,18 @@ static bool sealDirectTextAdmin(const uint8_t datagramId[mesh::DATAGRAM_ID_LEN],
 static void buildChatDatagramAdmin(const uint8_t id[mesh::DATAGRAM_ID_LEN],
                                    const uint8_t destNode[mesh::NODE_ID_LEN],
                                    uint16_t flags,
+                                   const AdminRoute& route,
                                    const std::vector<uint8_t>& payload,
                                    std::vector<uint8_t>& dg) {
   dg.clear();
-  dg.push_back(flags ? 0xa8 : 0xa7);
+  cborEmitMapHeaderAdmin(dg, flags ? 10 : 9);
   cborEmitUintAdmin(dg, mesh::KEY_VERSION); cborEmitUintAdmin(dg, mesh::DATAGRAM_VERSION);
   cborEmitUintAdmin(dg, mesh::KEY_ID); cborEmitBstrAdmin(dg, id, mesh::DATAGRAM_ID_LEN);
   cborEmitUintAdmin(dg, mesh::KEY_SOURCE); cborEmitBstrAdmin(dg, g_nodeId, mesh::NODE_ID_LEN);
   cborEmitUintAdmin(dg, mesh::KEY_DEST); cborEmitBstrAdmin(dg, destNode, mesh::NODE_ID_LEN);
-  cborEmitUintAdmin(dg, mesh::KEY_TTL); cborEmitUintAdmin(dg, 1);
+  cborEmitUintAdmin(dg, mesh::KEY_TTL); cborEmitUintAdmin(dg, route.size());
+  cborEmitUintAdmin(dg, mesh::KEY_ROUTE); cborEmitRouteAdmin(dg, route);
+  cborEmitUintAdmin(dg, mesh::KEY_ROUTE_CURSOR); cborEmitUintAdmin(dg, 0);
   cborEmitUintAdmin(dg, mesh::KEY_PROTOCOL); cborEmitUintAdmin(dg, mesh::PROTO_BLEEDGE_CHAT);
   if (flags) { cborEmitUintAdmin(dg, mesh::KEY_FLAGS); cborEmitUintAdmin(dg, flags); }
   cborEmitUintAdmin(dg, mesh::KEY_PAYLOAD); cborEmitBstrAdmin(dg, payload.data(), payload.size());
@@ -589,6 +674,7 @@ static void buildChatDatagramAdmin(const uint8_t id[mesh::DATAGRAM_ID_LEN],
 
 static void sendEncryptedAdminReply(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN],
                                     const uint8_t recipientPub[mesh::PUBKEY_LEN],
+                                    const AdminRoute& route,
                                     const String& text) {
   uint8_t id[mesh::DATAGRAM_ID_LEN];
   esp_fill_random(id, sizeof(id));
@@ -598,12 +684,13 @@ static void sendEncryptedAdminReply(uint16_t conn, const uint8_t destNode[mesh::
     return;
   }
   std::vector<uint8_t> dg;
-  buildChatDatagramAdmin(id, destNode, mesh::FLAG_ACK_REQUESTED, payload, dg);
+  buildChatDatagramAdmin(id, destNode, mesh::FLAG_ACK_REQUESTED, route, payload, dg);
   g_dedup.seenOrAdd(id);
-  sendFramesToConn(dg, conn);
+  sendAdminDatagramRoute(dg, route, conn);
 }
 
 static void sendAckAdmin(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN],
+                         const AdminRoute& route,
                          const uint8_t ackedId[mesh::DATAGRAM_ID_LEN]) {
   std::vector<uint8_t> body;
   body.push_back(0xa1);
@@ -615,20 +702,21 @@ static void sendAckAdmin(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN
   uint8_t id[mesh::DATAGRAM_ID_LEN];
   esp_fill_random(id, sizeof(id));
   std::vector<uint8_t> dg;
-  dg.push_back(0xa7);
+  cborEmitMapHeaderAdmin(dg, 9);
   cborEmitUintAdmin(dg, mesh::KEY_VERSION); cborEmitUintAdmin(dg, mesh::DATAGRAM_VERSION);
   cborEmitUintAdmin(dg, mesh::KEY_ID); cborEmitBstrAdmin(dg, id, mesh::DATAGRAM_ID_LEN);
   cborEmitUintAdmin(dg, mesh::KEY_SOURCE); cborEmitBstrAdmin(dg, g_nodeId, mesh::NODE_ID_LEN);
   cborEmitUintAdmin(dg, mesh::KEY_DEST); cborEmitBstrAdmin(dg, destNode, mesh::NODE_ID_LEN);
-  cborEmitUintAdmin(dg, mesh::KEY_TTL); cborEmitUintAdmin(dg, 1);
+  cborEmitUintAdmin(dg, mesh::KEY_TTL); cborEmitUintAdmin(dg, route.size());
+  cborEmitUintAdmin(dg, mesh::KEY_ROUTE); cborEmitRouteAdmin(dg, route);
+  cborEmitUintAdmin(dg, mesh::KEY_ROUTE_CURSOR); cborEmitUintAdmin(dg, 0);
   cborEmitUintAdmin(dg, mesh::KEY_PROTOCOL); cborEmitUintAdmin(dg, mesh::PROTO_BLEEDGE_CONTROL);
   cborEmitUintAdmin(dg, mesh::KEY_PAYLOAD); cborEmitBstrAdmin(dg, ctrl.data(), ctrl.size());
   g_dedup.seenOrAdd(id);
-  sendFramesToConn(dg, conn);
+  sendAdminDatagramRoute(dg, route, conn);
 }
 
 static bool handleRemoteAdminChat(const std::vector<uint8_t>& dg, const mesh::DatagramHeader& h, uint16_t sender) {
-  (void)dg;
   if (h.protocol != mesh::PROTO_BLEEDGE_CHAT || !h.hasDestination ||
       memcmp(h.destination, g_nodeId, mesh::NODE_ID_LEN) != 0 ||
       h.payload == nullptr || h.payloadLen == 0) {
@@ -636,7 +724,8 @@ static bool handleRemoteAdminChat(const std::vector<uint8_t>& dg, const mesh::Da
   }
   DirectChatBody parsed;
   if (!parseDirectChatPayload(h.payload, h.payloadLen, parsed)) return false;
-  if (h.flags & mesh::FLAG_ACK_REQUESTED) sendAckAdmin(sender, h.source, h.id);
+  AdminRoute returnRoute = buildReturnRouteAdmin(dg, h.source);
+  if (h.flags & mesh::FLAG_ACK_REQUESTED) sendAckAdmin(sender, h.source, returnRoute, h.id);
 
   std::array<uint8_t, mesh::PUBKEY_LEN> senderPub{};
   String cmd;
@@ -646,13 +735,13 @@ static bool handleRemoteAdminChat(const std::vector<uint8_t>& dg, const mesh::Da
   }
   if (!isAdminPub(senderPub.data())) {
     g_cmdDenied++;
-    sendEncryptedAdminReply(sender, h.source, senderPub.data(), "not authenticated");
+    sendEncryptedAdminReply(sender, h.source, senderPub.data(), returnRoute, "not authenticated");
     return true;
   }
   cmd.trim();
   g_cmdAccepted++;
   String reply = handleAdminCommand(cmd);
-  sendEncryptedAdminReply(sender, h.source, senderPub.data(), reply);
+  sendEncryptedAdminReply(sender, h.source, senderPub.data(), returnRoute, reply);
   Serial.printf("[admin] from=%s cmd=%s\n", bytesHex(senderPub.data(), 4).c_str(), cmd.c_str());
   return true;
 }
