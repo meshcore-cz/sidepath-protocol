@@ -1,7 +1,5 @@
-// BLEEdge mesh core for microcontrollers — wire-compatible with core/ (Go) and
-// the Android Kotlin port. Pure logic, no BLE/Arduino BLE dependencies, so it can
-// be unit-tested on the host. See core/fragment.go and core/packet.go for the
-// reference implementation.
+// BLEEdge v3 mesh core for microcontrollers. Pure wire logic, no NimBLE
+// dependency, so it can be host-tested against the Go implementation.
 #pragma once
 
 #include <Arduino.h>
@@ -9,145 +7,140 @@
 
 namespace mesh {
 
-constexpr size_t NODE_ID_LEN   = 8;
-constexpr size_t PACKET_ID_LEN = 16;
-constexpr size_t FRAME_HEADER  = 23;  // version(1)+id(16)+fragIdx(1)+fragCount(1)+crc32(4)
-constexpr size_t PUBKEY_LEN    = 32;  // Ed25519 public key
-constexpr size_t SIG_LEN       = 64;  // Ed25519 signature
-constexpr uint8_t PROTOCOL_VERSION = 2;  // v2 = Ed25519 identities + signed ANNOUNCE
+constexpr size_t NODE_ID_LEN     = 10;
+constexpr size_t DATAGRAM_ID_LEN = 16;
+constexpr size_t TRANSFER_ID_LEN = 16;
+constexpr size_t FRAME_HEADER    = 23;
+constexpr size_t PUBKEY_LEN      = 32;
+constexpr size_t SIG_LEN         = 64;
 
-// CBOR packet map keys (see core/packet.go).
+constexpr uint8_t FRAME_VERSION     = 2;
+constexpr uint8_t DATAGRAM_VERSION  = 3;
+constexpr uint8_t NODE_INFO_VERSION = 1;
+constexpr uint8_t ANNOUNCE_VERSION  = 1;
+
+constexpr uint8_t MAX_TTL        = 16;
+constexpr uint8_t ANNOUNCE_TTL   = 5;
+constexpr uint8_t MAX_ROUTE_HOPS = 16;
+
+// Datagram CBOR keys.
 enum : uint8_t {
-  KEY_VERSION = 1, KEY_TYPE = 2, KEY_ID = 3, KEY_SOURCE = 4, KEY_DEST = 5,
-  KEY_MODE = 6, KEY_TTL = 7, KEY_ROUTE_CURSOR = 8, KEY_ROUTE = 9, KEY_TRACE = 10,
-  KEY_PAYLOAD_TYPE = 11, KEY_PAYLOAD = 12, KEY_SEQ = 13, KEY_TRACE_METRIC = 14,
+  KEY_VERSION = 1, KEY_ID = 2, KEY_SOURCE = 3, KEY_DEST = 4, KEY_TTL = 5,
+  KEY_ROUTE = 6, KEY_ROUTE_CURSOR = 7, KEY_PATH = 8, KEY_PROTOCOL = 9,
+  KEY_FLAGS = 10, KEY_PAYLOAD = 11,
 };
 
-enum : uint8_t { TYPE_DATA = 1, TYPE_ANNOUNCE = 2, TYPE_ACK = 3 };
-enum : uint8_t { MODE_FLOOD = 1, MODE_SOURCE_ROUTE = 2 };
-enum : uint8_t {
-  PAYLOAD_TEXT = 1, PAYLOAD_MESH_CORE_RAW = 2, PAYLOAD_CHAT_PLAIN = 3,
-  PAYLOAD_CHAT_ENCRYPTED = 4, PAYLOAD_CHANNEL = 5, PAYLOAD_TRACE_REQUEST = 6,
-  PAYLOAD_TRACE_RESPONSE = 7,
-  PAYLOAD_TYPING = 8,  // ephemeral "peer is typing" hint — never ACKed, empty payload
+enum : uint16_t {
+  PROTO_BLEEDGE_CONTROL = 0x0000,
+  PROTO_MESHCORE_PACKET = 0x0001,
+  PROTO_BLEEDGE_CHAT    = 0x0100,
 };
 
-// Capability bits (see core/types.go).
+enum : uint16_t { FLAG_ACK_REQUESTED = 0x0001 };
+
 enum : uint8_t {
-  CAP_SENDER = 0x01, CAP_RECEIVER = 0x02, CAP_RELAY = 0x04,
-  CAP_GATEWAY = 0x08, CAP_CODED_PHY = 0x10,
+  CONTROL_ANNOUNCE = 1,
+  CONTROL_ACK = 2,
+  CONTROL_TRACE_REQUEST = 3,
+  CONTROL_TRACE_RESPONSE = 4,
+};
+
+enum : uint16_t {
+  CAP_SENDER = 0x0001,
+  CAP_RECEIVER = 0x0002,
+  CAP_RELAY = 0x0004,
+  CAP_GATEWAY = 0x0008,
+  CAP_CODED_PHY = 0x0010,
 };
 
 uint32_t crc32_ieee(const uint8_t* data, size_t len);
 
-// ---- DedupCache: recently-seen PacketIDs ------------------------------------
 class DedupCache {
  public:
   explicit DedupCache(size_t capacity = 128, uint32_t ttlMs = 5UL * 60 * 1000);
-  // Returns true if id was already seen (within TTL). Otherwise records it.
-  bool seenOrAdd(const uint8_t id[PACKET_ID_LEN]);
+  bool seenOrAdd(const uint8_t id[DATAGRAM_ID_LEN]);
 
  private:
-  struct Entry { uint8_t id[PACKET_ID_LEN]; uint32_t seenMs; bool used; };
+  struct Entry { uint8_t id[DATAGRAM_ID_LEN]; uint32_t seenMs; bool used; };
   std::vector<Entry> entries_;
   uint32_t ttlMs_;
   size_t next_;
 };
 
-// ---- Reassembler: collects GATT frames into a packet ------------------------
 class Reassembler {
  public:
   explicit Reassembler(uint32_t timeoutMs = 10000) : timeoutMs_(timeoutMs) {}
-  // Feed one raw GATT frame. On the frame that completes a packet (CRC valid),
-  // fills `out` with the packet bytes and returns true. Otherwise returns false.
-  bool addFrame(const uint8_t* raw, size_t len, std::vector<uint8_t>& out);
+  bool addFrame(uint16_t peerLink, const uint8_t* raw, size_t len, std::vector<uint8_t>& out);
   void reap();
 
  private:
   struct Assembly {
     bool used = false;
-    uint8_t id[PACKET_ID_LEN];
+    uint16_t peer = 0;
+    uint8_t transferId[TRANSFER_ID_LEN];
     uint8_t count = 0;
     uint32_t crc = 0;
     uint32_t lastMs = 0;
-    std::vector<std::vector<uint8_t>> frags;  // size == count
+    std::vector<std::vector<uint8_t>> frags;
     std::vector<bool> have;
   };
-  static constexpr size_t MAX_PENDING = 4;
+  static constexpr size_t MAX_PENDING = 8;
   Assembly slots_[MAX_PENDING];
   uint32_t timeoutMs_;
 };
 
-// ---- Packet inspection / relay transcode ------------------------------------
-struct PacketHeader {
+struct DatagramHeader {
   bool ok = false;
-  uint8_t id[PACKET_ID_LEN];
-  uint8_t type = 0;
-  uint8_t mode = 0;
-  uint8_t ttl = 0;
-  uint8_t payloadType = 0;
-  uint8_t routeCursor = 0;
-  bool traceContainsSelf = false;
-  uint8_t source[NODE_ID_LEN];   // packet origin (key 4)
+  uint8_t id[DATAGRAM_ID_LEN];
+  uint8_t source[NODE_ID_LEN];
   bool hasSource = false;
-  uint8_t destination[NODE_ID_LEN];  // packet destination (key 5)
+  uint8_t destination[NODE_ID_LEN];
   bool hasDestination = false;
-  uint8_t lastHop[NODE_ID_LEN];  // last trace entry — the peer that sent us this frame
+  uint8_t ttl = 0;
+  uint16_t protocol = 0;
+  uint16_t flags = 0;
+  uint8_t routeCursor = 0;
+  uint8_t pathLen = 0;
+  uint8_t routeLen = 0;
+  bool sourceRouted = false;
+  bool pathContainsSelf = false;
+  uint8_t lastHop[NODE_ID_LEN];
   bool hasLastHop = false;
-  uint8_t nextHop[NODE_ID_LEN];  // route[route_cursor + 1] after this relay
-  bool hasNextHop = false;
   bool routeCurrentIsSelf = false;
   bool routeEndsHere = false;
-  const uint8_t* payload = nullptr;  // byte string content for key 12
+  uint8_t nextHop[NODE_ID_LEN];
+  bool hasNextHop = false;
+  const uint8_t* payload = nullptr;
   size_t payloadLen = 0;
+  uint8_t controlKind = 0;  // parsed when protocol == BLEEDGE_CONTROL.
 };
 
-// The directly-connected peer that sent us a packet: the last trace hop, or the
-// source if the trace is empty (a freshly-originated packet from a direct neighbor).
-// Writes 8 bytes to `out` and returns true if known.
-bool directNeighbor(const PacketHeader& h, uint8_t out[NODE_ID_LEN]);
+bool directNeighbor(const DatagramHeader& h, uint8_t out[NODE_ID_LEN]);
+DatagramHeader parseDatagram(const uint8_t* dg, size_t len, const uint8_t selfId[NODE_ID_LEN]);
 
-// Parses the fields a relay needs and checks whether `selfId` is already in the
-// trace (loop). Does not allocate. Returns false on malformed input.
-PacketHeader parseHeader(const uint8_t* pkt, size_t len, const uint8_t selfId[NODE_ID_LEN]);
+bool buildFloodForward(const uint8_t* dg, size_t len, const uint8_t selfId[NODE_ID_LEN],
+                       uint8_t newTtl, std::vector<uint8_t>& out);
+bool buildSourceRouteForward(const uint8_t* dg, size_t len, const uint8_t selfId[NODE_ID_LEN],
+                             uint8_t newTtl, uint8_t newRouteCursor,
+                             std::vector<uint8_t>& out);
 
-// Produces a forwardable copy of `pkt`: every CBOR map entry copied verbatim
-// except TTL (rewritten to `newTtl`) and Trace (with `selfId` appended).
-// Returns false on malformed input.
-bool buildForward(const uint8_t* pkt, size_t len, const uint8_t selfId[NODE_ID_LEN],
-                  uint8_t newTtl, std::vector<uint8_t>& out);
-
-// Produces a forwardable TRACE source-route packet. Requires parseHeader() to
-// have confirmed routeCurrentIsSelf and hasNextHop. Rewrites TTL, route_cursor,
-// trace, and trace_metric; copies all other fields verbatim.
-bool buildTraceSourceRouteForward(const uint8_t* pkt, size_t len,
-                                  const uint8_t selfId[NODE_ID_LEN],
-                                  uint8_t newTtl, uint8_t newRouteCursor,
-                                  int8_t metric, std::vector<uint8_t>& out);
-
-// Builds the canonical byte string that an ANNOUNCE signature covers. Fixed
-// explicit layout (must match core.AnnounceSignedMessage in Go and the Kotlin
-// port): pubkey[32] | timestamp[4 LE] | caps[1] | seq[4 LE] | count[1] |
-// neighbors[count*8]. No crypto here — the caller signs the result.
-void announceSignedMessage(const uint8_t pubKey[PUBKEY_LEN], uint32_t timestamp,
-                           uint8_t caps, uint32_t seq,
+void announceSignedMessage(const uint8_t pubKey[PUBKEY_LEN], uint64_t epoch, uint32_t seq,
+                           int64_t timestamp, uint16_t caps,
                            const uint8_t* neighbors, size_t neighborCount,
+                           const char* name, const char* description, const char* platform,
                            std::vector<uint8_t>& out);
 
-// Builds a complete signed ANNOUNCE packet (CBOR) this node originates. `selfId`
-// must equal pubKey[:8]. `signature` is the Ed25519 signature over
-// announceSignedMessage(...), produced by the caller. `packetId` is the
-// caller-generated 16-byte ID (also used for fragmentation and dedup marking).
-// `neighbors` is a contiguous array of `neighborCount` 8-byte NodeIDs.
-void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint8_t caps, uint32_t seq,
-                   int64_t unixSeconds, const uint8_t packetId[PACKET_ID_LEN],
+void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint16_t caps, uint64_t epoch,
+                   uint32_t seq, int64_t unixSeconds, const uint8_t datagramId[DATAGRAM_ID_LEN],
                    const uint8_t* neighbors, size_t neighborCount,
                    const uint8_t pubKey[PUBKEY_LEN], const uint8_t signature[SIG_LEN],
-                   const char* description, const char* name, const char* platform,
+                   const char* name, const char* description, const char* platform,
                    std::vector<uint8_t>& out);
 
-// Splits packet bytes into GATT frames (matches core.FragmentPacket).
-void fragment(const uint8_t* pkt, size_t len, size_t mtu, const uint8_t packetId[PACKET_ID_LEN],
+void buildNodeInfo(const uint8_t pubKey[PUBKEY_LEN], uint16_t caps, std::vector<uint8_t>& out);
+
+void randomTransferId(uint8_t out[TRANSFER_ID_LEN]);
+void fragment(const uint8_t* dg, size_t len, size_t mtu,
               std::vector<std::vector<uint8_t>>& frames);
 
 }  // namespace mesh

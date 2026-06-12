@@ -4,12 +4,12 @@ Minimal relay node for the BLEEdge mesh. The ESP32-C6 runs as a **multi-connecti
 GATT-server "relay hub"**: phones and other nodes connect to it as GATT clients —
 exactly the way they connect to each other — and it floods packets between all
 connected peers, applying the same routing rules as the rest of the mesh
-(dedup, TTL, loop/trace, flood). Two nodes that can't reach each other directly can
+(dedup, TTL, loop/path checks, flood/source-route). Two nodes that can't reach each other directly can
 talk through the ESP32.
 
 It is wire-compatible with the Go (`core/`, `linux/`, `macos/`) and Android nodes:
-same GATT UUIDs, the same 23-byte fragment framing + CRC32, and the same CBOR packet
-format with integer keys.
+same GATT UUIDs, v2 23-byte frame fragmentation + CRC32, and v3 CBOR datagrams
+with integer keys.
 
 ## What it does
 
@@ -17,30 +17,28 @@ format with integer keys.
   carrying its NodeID (scan response) so any node discovers it on 1M PHY.
 - GATT server with the three BLEEdge characteristics: `NODE_INFO` (read),
   `PACKET_IN` (write), `PACKET_OUT` (notify).
-- Reassembles incoming frames, decodes the packet, and for **flood** packets:
-  drops duplicates / loops / TTL-exhausted, appends itself to the trace, decrements
+- Reassembles incoming frames, decodes the datagram, and for **flood** datagrams:
+  drops duplicates / loops / TTL-exhausted, appends itself to the path, decrements
   TTL, re-fragments, and notifies every connected peer **except** the sender.
-- For **TRACE source-route** packets where its NodeID is the current route hop,
-  appends itself to the trace, appends a trace metric sample, advances
-  `route_cursor`, and notifies only the connected next hop on the selected track.
-  TRACE packets in flood mode are not relayed.
-- Sends a periodic `ANNOUNCE` (every 15 s) advertising `relay` capability **and its
+- For **source-routed** datagrams where its NodeID is the current route hop,
+  appends itself to the path, advances `route_cursor`, and notifies only the
+  connected next hop on the selected route.
+- Sends a periodic signed v3 `ANNOUNCE` (every 15 s) advertising `relay` capability **and its
   learned neighbors**, so it appears correctly in other nodes' topology. Neighbors
-  are learned from received traffic — the last trace hop (or the source of a fresh
-  packet) is the directly-connected peer — which works even though every connection
+  are learned from received traffic — the last path hop (or the source of a fresh
+  datagram) is the directly-connected peer — which works even though every connection
   is inbound (the phones connect to the relay, not the other way around).
-- Derives a stable 8-byte NodeID from its persisted Ed25519 public key (`pubkey[:8]`).
-- Accepts encrypted direct-message remote-control commands addressed to its NodeID
-  from configured admin Ed25519 public keys, and replies by encrypted DM.
+- Derives a stable 10-byte NodeID from its persisted Ed25519 public key (`pubkey[:10]`).
+- Provides admin commands over USB serial and encrypted direct BLEEdge Chat
+  messages for relay diagnostics, admin-key management, and clock setup.
 
 ## Limitations (intentional, for a "basic" relay)
 
 - **Peripheral/server role only.** It does not scan or initiate connections, so it
   won't link two *other* relays together; it bridges the centrals (phones) that
   connect to it. Adding the central role (scan + GATT client) is the natural next step.
-- **TRACE-only source routing.** Ordinary source-routed DATA is not forwarded
-  (logged and dropped). TRACE source-route packets are forwarded only when this
-  relay is on the selected track and the next hop is currently connected.
+- **Peripheral/server relay only.** Source-routed datagrams are forwarded only
+  when this relay is on the selected route and the next hop is currently connected.
 - **1M PHY.** Matches the mesh default. (The C6 supports Coded PHY; enabling Long
   Range advertising is a future extension.)
 - Default max simultaneous connections is set by NimBLE
@@ -50,30 +48,39 @@ format with integer keys.
 
 1. Install the **arduino-esp32** core **≥ 3.0.0** (Boards Manager → "esp32 by Espressif").
 2. Install **NimBLE-Arduino ≥ 2.1.0** (Library Manager → "NimBLE-Arduino").
-3. Add build-time remote-control admins in `ADMIN_PUBKEYS` near the top of
-   `xiao_esp32c6.ino` as 64-character Ed25519 public-key hex strings.
-4. Select board **"XIAO_ESP32C6"**.
-5. Open `xiao_esp32c6.ino` (keep `mesh.h` / `mesh.cpp` in the same folder) and Upload.
+3. Select board **"XIAO_ESP32C6"**.
+4. Optional: set `BLEEDGE_ADMIN_PUBKEY` to a 32-byte Ed25519 public key hex
+   string in your build flags to enable a built-in remote admin.
+5. Open `xiao_esp32c6.ino` (keep `mesh.h` / `mesh.cpp` / `remote_admin.h`
+   in the same folder) and Upload.
 6. Open Serial Monitor at **115200 baud** — you'll see the node ID, advertising
    status, peer connect/disconnect, and per-packet relay/forward logs.
 
-## Remote control
+## Admin commands
 
-Send an encrypted direct message to the ESP32 node. The sender public key carried
-inside the chat envelope must be a build-time admin or a runtime admin stored in
-NVS; otherwise the node replies `not authenticated`.
+Admin commands are available in two places:
+
+- USB Serial Monitor at 115200 baud.
+- Encrypted BLEEdge Chat v1 `DIRECT_TEXT` messages addressed to the relay node.
+  The sender must be a configured admin public key. Remote admin replies are sent
+  back as encrypted `DIRECT_TEXT` messages.
 
 Commands:
 
 - `help` — show supported commands.
-- `sensors` — read the ESP32-C6 internal temperature.
-- `stats` — uptime, peer/neighbor counts, packet/frame counters, command counters,
-  free heap, plus placeholders for metrics that BLE does not expose (`noise_floor`
-  and `air_time`).
-- `admins` or `admin` — list build-time and runtime admin public keys.
-- `admin.add <pubkey>` — add a runtime admin public key to NVS.
-- `admin.remove <pubkey>` — remove a runtime admin public key from NVS. Build-time
+- `sensors` — read the ESP32 temperature sensor.
+- `stats` — uptime, peer/neighbor counts, datagram/frame counters, relay counters,
+  announce count, and current clock state.
+- `clock` — show the relay's internal UTC clock, or `unset`.
+- `clock.set <YYYY-MM-DDTHH:MM:SSZ>` — set the relay's volatile internal UTC
+  clock. Signed announces use this timestamp once set; before that, announces use
+  timestamp `0` as specified for devices without a reliable clock.
+- `admins` — list built-in and runtime remote-admin public keys.
+- `admin.add <pubkey>` — add a runtime remote-admin Ed25519 public key.
+- `admin.remove <pubkey>` — remove a runtime remote-admin public key. Built-in
   admins cannot be removed at runtime.
+
+Runtime admins are stored in ESP32 NVS under the relay's admin namespace.
 
 ### arduino-cli
 
@@ -99,16 +106,17 @@ arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32C6 -p /dev/ttyACM0 firmware/xia
 | File | Purpose |
 |------|---------|
 | `xiao_esp32c6.ino` | BLE setup, advertising, GATT server, relay glue (NimBLE) |
+| `remote_admin.h` | Encrypted direct-chat remote admin commands and admin-key storage |
 | `mesh.h` / `mesh.cpp` | Wire-format logic: CRC32, fragment/reassemble, CBOR parse + relay transcode, ANNOUNCE builder. No BLE deps. |
 | `test/` | Host cross-check harness — validates the mesh logic against the Go reference |
 
 ## Tests
 
-`mesh.cpp` is pure logic and is unit-tested on the host against the Go reference
-implementation (relay transcode round-trip, CRC32, byte-identical fragmentation):
+`mesh.cpp` is pure logic and is unit-tested on the host for v3 CRC, frame, and
+announce parsing behavior:
 
 ```bash
 ./firmware/xiao_esp32c6/test/run_tests.sh
 ```
 
-Requires a host C++17 compiler and the Go toolchain (run from the repo root).
+Requires a host C++17 compiler.
