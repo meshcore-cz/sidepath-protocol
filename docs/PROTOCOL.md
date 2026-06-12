@@ -218,7 +218,26 @@ but MUST NOT exceed `MAX_FRAME_SIZE` for BLEEdge frames.
 All frames belonging to one transmission share the same `transfer_id`,
 `fragment_count`, and `payload_crc32`.
 
-### 5.3 Reassembly
+### 5.3 Frame transmission reliability
+
+BLEEdge does not define per-frame ACKs, so a sender is responsible for making a
+single hop transmission complete enough for the receiver to reassemble it.
+
+For a transmission with `fragment_count > 1`, an implementation MUST NOT
+silently drop a fragment because the local BLE stack reports write/notification
+backpressure, for example a full notification transmit queue. It MUST either:
+
+* wait and retry until the frame is accepted by the local BLE stack;
+* use an acknowledged GATT write, indication, or equivalent platform mechanism;
+  or
+* abort the whole transmission and report/log the failure as a send failure.
+
+Fragments for the same `(peer_link, transfer_id)` SHOULD be sent in increasing
+`fragment_index` order and SHOULD be paced when the platform exposes only a
+small or lossy transmit queue. Receivers MUST still accept fragments in any
+order.
+
+### 5.4 Reassembly
 
 A receiver:
 
@@ -794,6 +813,8 @@ A conforming implementation MUST:
 * [ ] encode frame version `2` with a hop-local `transfer_id`;
 * [ ] key reassembly by `(peer_link, transfer_id)`;
 * [ ] fragment at `MAX_FRAME_SIZE = 200`;
+* [ ] handle GATT write/notification backpressure without silently dropping
+  fragments from a multi-fragment transmission;
 * [ ] encode datagram version `3` using CBOR integer keys 1–11;
 * [ ] infer flood versus source routing from the presence of `route`;
 * [ ] route unknown protocols as opaque payloads;

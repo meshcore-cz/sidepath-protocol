@@ -30,6 +30,8 @@ var (
 	packetOutUUID = ble.MustParse("9B7E6A10-7D91-4C19-A3B8-6E2A11F3A004")
 )
 
+const interFrameDelay = 20 * time.Millisecond
+
 // Node is a macOS BLEEdge node.
 type Node struct {
 	nodeID        core.NodeID
@@ -48,7 +50,7 @@ type Node struct {
 	// peer addr string → link
 	peers map[string]*MacPeerLink
 	// notifiers for PACKET_OUT (server-side subscribers)
-	notifiers map[string]ble.Notifier
+	notifiers map[string]*serverNotifier
 	// server-side peer addr string → learned NodeID
 	serverPeerIDs map[string]core.NodeID
 
@@ -59,6 +61,19 @@ type Node struct {
 	onMessage        func(core.Datagram)
 	onPeerConnect    func(core.NodeID)
 	onPeerDisconnect func(core.NodeID)
+}
+
+type TransmitInfo struct {
+	DatagramID    core.DatagramID
+	DatagramBytes int
+	FragmentCount int
+}
+
+type serverNotifier struct {
+	addr     string
+	notifier ble.Notifier
+	queue    chan []byte
+	done     chan struct{}
 }
 
 // Config holds startup parameters.
@@ -105,7 +120,7 @@ func New(cfg Config) *Node {
 		verbose:       cfg.Verbose,
 		announceEpoch: cfg.AnnounceEpoch,
 		peers:         make(map[string]*MacPeerLink),
-		notifiers:     make(map[string]ble.Notifier),
+		notifiers:     make(map[string]*serverNotifier),
 		serverPeerIDs: make(map[string]core.NodeID),
 		channels:      make(map[string]*Channel),
 		logFn:         cfg.LogFn,
@@ -193,13 +208,20 @@ func (n *Node) buildGATTService() *ble.Service {
 	poChar := ble.NewCharacteristic(packetOutUUID)
 	poChar.HandleNotify(ble.NotifyHandlerFunc(func(req ble.Request, notifier ble.Notifier) {
 		addr := req.Conn().RemoteAddr().String()
+		sn := n.newServerNotifier(addr, notifier)
 		n.mu.Lock()
-		n.notifiers[addr] = notifier
+		if old := n.notifiers[addr]; old != nil {
+			old.close()
+		}
+		n.notifiers[addr] = sn
 		n.mu.Unlock()
 		n.logf("server: peer %s subscribed to PACKET_OUT", addr)
 		<-notifier.Context().Done()
+		sn.close()
 		n.mu.Lock()
-		delete(n.notifiers, addr)
+		if n.notifiers[addr] == sn {
+			delete(n.notifiers, addr)
+		}
 		delete(n.serverPeerIDs, addr)
 		n.mu.Unlock()
 		n.logf("server: peer %s unsubscribed from PACKET_OUT", addr)
@@ -608,16 +630,12 @@ func (n *Node) relayFlood(a core.Action) {
 		if a.ExcludePeer != nil && link.peerID == *a.ExcludePeer {
 			continue // don't relay back to incoming peer
 		}
-		for _, f := range frames {
-			_ = link.sendFrame(f.Encode())
-		}
+		n.sendFramesToLink(link, frames)
 		_ = addr
 	}
 	// Also notify server-side subscribers
 	for _, notifier := range n.notifiers {
-		for _, f := range frames {
-			notifier.Write(f.Encode())
-		}
+		n.notifyFrames(notifier, frames)
 	}
 }
 
@@ -667,14 +685,10 @@ func (n *Node) announceLoop(ctx context.Context) {
 			frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
 			n.mu.Lock()
 			for _, link := range n.peers {
-				for _, f := range frames {
-					_ = link.sendFrame(f.Encode())
-				}
+				n.sendFramesToLink(link, frames)
 			}
 			for _, notifier := range n.notifiers {
-				for _, f := range frames {
-					notifier.Write(f.Encode())
-				}
+				n.notifyFrames(notifier, frames)
 			}
 			n.mu.Unlock()
 		}
@@ -701,18 +715,28 @@ func (n *Node) SendText(dst core.NodeID, text string, ttl uint8) error {
 // the BLEEdge mesh as a v3 MESHCORE_PACKET datagram. The bytes are carried
 // verbatim; BLEEdge routing treats the payload as opaque.
 func (n *Node) SendMeshCoreRaw(payload []byte) error {
+	_, err := n.SendMeshCoreRawWithInfo(payload)
+	return err
+}
+
+func (n *Node) SendMeshCoreRawWithInfo(payload []byte) (TransmitInfo, error) {
 	dg := n.router.NewBroadcast(core.ProtocolMeshCorePacket, payload, core.DefaultFloodTTL)
-	return n.transmit(dg)
+	return n.transmitWithInfo(dg)
 }
 
 // SendMeshCoreRawTo sends an opaque MeshCore packet to a specific reachable
 // BLEEdge neighbor as a v3 MESHCORE_PACKET datagram.
 func (n *Node) SendMeshCoreRawTo(dst core.NodeID, payload []byte) error {
+	_, err := n.SendMeshCoreRawToWithInfo(dst, payload)
+	return err
+}
+
+func (n *Node) SendMeshCoreRawToWithInfo(dst core.NodeID, payload []byte) (TransmitInfo, error) {
 	dg, ok := n.router.NewUnicast(dst, core.ProtocolMeshCorePacket, payload, 0, core.DefaultFloodTTL, true)
 	if !ok {
-		return fmt.Errorf("no direct BLEEdge route to %s", dst)
+		return TransmitInfo{}, fmt.Errorf("no direct BLEEdge route to %s", dst)
 	}
-	return n.transmit(dg)
+	return n.transmitWithInfo(dg)
 }
 
 // MeshCoreNeighborForHash resolves a MeshCore node hash to a currently
@@ -815,26 +839,28 @@ func (n *Node) PublicKeyFor(id core.NodeID) []byte {
 
 // sendData builds, originates and transmits a DATA packet.
 func (n *Node) transmit(dg core.Datagram) error {
+	_, err := n.transmitWithInfo(dg)
+	return err
+}
+
+func (n *Node) transmitWithInfo(dg core.Datagram) (TransmitInfo, error) {
 	n.router.MarkOriginated(dg.ID)
 	data, err := dg.Encode()
 	if err != nil {
-		return err
+		return TransmitInfo{}, err
 	}
 	frames := core.FragmentDatagramNew(data, core.MaxFrameSize)
+	info := TransmitInfo{DatagramID: dg.ID, DatagramBytes: len(data), FragmentCount: len(frames)}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, link := range n.peers {
-		for _, f := range frames {
-			_ = link.sendFrame(f.Encode())
-		}
+		n.sendFramesToLink(link, frames)
 	}
 	// Also send to server-side subscribers (peers that connected TO us)
 	for _, notifier := range n.notifiers {
-		for _, f := range frames {
-			notifier.Write(f.Encode())
-		}
+		n.notifyFrames(notifier, frames)
 	}
-	return nil
+	return info, nil
 }
 
 func (n *Node) transmitToRoute(dg core.Datagram) error {
@@ -859,9 +885,7 @@ func (n *Node) sendFramesToPeer(frames []core.Frame, peer core.NodeID) bool {
 	defer n.mu.Unlock()
 	for _, link := range n.peers {
 		if link.peerID == peer {
-			for _, f := range frames {
-				_ = link.sendFrame(f.Encode())
-			}
+			n.sendFramesToLink(link, frames)
 			return true
 		}
 	}
@@ -873,12 +897,92 @@ func (n *Node) sendFramesToPeer(frames []core.Frame, peer core.NodeID) bool {
 		if !ok {
 			continue
 		}
-		for _, f := range frames {
-			notifier.Write(f.Encode())
-		}
+		n.notifyFrames(notifier, frames)
 		return true
 	}
 	return false
+}
+
+func (n *Node) sendFramesToLink(link *MacPeerLink, frames []core.Frame) {
+	reliable := len(frames) > 1
+	for i, f := range frames {
+		var err error
+		if reliable {
+			err = link.sendFrameReliable(f.Encode())
+		} else {
+			err = link.sendFrame(f.Encode())
+		}
+		if err != nil {
+			n.logf("send frame error peer=%s fragment=%d/%d reliable=%v: %v", link.peerID, i+1, len(frames), reliable, err)
+		}
+		if reliable && i+1 < len(frames) {
+			time.Sleep(interFrameDelay)
+		}
+	}
+}
+
+func (n *Node) notifyFrames(notifier *serverNotifier, frames []core.Frame) {
+	for i, f := range frames {
+		if !notifier.enqueue(f.Encode()) {
+			n.logf("notify queue full addr=%s fragment=%d/%d", notifier.addr, i+1, len(frames))
+		}
+		if len(frames) > 1 && i+1 < len(frames) {
+			time.Sleep(interFrameDelay)
+		}
+	}
+}
+
+func (n *Node) newServerNotifier(addr string, notifier ble.Notifier) *serverNotifier {
+	sn := &serverNotifier{
+		addr:     addr,
+		notifier: notifier,
+		queue:    make(chan []byte, 256),
+		done:     make(chan struct{}),
+	}
+	go n.runServerNotifier(sn)
+	return sn
+}
+
+func (n *Node) runServerNotifier(sn *serverNotifier) {
+	for {
+		select {
+		case <-sn.done:
+			return
+		case frame := <-sn.queue:
+			for {
+				_, err := sn.notifier.Write(frame)
+				if err == nil {
+					break
+				}
+				n.logf("notify backpressure addr=%s: %v; retrying", sn.addr, err)
+				select {
+				case <-sn.done:
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+		}
+	}
+}
+
+func (s *serverNotifier) enqueue(frame []byte) bool {
+	frame = append([]byte(nil), frame...)
+	select {
+	case <-s.done:
+		return false
+	case s.queue <- frame:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *serverNotifier) close() {
+	select {
+	case <-s.done:
+	default:
+		close(s.done)
+	}
 }
 
 // Neighbors returns the current neighbor table entries.

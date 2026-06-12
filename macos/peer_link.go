@@ -29,6 +29,10 @@ func (l *MacPeerLink) sendFrame(frame []byte) error {
 	return l.cln.WriteCharacteristic(l.piChar, frame, true /* noRsp */)
 }
 
+func (l *MacPeerLink) sendFrameReliable(frame []byte) error {
+	return l.cln.WriteCharacteristic(l.piChar, frame, false /* with response */)
+}
+
 // SendFrame implements core.PeerLink — fragments the payload and sends each frame.
 func (l *MacPeerLink) SendFrame(frame []byte) error {
 	return l.sendFrame(frame)

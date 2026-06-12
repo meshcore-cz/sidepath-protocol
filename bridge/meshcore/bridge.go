@@ -219,10 +219,14 @@ func (b *Bridge) stream(ctx context.Context, forward func(Packet)) error {
 			b.logf("meshcore bridge: skip %s: %s", packetSummary(mesh, pkt.Bytes, 0, nil, pkt.RSSI, pkt.SNR), reason)
 			continue
 		}
-		if !b.shouldForward(pkt.Bytes) {
+		if !b.shouldForwardPacket(mesh, pkt.Bytes) {
 			continue
 		}
-		forward(Packet{Bytes: pkt.Bytes, Mesh: mesh, Mode: mode, TargetHash: target, SNR: pkt.SNR, RSSI: pkt.RSSI, At: pkt.Timestamp})
+		forwardPkt := Packet{Bytes: pkt.Bytes, Mesh: mesh, Mode: mode, TargetHash: target, SNR: pkt.SNR, RSSI: pkt.RSSI, At: pkt.Timestamp}
+		if mesh.Type == meshpkt.PayloadAdvert {
+			b.logf("meshcore bridge: forward %s", advertSummary(forwardPkt))
+		}
+		forward(forwardPkt)
 	}
 }
 
@@ -288,6 +292,72 @@ func packetSummary(pkt meshpkt.Packet, raw []byte, mode ForwardMode, target []by
 	return Packet{Bytes: raw, Mesh: pkt, Mode: mode, TargetHash: target, RSSI: rssi, SNR: snr}.Summary()
 }
 
+func advertSummary(p Packet) string {
+	adv, err := meshpkt.DecodeAdvertPayload(p.Mesh.Payload)
+	if err != nil {
+		return fmt.Sprintf("ADVERT decode-error=%q %s", err, p.Summary())
+	}
+	gps := ""
+	if adv.HasGPS {
+		gps = fmt.Sprintf(" gps=%.6f,%.6f", adv.Lat, adv.Lon)
+	}
+	features := ""
+	if adv.HasFeat1 {
+		features += fmt.Sprintf(" feat1=0x%04x", adv.Feature1)
+	}
+	if adv.HasFeat2 {
+		features += fmt.Sprintf(" feat2=0x%04x", adv.Feature2)
+	}
+	signed := "unsigned"
+	if !allZero(adv.Signature) {
+		signed = "signed"
+	}
+	return fmt.Sprintf(
+		"ADVERT name=%q nodeType=%s pub=%s ts=%s sig=%s%s%s %s",
+		adv.Name,
+		advertNodeTypeName(adv.NodeType),
+		shortHex(adv.PublicKey, 8),
+		adv.Timestamp.UTC().Format(time.RFC3339),
+		signed,
+		gps,
+		features,
+		p.Summary(),
+	)
+}
+
+func advertNodeTypeName(t byte) string {
+	switch t {
+	case meshpkt.AdvertNodeChat:
+		return "chat"
+	case meshpkt.AdvertNodeRepeater:
+		return "repeater"
+	case meshpkt.AdvertNodeRoom:
+		return "room"
+	case meshpkt.AdvertNodeSensor:
+		return "sensor"
+	case meshpkt.AdvertNodeUnknown:
+		return "unknown"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
+	}
+}
+
+func shortHex(b []byte, n int) string {
+	if len(b) > n {
+		b = b[:n]
+	}
+	return hex.EncodeToString(b)
+}
+
+func allZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // shouldForward returns true if this packet's content has not been forwarded
 // within DedupTTL. It also opportunistically prunes expired entries.
 func (b *Bridge) shouldForward(otaBytes []byte) bool {
@@ -306,6 +376,13 @@ func (b *Bridge) shouldForward(otaBytes []byte) bool {
 	}
 	b.seen[h] = now
 	return true
+}
+
+func (b *Bridge) shouldForwardPacket(pkt meshpkt.Packet, otaBytes []byte) bool {
+	if pkt.Type == meshpkt.PayloadAdvert {
+		return true
+	}
+	return b.shouldForward(otaBytes)
 }
 
 // DefaultSocketPath mirrors meshcore-go backend.SocketPath(): MC_BACKEND_SOCKET

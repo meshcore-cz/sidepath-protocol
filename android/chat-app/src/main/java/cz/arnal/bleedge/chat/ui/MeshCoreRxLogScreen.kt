@@ -3,6 +3,7 @@ package cz.arnal.bleedge.chat.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -125,40 +126,71 @@ private fun MeshCoreRow(p: MeshCorePacket, nowMs: Long, onClick: () -> Unit) {
     val ageMs = (nowMs - p.timestampMs).coerceAtLeast(0)
     val freshAlpha = ((7_000L - ageMs).coerceIn(0L, 7_000L).toFloat() / 7_000f) * 0.13f
     val color = meshCoreColor(p.envelope?.type)
-    Column(
+    BoxWithConstraints(
         Modifier
             .fillMaxWidth()
             .background(color.copy(alpha = freshAlpha))
             .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = 14.dp, vertical = 8.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            MeshCorePill(p.envelope?.type)
-            Text(
-                mcTimeFmt.format(Date(p.timestampMs)),
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                meshCoreMeta(p.envelope),
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f),
-            )
-            SignalLabel(p.directRssi, "rssi", style = MaterialTheme.typography.labelSmall)
+        val wide = maxWidth >= 600.dp
+        Column {
+            if (wide) {
+                // Roomy: everything on one line.
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MeshCorePill(p.envelope?.type)
+                    MetaText(mcTimeFmt.format(Date(p.timestampMs)))
+                    MetaText(meshCoreMeta(p.envelope), Modifier.weight(1f))
+                    if (p.receiveCount > 1) MeshCoreCountBadge(p.receiveCount)
+                    SignalLabel(p.directRssi, "rssi", style = MaterialTheme.typography.labelSmall)
+                }
+            } else {
+                // Narrow (phone): type + time + signal on line 1, packet meta on line 2.
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MeshCorePill(p.envelope?.type)
+                    MetaText(mcTimeFmt.format(Date(p.timestampMs)), Modifier.weight(1f))
+                    if (p.receiveCount > 1) MeshCoreCountBadge(p.receiveCount)
+                    SignalLabel(p.directRssi, "rssi", style = MaterialTheme.typography.labelSmall)
+                }
+                MetaText(meshCoreMeta(p.envelope), Modifier.padding(top = 1.dp))
+            }
+            // A decoded channel message (one of our joined channels matched) shows inline.
+            if (p.channelText != null) {
+                Text(
+                    "${p.channelSender.orEmpty().ifBlank { "?" }}: ${p.channelText}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 2,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
         }
-        // A decoded channel message (one of our joined channels matched) shows inline.
-        if (p.channelText != null) {
-            Text(
-                "${p.channelSender.orEmpty().ifBlank { "?" }}: ${p.channelText}",
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium,
-                maxLines = 2,
-                modifier = Modifier.padding(top = 2.dp),
-            )
-        }
+    }
+}
+
+@Composable
+private fun MetaText(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        fontFamily = FontFamily.Monospace,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+        modifier = modifier,
+    )
+}
+
+@Composable
+private fun MeshCoreCountBadge(count: Int) {
+    Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(6.dp)) {
+        Text(
+            "×$count",
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSecondaryContainer,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+        )
     }
 }
 
@@ -229,6 +261,7 @@ private fun MeshCoreDetailDialog(p: MeshCorePacket, vm: ChatViewModel, onDismiss
 
                 Spacer(Modifier.width(4.dp))
                 Text("BLEEdge carrier", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+                McField("Received", p.receiveCount.toString())
                 McField("Source", "${vm.nameForHex(p.source.toHex())}\n${p.source.toHex()}")
                 McField("Datagram", p.datagramId.toHexLower())
                 if (p.path.isNotEmpty()) McField("BLE path", p.path.joinToString(" → ") {

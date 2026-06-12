@@ -260,22 +260,26 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		go br.Run(ctx, func(pkt mcbridge.Packet) {
 			switch pkt.Mode {
 			case mcbridge.ForwardFlood:
-				if err := node.SendMeshCoreRaw(pkt.Bytes); err != nil {
+				tx, err := node.SendMeshCoreRawWithInfo(pkt.Bytes)
+				if err != nil {
 					bridgeLog(fmt.Sprintf("meshcore bridge: flood failed: %v packet=%s", err, pkt.Summary()))
 					return
 				}
-				bridgeLog("meshcore bridge: flooded " + pkt.Summary())
+				bridgeLog(fmt.Sprintf("meshcore bridge: flooded dg=%s bytes=%d fragments=%d %s",
+					hex.EncodeToString(tx.DatagramID[:]), tx.DatagramBytes, tx.FragmentCount, pkt.Summary()))
 			case mcbridge.ForwardDirect:
 				dst, ok := node.MeshCoreNeighborForHash(pkt.TargetHash)
 				if !ok {
 					bridgeLog("meshcore bridge: skip direct " + pkt.Summary() + " reason=no reachable BLEEdge neighbor for MeshCore hash")
 					return
 				}
-				if err := node.SendMeshCoreRawTo(dst, pkt.Bytes); err != nil {
+				tx, err := node.SendMeshCoreRawToWithInfo(dst, pkt.Bytes)
+				if err != nil {
 					bridgeLog(fmt.Sprintf("meshcore bridge: direct failed dst=%s err=%v packet=%s", dst, err, pkt.Summary()))
 					return
 				}
-				bridgeLog(fmt.Sprintf("meshcore bridge: direct dst=%s %s", dst, pkt.Summary()))
+				bridgeLog(fmt.Sprintf("meshcore bridge: direct dst=%s dg=%s bytes=%d fragments=%d %s",
+					dst, hex.EncodeToString(tx.DatagramID[:]), tx.DatagramBytes, tx.FragmentCount, pkt.Summary()))
 			default:
 				bridgeLog("meshcore bridge: skip unknown forwarding mode " + pkt.Summary())
 			}

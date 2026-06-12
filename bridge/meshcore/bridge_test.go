@@ -2,6 +2,7 @@ package meshcore
 
 import (
 	"crypto/sha256"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,4 +131,105 @@ func TestShouldForwardDedup(t *testing.T) {
 	if !b.shouldForward(packet) {
 		t.Fatal("packet past TTL should forward again")
 	}
+}
+
+func TestClassifyAdvertBypassesForwardDedup(t *testing.T) {
+	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
+		Route:        meshpkt.RouteFlood,
+		Type:         meshpkt.PayloadAdvert,
+		PathHashSize: 2,
+		Payload:      []byte{1, 2, 3, 4},
+	})
+	if err != nil {
+		t.Fatalf("EncodePacket: %v", err)
+	}
+	pkt, mode, _, _, err := classify(raw)
+	if err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	if pkt.Type != meshpkt.PayloadAdvert || mode != ForwardFlood {
+		t.Fatalf("classify advert got type=%s mode=%v", pkt.Type, mode)
+	}
+
+	b := New(Config{DedupTTL: time.Hour})
+	if !b.shouldForwardPacket(pkt, raw) {
+		t.Fatal("first advert should forward")
+	}
+	if !b.shouldForwardPacket(pkt, raw) {
+		t.Fatal("duplicate advert should bypass content dedup")
+	}
+}
+
+func TestAdvertSummaryIncludesDecodedFields(t *testing.T) {
+	advPayload, err := meshpkt.EncodeAdvertPayload(meshpkt.Advert{
+		PublicKey: bytesOf(0xab, 32),
+		Timestamp: time.Unix(1_781_273_821, 0).UTC(),
+		NodeType:  meshpkt.AdvertNodeRepeater,
+		HasGPS:    true,
+		Lat:       50.087451,
+		Lon:       14.420671,
+		HasFeat1:  true,
+		Feature1:  0x1234,
+		Name:      "Repeater1",
+	})
+	if err != nil {
+		t.Fatalf("EncodeAdvertPayload: %v", err)
+	}
+	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
+		Route:        meshpkt.RouteFlood,
+		Type:         meshpkt.PayloadAdvert,
+		PathHashSize: 2,
+		Payload:      advPayload,
+	})
+	if err != nil {
+		t.Fatalf("EncodePacket: %v", err)
+	}
+	pkt, err := meshpkt.DecodePacket(raw)
+	if err != nil {
+		t.Fatalf("DecodePacket: %v", err)
+	}
+
+	got := advertSummary(Packet{Bytes: raw, Mesh: pkt, Mode: ForwardFlood, RSSI: -87, SNR: 6.5})
+	for _, want := range []string{
+		`ADVERT name="Repeater1"`,
+		"nodeType=repeater",
+		"pub=abababababababab",
+		"ts=2026-06-12T14:17:01Z",
+		"sig=unsigned",
+		"gps=50.087451,14.420671",
+		"feat1=0x1234",
+		"rssi=-87 snr=6.5",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("advertSummary missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestAdvertSummaryIncludesDecodeError(t *testing.T) {
+	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
+		Route:        meshpkt.RouteFlood,
+		Type:         meshpkt.PayloadAdvert,
+		PathHashSize: 2,
+		Payload:      []byte{1, 2, 3},
+	})
+	if err != nil {
+		t.Fatalf("EncodePacket: %v", err)
+	}
+	pkt, err := meshpkt.DecodePacket(raw)
+	if err != nil {
+		t.Fatalf("DecodePacket: %v", err)
+	}
+	got := advertSummary(Packet{Bytes: raw, Mesh: pkt, Mode: ForwardFlood})
+	if !strings.Contains(got, "ADVERT decode-error=") || !strings.Contains(got, "type=ADVERT") {
+		t.Fatalf("advertSummary should include decode error and packet summary, got:\n%s", got)
+	}
+}
+
+func bytesOf(v byte, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = v
+	}
+	return b
 }

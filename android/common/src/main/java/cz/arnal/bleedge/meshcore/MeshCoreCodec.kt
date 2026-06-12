@@ -76,6 +76,7 @@ data class MeshCorePacket(
     val contentId: String = "", // short hash of the inner packet bytes (dedup identity)
     val channelSender: String? = null,
     val channelText: String? = null,
+    val receiveCount: Int = 1,
 )
 
 /**
