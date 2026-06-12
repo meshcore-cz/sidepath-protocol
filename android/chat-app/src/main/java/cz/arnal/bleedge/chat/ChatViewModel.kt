@@ -710,15 +710,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun handleIncomingChannel(msg: ReceivedMessage) {
-        if (!processed.add(msg.datagramId.toHex())) return
         val channelPayload = msg.channelPayload ?: return
         val hashByte = ChatChannel.payloadChannelHash(channelPayload) ?: return
+        // Identity = the encrypted channel_payload (identical for the same message across LoRa/BLEEdge
+        // paths, since AES-ECB is deterministic), so a re-routed duplicate collapses to one row. Native
+        // BLEEdge channel messages keep their unique datagram id.
+        val id = if (msg.fromMeshCore) "mc:" + channelPayload.toHex()
+        else msg.datagramId.toHex().ifEmpty { newId() }
+        if (!processed.add(id)) return
         // Try every joined channel whose hash matches; the MAC tells us which one decrypts.
         for (ch in dao.channelsByHash(hashByte)) {
             val decoded = ChatChannel.decodePayload(ch.pskHex.hexToBytes(), channelPayload) ?: continue
             dao.insertMessage(
                 Message(
-                    id = msg.datagramId.toHex().ifEmpty { newId() },
+                    id = id,
                     peerHex = channelPeerId(ch.pskHex),
                     senderHex = msg.fromNodeId.toHex(),
                     senderName = decoded.senderLabel,
@@ -729,6 +734,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     routeHex = msg.path.toRouteHex(),
                     read = false,
                     viaMeshCore = msg.fromMeshCore,
+                    meshCoreType = msg.meshCoreType.orEmpty(),
+                    meshCoreRoute = msg.meshCoreRoute.orEmpty(),
+                    meshCoreHops = msg.meshCoreHops,
+                    meshCorePacketId = msg.meshCorePacketId.orEmpty(),
                 )
             )
             return
@@ -917,9 +926,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun joinPublic() = joinChannelPsk(ChatChannel.PUBLIC_SECRET, "Public", ChannelKind.PUBLIC)
 
     fun joinNamedChannel(name: String) {
-        val n = name.trim()
+        val n = name.trim().removePrefix("#").trim()
         if (n.isEmpty()) return
-        joinChannelPsk(ChatChannel.namedSecret(n), n, ChannelKind.NAMED)
+        // MeshCore derives a hashtag channel's key from the name INCLUDING the leading '#'
+        // (e.g. SHA-256("#xxxyyy")[:16]). Match that exactly so named channels interoperate;
+        // we store the bare name ("xxxyyy") and render the '#' via channelLabel.
+        joinChannelPsk(ChatChannel.namedSecret("#$n"), n, ChannelKind.NAMED)
     }
 
     fun joinSecretChannel(name: String, secret: String) {

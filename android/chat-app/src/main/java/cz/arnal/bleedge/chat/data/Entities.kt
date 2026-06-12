@@ -96,4 +96,9 @@ data class Message(
     val routeHex: String = "",
     val read: Boolean = false,
     val viaMeshCore: Boolean = false, // true if this message arrived over the MeshCore bridge
+    // MeshCore carrier details (only set when viaMeshCore), shown in message details.
+    val meshCoreType: String = "",
+    val meshCoreRoute: String = "",
+    val meshCoreHops: Int = 0,
+    val meshCorePacketId: String = "",
 )

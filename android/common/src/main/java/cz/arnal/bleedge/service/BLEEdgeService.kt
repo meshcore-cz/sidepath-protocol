@@ -111,6 +111,11 @@ data class ReceivedMessage(
     val traceResponse: TraceResponseBody? = null,
     val path: List<NodeId> = emptyList(),
     val fromMeshCore: Boolean = false,
+    // MeshCore carrier metadata (set when fromMeshCore), surfaced in message details.
+    val meshCoreType: String? = null,
+    val meshCoreRoute: String? = null,
+    val meshCoreHops: Int = 0,
+    val meshCorePacketId: String? = null,
     val timestampMs: Long = System.currentTimeMillis(),
 )
 
@@ -638,6 +643,8 @@ class BLEEdgeService : Service() {
                 text = decoded.text
                 break
             }
+            val transport = if (env.isTransport && env.transportCodes != null)
+                " transport %04x/%04x".format(env.transportCodes!![0], env.transportCodes!![1]) else ""
             appendMessage(
                 ReceivedMessage(
                     dg.source, dg.id, dg.protocol,
@@ -645,6 +652,10 @@ class BLEEdgeService : Service() {
                     channelPayload = env.payload,
                     path = dg.path,
                     fromMeshCore = true,
+                    meshCoreType = env.type,
+                    meshCoreRoute = env.route + transport,
+                    meshCoreHops = env.hopCount,
+                    meshCorePacketId = contentId,
                 )
             )
         }

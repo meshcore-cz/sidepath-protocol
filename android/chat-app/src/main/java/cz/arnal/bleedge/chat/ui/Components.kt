@@ -326,7 +326,15 @@ fun MessageDetailsSheet(
                 }
             }
             DetailRow("Direction", if (msg.incoming) "Incoming" else "Outgoing")
-            if (msg.viaMeshCore) DetailRow("Origin", "MeshCore (bridged from LoRa)")
+            if (msg.viaMeshCore) {
+                DetailRow("Origin", "MeshCore (bridged from LoRa)")
+                if (msg.meshCoreType.isNotBlank()) DetailRow("MeshCore type", msg.meshCoreType)
+                if (msg.meshCoreRoute.isNotBlank()) {
+                    val hops = if (msg.meshCoreHops > 0) " · ${msg.meshCoreHops} hop${if (msg.meshCoreHops == 1) "" else "s"}" else ""
+                    DetailRow("MeshCore route", msg.meshCoreRoute + hops)
+                }
+                if (msg.meshCorePacketId.isNotBlank()) DetailRow("MeshCore packet", msg.meshCorePacketId)
+            }
             DetailRow("Time", "${dayFmt.format(Date(msg.timestampMs))} ${formatClock(msg.timestampMs)}")
             if (!msg.incoming) {
                 DetailRow("Status", when (msg.status) {
