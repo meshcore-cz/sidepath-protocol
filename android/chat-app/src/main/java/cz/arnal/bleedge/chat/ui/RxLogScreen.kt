@@ -21,6 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.CallMade
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -59,8 +60,14 @@ import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RxLogScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenProfile: (String) -> Unit = {}) {
+fun RxLogScreen(
+    vm: ChatViewModel,
+    onBack: () -> Unit,
+    onOpenProfile: (String) -> Unit = {},
+    onOpenMeshCoreLog: () -> Unit = {},
+) {
     val packets by vm.rxPackets.collectAsState()
+    val total by vm.rxTotal.collectAsState()
     val myNode by vm.nodeId.collectAsState()
     val peers by vm.connectedPeers.collectAsState()
     val nowMs by produceState(initialValue = System.currentTimeMillis()) {
@@ -78,7 +85,10 @@ fun RxLogScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenProfile: (String) -
                     Column {
                         Text("Rx Log")
                         Text(
-                            "${packets.size} packet${if (packets.size == 1) "" else "s"}",
+                            if (packets.size < total)
+                                "last ${packets.size} packets ($total total)"
+                            else
+                                "${packets.size} packet${if (packets.size == 1) "" else "s"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -87,6 +97,11 @@ fun RxLogScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenProfile: (String) -
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onOpenMeshCoreLog) {
+                        Icon(Icons.Default.Hub, contentDescription = "MeshCore log")
                     }
                 },
             )

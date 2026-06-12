@@ -32,6 +32,9 @@ android {
 
 dependencies {
     implementation project(':common')
+    // meshpkt MeshCore decoder AAR — :common compiles against it (compileOnly) but apps must
+    // package its classes + native .so into the APK. The .aar lives in common/libs.
+    implementation files('../common/libs/meshpkt.aar')
     implementation "androidx.core:core-ktx:1.13.1"
     implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.8.7"
     implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7"

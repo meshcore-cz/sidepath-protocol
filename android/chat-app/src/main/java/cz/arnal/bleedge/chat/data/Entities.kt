@@ -27,6 +27,33 @@ data class Channel(
     val kind: String,
 )
 
+/** Where a discovered contact was heard. */
+object DiscoverySource {
+    const val BLEEDGE = "bleedge" // a BLEEdge node's signed ANNOUNCE (topology)
+    const val MESHCORE = "meshcore" // a MeshCore ADVERT bridged onto the mesh
+}
+
+/**
+ * A node we've heard advertise but haven't added to our contacts. Surfaced on the Explore tab.
+ * Keyed by [pubKeyHex] (32-byte Ed25519 key) which both BLEEdge nodes and MeshCore nodes carry.
+ * [nodeType] is the MeshCore node type (0=unknown 1=chat 2=repeater 3=room 4=sensor; 0 for
+ * BLEEdge). [lastAdvertisedMs] is updated each time we hear the node advertise.
+ */
+@Entity(tableName = "discovered_contacts")
+data class DiscoveredContact(
+    @PrimaryKey val pubKeyHex: String,
+    val nodeHex: String,        // BLEEdge NodeId hex (pubkey[:10]); derived for MeshCore too
+    val name: String,
+    val source: String,         // DiscoverySource.*
+    val nodeType: Int = 0,
+    val hasGps: Boolean = false,
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+    val sigVerified: Boolean = false,
+    val lastAdvertisedMs: Long = 0L,
+    val firstSeenMs: Long = 0L,
+)
+
 /** Outgoing-message delivery state. */
 object MsgStatus {
     const val SENDING = 0
@@ -44,6 +71,9 @@ data class Contact(
     @PrimaryKey val nodeHex: String,
     val pubKeyHex: String,
     val description: String,
+    // A user-chosen local alias (from Rename). Overrides the node's wire/derived name in all
+    // views; empty means "use the node's advertised name". Distinct from [description].
+    val localName: String = "",
 )
 
 /**
@@ -65,4 +95,5 @@ data class Message(
     val status: Int = MsgStatus.SENT,
     val routeHex: String = "",
     val read: Boolean = false,
+    val viaMeshCore: Boolean = false, // true if this message arrived over the MeshCore bridge
 )

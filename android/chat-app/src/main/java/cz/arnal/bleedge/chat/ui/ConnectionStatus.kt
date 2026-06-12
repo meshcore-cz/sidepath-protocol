@@ -46,6 +46,7 @@ import cz.arnal.bleedge.service.RSSI_UNKNOWN
 data class MeshNav(
     val openTrace: (String) -> Unit = {},
     val openRxLog: () -> Unit = {},
+    val openMeshCoreLog: () -> Unit = {},
 )
 
 val LocalMeshNav = staticCompositionLocalOf { MeshNav() }

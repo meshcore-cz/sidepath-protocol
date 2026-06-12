@@ -32,5 +32,13 @@ dependencies {
     // and X25519 (RFC 7748) + HKDF for chat encryption. Low-level BouncyCastle
     // (no JCE provider registration → no conflict with Android's bundled BC).
     api "org.bouncycastle:bcprov-jdk18on:1.78.1"
+    // meshpkt MeshCore packet decoder (gomobile AAR; native .so per ABI). Used by the
+    // MeshCore subsystem to decode raw MeshCore packets carried opaquely over the BLEEdge
+    // mesh. compileOnly here because AGP forbids bundling a local .aar into a library AAR
+    // (:common:bundleDebugAar); the *app* modules add it as a real `implementation` dep so
+    // its classes + jni libs land in the APK. See chat-app/build.gradle.
+    compileOnly files('libs/meshpkt.aar')
     testImplementation "junit:junit:4.13.2"
+    // Real org.json on the unit-test classpath (android.jar's is stubbed/"not mocked").
+    testImplementation "org.json:json:20231013"
 }

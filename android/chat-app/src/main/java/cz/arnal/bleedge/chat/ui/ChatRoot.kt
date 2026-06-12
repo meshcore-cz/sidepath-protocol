@@ -12,7 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Hub
-import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.TravelExplore
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Icon
@@ -45,6 +45,7 @@ private sealed class Dest(val depth: Int) {
     data object Tabs : Dest(0)
     data object Settings : Dest(1)
     data object RxLog : Dest(1)
+    data object MeshCoreLog : Dest(1)
     data object About : Dest(2)
     data class Conversation(val peer: String) : Dest(1)
     data class Profile(val peer: String) : Dest(2)
@@ -58,6 +59,7 @@ fun ChatRoot(vm: ChatViewModel) {
     var openTrace by rememberSaveable { mutableStateOf<String?>(null) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var showRxLog by rememberSaveable { mutableStateOf(false) }
+    var showMeshCoreLog by rememberSaveable { mutableStateOf(false) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
     var tab by rememberSaveable { mutableStateOf(0) }
 
@@ -79,6 +81,7 @@ fun ChatRoot(vm: ChatViewModel) {
         showAbout -> Dest.About
         openProfile != null -> Dest.Profile(openProfile!!)
         openPeer != null -> Dest.Conversation(openPeer!!)
+        showMeshCoreLog -> Dest.MeshCoreLog
         showRxLog -> Dest.RxLog
         showSettings -> Dest.Settings
         else -> Dest.Tabs
@@ -93,6 +96,7 @@ fun ChatRoot(vm: ChatViewModel) {
             Dest.About -> showAbout = false
             is Dest.Profile -> openProfile = null
             is Dest.Conversation -> openPeer = null
+            Dest.MeshCoreLog -> showMeshCoreLog = false
             Dest.RxLog -> showRxLog = false
             Dest.Settings -> showSettings = false
             Dest.Tabs -> Unit
@@ -127,6 +131,7 @@ fun ChatRoot(vm: ChatViewModel) {
         LocalMeshNav provides MeshNav(
             openTrace = { openTrace = it },
             openRxLog = { showRxLog = true },
+            openMeshCoreLog = { showMeshCoreLog = true },
         ),
     ) {
     AnimatedContent(
@@ -163,6 +168,12 @@ fun ChatRoot(vm: ChatViewModel) {
                 onOpenAbout = { showAbout = true },
             )
             Dest.RxLog -> RxLogScreen(
+                vm,
+                onBack = popTop,
+                onOpenProfile = { openProfile = it },
+                onOpenMeshCoreLog = { showMeshCoreLog = true },
+            )
+            Dest.MeshCoreLog -> MeshCoreRxLogScreen(
                 vm,
                 onBack = popTop,
                 onOpenProfile = { openProfile = it },
@@ -217,8 +228,8 @@ private fun TabsScaffold(
                 NavigationBarItem(
                     selected = tab == 1,
                     onClick = { onSelectTab(1) },
-                    icon = { Icon(Icons.Default.Public, contentDescription = "Channels") },
-                    label = { Text("Channels") },
+                    icon = { Icon(Icons.Default.TravelExplore, contentDescription = "Explore") },
+                    label = { Text("Explore") },
                 )
                 NavigationBarItem(
                     selected = tab == 2,
@@ -238,9 +249,9 @@ private fun TabsScaffold(
                     onOpenSettings = onOpenSettings,
                     onOpenAbout = onOpenAbout,
                 )
-                1 -> ChannelsScreen(
+                1 -> ExploreScreen(
                     vm,
-                    onOpenChannel = onOpenConversation,
+                    onOpenConversation = onOpenConversation,
                     onOpenProfile = onOpenProfile,
                     onOpenSettings = onOpenSettings,
                     onOpenAbout = onOpenAbout,

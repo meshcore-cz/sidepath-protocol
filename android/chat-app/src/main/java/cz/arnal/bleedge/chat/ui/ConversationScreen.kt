@@ -36,6 +36,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
@@ -56,6 +57,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.ui.graphics.Color
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -445,6 +447,33 @@ private fun TypingBubble() {
     }
 }
 
+/** Small pill marking a channel message that arrived over the MeshCore bridge (not native BLEEdge). */
+@Composable
+private fun MeshCoreBadge() {
+    Surface(
+        color = Color(0xFF00838F).copy(alpha = 0.16f),
+        shape = RoundedCornerShape(6.dp),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Icon(
+                Icons.Default.Hub,
+                contentDescription = null,
+                modifier = Modifier.size(11.dp),
+                tint = Color(0xFF00838F),
+            )
+            Text(
+                "MeshCore",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFF00838F),
+            )
+        }
+    }
+}
+
 @Composable
 private fun MessageBubble(
     msg: Message,
@@ -467,12 +496,15 @@ private fun MessageBubble(
         ) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 if (isChannel && msg.incoming) {
-                    Text(
-                        senderLabel,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.SemiBold,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            senderLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        if (msg.viaMeshCore) MeshCoreBadge()
+                    }
                 }
                 MessageContent(msg.text, enableMentions = isChannel, onMentionClick = onMentionClick)
                 Spacer(Modifier.size(2.dp))

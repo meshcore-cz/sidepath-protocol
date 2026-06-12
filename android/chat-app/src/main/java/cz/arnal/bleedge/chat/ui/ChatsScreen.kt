@@ -2,7 +2,6 @@ package cz.arnal.bleedge.chat.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,11 +15,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Create
+import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -41,8 +43,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import cz.arnal.bleedge.chat.AdvertisedNode
+import cz.arnal.bleedge.chat.ChatListItem
 import cz.arnal.bleedge.chat.ChatViewModel
-import cz.arnal.bleedge.chat.ConversationSummary
+import cz.arnal.bleedge.chat.data.ChannelKind
 import cz.arnal.bleedge.chat.nameFromPubKey
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -54,17 +57,21 @@ fun ChatsScreen(
     onOpenSettings: () -> Unit,
     onOpenAbout: () -> Unit,
 ) {
-    val conversations by vm.conversations.collectAsState()
+    val items by vm.chatItems.collectAsState()
+    val joined by vm.channels.collectAsState()
+    val publicJoined = remember(joined) { joined.any { it.kind == ChannelKind.PUBLIC } }
     val myNode by vm.nodeId.collectAsState()
     val myName by vm.myName.collectAsState()
     val myPubKeyHex by vm.myPubKeyHex.collectAsState()
-    var showPicker by remember { mutableStateOf(false) }
+    var chooser by remember { mutableStateOf(false) }
+    var showNewChat by remember { mutableStateOf(false) }
+    var showJoin by remember { mutableStateOf(false) }
     var searching by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
 
-    val visible = remember(conversations, query) {
-        if (query.isBlank()) conversations
-        else conversations.filter { it.title.contains(query.trim(), ignoreCase = true) }
+    val visible = remember(items, query) {
+        if (query.isBlank()) items
+        else items.filter { it.title.contains(query.trim(), ignoreCase = true) }
     }
 
     Scaffold(
@@ -104,8 +111,8 @@ fun ChatsScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { showPicker = true }) {
-                Icon(Icons.Default.Create, contentDescription = "New chat")
+            FloatingActionButton(onClick = { chooser = true }) {
+                Icon(Icons.Default.Add, contentDescription = "New chat or channel")
             }
         },
         // Root scaffold reserves the bottom-nav space; TopAppBar handles the status bar.
@@ -117,52 +124,94 @@ fun ChatsScreen(
             visible.isEmpty() ->
                 EmptyState(Modifier.fillMaxSize().padding(padding), searching = searching)
             else -> LazyColumn(Modifier.fillMaxSize().padding(padding)) {
-                items(visible, key = { it.peerHex }) { conv ->
-                    ConversationRow(
-                        conv,
-                        onClick = { onOpenConversation(conv.peerHex) },
-                        onAvatarClick = { onOpenProfile(conv.peerHex) },
+                items(visible, key = { it.peerHex }) { item ->
+                    ChatRow(
+                        item,
+                        onClick = { onOpenConversation(item.peerHex) },
+                        onAvatarClick = { onOpenProfile(item.peerHex) },
                     )
                 }
             }
         }
     }
 
-    if (showPicker) {
+    if (chooser) {
+        AddChooserSheet(
+            onNewChat = { chooser = false; showNewChat = true },
+            onJoinChannel = { chooser = false; showJoin = true },
+            onDismiss = { chooser = false },
+        )
+    }
+    if (showNewChat) {
         NewChatSheet(
             vm = vm,
             onPick = { node ->
                 vm.startChat(node)
-                showPicker = false
+                showNewChat = false
                 onOpenConversation(node.nodeHex)
             },
-            onDismiss = { showPicker = false },
+            onDismiss = { showNewChat = false },
+        )
+    }
+    if (showJoin) {
+        JoinChannelSheet(
+            vm = vm,
+            showPublic = !publicJoined,
+            onJoined = { showJoin = false },
+            onDismiss = { showJoin = false },
         )
     }
 }
 
+/** A merged-list row: a direct conversation or a channel (selected by [ChatListItem.isChannel]). */
 @Composable
-private fun ConversationRow(conv: ConversationSummary, onClick: () -> Unit, onAvatarClick: () -> Unit) {
+private fun ChatRow(item: ChatListItem, onClick: () -> Unit, onAvatarClick: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(seed = conv.peerHex, label = conv.title, identiconKey = conv.pubKeyHex, onClick = onAvatarClick)
+        Avatar(
+            seed = item.peerHex,
+            label = item.title,
+            identiconKey = if (item.isChannel) null else item.pubKeyHex,
+            onClick = onAvatarClick,
+        )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(conv.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            val pub = formatPubKey(conv.pubKeyHex)
-            if (pub.isNotEmpty()) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
-                    pub,
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.labelSmall,
+                    if (item.isChannel) channelLabel(item.title, item.channelKind) else item.title,
+                    fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
+                if (item.isChannel) {
+                    Icon(
+                        Icons.Default.Public,
+                        contentDescription = "Channel",
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (!item.isChannel) {
+                val pub = formatPubKey(item.pubKeyHex)
+                if (pub.isNotEmpty()) {
+                    Text(
+                        pub,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+            val subtitle = when {
+                item.lastText.isBlank() -> "No messages yet"
+                item.isChannel && item.lastSender.isNotBlank() -> "${item.lastSender}: ${item.lastText}"
+                else -> item.lastText
             }
             Text(
-                conv.lastText,
+                subtitle,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodyMedium,
@@ -170,15 +219,46 @@ private fun ConversationRow(conv: ConversationSummary, onClick: () -> Unit, onAv
         }
         Spacer(Modifier.width(8.dp))
         Column(horizontalAlignment = Alignment.End) {
-            Text(
-                formatRelative(conv.lastTimestampMs),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (conv.unread > 0) {
-                Spacer(Modifier.size(4.dp))
-                androidx.compose.material3.Badge { Text("${conv.unread}") }
+            if (item.lastTimestampMs > 0) {
+                Text(
+                    formatRelative(item.lastTimestampMs),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
+            if (item.unread > 0) {
+                Spacer(Modifier.size(4.dp))
+                androidx.compose.material3.Badge { Text("${item.unread}") }
+            }
+        }
+    }
+}
+
+/** The "+" chooser: start a contact chat or join a channel. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddChooserSheet(onNewChat: () -> Unit, onJoinChannel: () -> Unit, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
+            Text("Add", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
+            ChooserRow(Icons.Default.PersonAdd, "New contact chat", "Message a nearby node directly", onNewChat)
+            HorizontalDivider()
+            ChooserRow(Icons.Default.Public, "Join channel", "Public, named, or secret group channel", onJoinChannel)
+        }
+    }
+}
+
+@Composable
+private fun ChooserRow(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.width(16.dp))
+        Column {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -202,7 +282,7 @@ private fun EmptyState(modifier: Modifier, searching: Boolean) {
         } else {
             Text("No chats yet", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Tap the pencil to start a chat with a nearby node.",
+                "Tap + to start a chat or join a channel.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyMedium,
             )

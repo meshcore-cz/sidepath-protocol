@@ -25,6 +25,10 @@ import cz.arnal.bleedge.chatproto.ChatDirectText
 import cz.arnal.bleedge.chatproto.ChatKind
 import cz.arnal.bleedge.chatproto.ChatPublicText
 import cz.arnal.bleedge.chatproto.ChatTyping
+import cz.arnal.bleedge.meshcore.MeshCoreAdvert
+import cz.arnal.bleedge.meshcore.MeshCoreCodec
+import cz.arnal.bleedge.meshcore.MeshCorePacket
+import cz.arnal.bleedge.meshcore.MeshCoreType
 import cz.arnal.bleedge.protocol.AckBody
 import cz.arnal.bleedge.protocol.Action
 import cz.arnal.bleedge.protocol.ActionType
@@ -106,6 +110,7 @@ data class ReceivedMessage(
     val channelPayload: ByteArray? = null,
     val traceResponse: TraceResponseBody? = null,
     val path: List<NodeId> = emptyList(),
+    val fromMeshCore: Boolean = false,
     val timestampMs: Long = System.currentTimeMillis(),
 )
 
@@ -179,6 +184,32 @@ data class MeshStats(
     val duplicatesDropped: Int = 0,
 )
 
+/**
+ * Time- and size-bounded "have I seen this content before?" set, keyed by a content id. Used to
+ * process each unique MeshCore packet once regardless of how many BLEEdge paths re-deliver it.
+ */
+private class ContentDedupCache(
+    private val ttlMs: Long = BLEEdge.DEDUP_TTL_MS,
+    private val maxEntries: Int = BLEEdge.DEDUP_LIMIT,
+) {
+    private val seen = LinkedHashMap<String, Long>()
+
+    /** Returns true only the first time [key] is seen within the TTL window. */
+    @Synchronized fun firstSight(key: String): Boolean {
+        val now = System.currentTimeMillis()
+        val it = seen.entries.iterator()
+        while (it.hasNext()) { if (now - it.next().value > ttlMs) it.remove() else break }
+        seen[key]?.let { if (now - it <= ttlMs) return false }
+        seen[key] = now
+        while (seen.size > maxEntries) {
+            val k = seen.keys.iterator()
+            if (!k.hasNext()) break
+            k.next(); k.remove()
+        }
+        return true
+    }
+}
+
 // ---- Service ----------------------------------------------------------------
 
 class BLEEdgeService : Service() {
@@ -216,6 +247,26 @@ class BLEEdgeService : Service() {
     private val _rxPackets = MutableStateFlow<List<RxPacket>>(emptyList())
     val rxPackets: StateFlow<List<RxPacket>> = _rxPackets.asStateFlow()
     private val maxRxPackets = 300
+    // Cumulative count of all packets received (the rxPackets list is trimmed to maxRxPackets).
+    private val _rxTotal = MutableStateFlow(0)
+    val rxTotal: StateFlow<Int> = _rxTotal.asStateFlow()
+
+    // ---- MeshCore subsystem ----
+    private val _meshCorePackets = MutableStateFlow<List<MeshCorePacket>>(emptyList())
+    val meshCorePackets: StateFlow<List<MeshCorePacket>> = _meshCorePackets.asStateFlow()
+    private val _meshCoreTotal = MutableStateFlow(0)
+    val meshCoreTotal: StateFlow<Int> = _meshCoreTotal.asStateFlow()
+    // Decoded MeshCore ADVERTs (node advertisements) seen on the mesh — consumed by the chat-app
+    // to populate its discovered-contacts table.
+    private val _meshCoreAdverts = MutableStateFlow<List<MeshCoreAdvert>>(emptyList())
+    val meshCoreAdverts: StateFlow<List<MeshCoreAdvert>> = _meshCoreAdverts.asStateFlow()
+    // Joined-channel PSKs (16-byte secrets), pushed in by the chat-app, used only to
+    // render decrypted GRP_TXT plaintext in the MeshCore Rx Log.
+    @Volatile private var meshCoreChannelSecrets: List<ByteArray> = emptyList()
+    // Content-level dedup for MeshCore packets: the same logical MeshCore packet reaches us via
+    // multiple LoRa paths / BLEEdge relays (each a distinct datagram), so we key on the stable
+    // inner payload to process each unique packet only once.
+    private val meshCoreContentSeen = ContentDedupCache()
 
     private val originatedFloodIds = ConcurrentHashMap<String, Long>()
     private val _floodRepeats = MutableStateFlow<Map<String, List<RepeatSample>>>(emptyMap())
@@ -492,6 +543,13 @@ class BLEEdgeService : Service() {
                 droppedReason = droppedReason,
             )) + it).take(maxRxPackets)
         }
+        _rxTotal.update { it + 1 }
+
+        // MeshCore subsystem: dedup + record every MeshCore-carrying datagram we see (the inner
+        // packet may reach us via several BLEEdge paths; we process each unique packet once).
+        if (dg.protocol == PayloadProtocol.MESHCORE_PACKET) {
+            handleMeshCorePacket(dg, addrHex)
+        }
 
         _stats.update { s ->
             s.copy(
@@ -542,8 +600,71 @@ class BLEEdgeService : Service() {
         when (dg.protocol) {
             PayloadProtocol.BLEEDGE_CONTROL -> deliverControl(dg)
             PayloadProtocol.BLEEDGE_CHAT -> deliverChat(dg)
+            // MeshCore packets are handled (deduped) in handleMeshCorePacket from the receive path.
+            PayloadProtocol.MESHCORE_PACKET -> Unit
             else -> appendMessage(ReceivedMessage(dg.source, dg.id, dg.protocol, path = dg.path))
         }
+    }
+
+    /**
+     * Handles a received MeshCore-carrying datagram once: dedups on the inner MeshCore packet
+     * bytes (so identical OTA frames re-delivered over different BLEEdge paths are dropped, while
+     * distinct LoRa arrivals — different hop counts → different bytes — are kept), then records it
+     * for the MeshCore Rx Log, feeds ADVERTs to the discovered-contacts stream, and hands GRP_TXT
+     * channel messages to the chat-app via a CHANNEL_TEXT [ReceivedMessage] flagged [fromMeshCore].
+     */
+    private fun handleMeshCorePacket(dg: Datagram, addrHex: String) {
+        val hash = sha256(dg.payload)
+        if (!meshCoreContentSeen.firstSight(hash.toHex())) return // same packet via another BLEEdge path
+        val contentId = hash.copyOf(6).toHex()
+
+        val env = MeshCoreCodec.decodeEnvelope(dg.payload)
+        val rssi = peers[addrHex]?.rssi ?: RSSI_UNKNOWN
+
+        // MeshCore ADVERT → discovered-contacts feed.
+        if (env != null && env.type == MeshCoreType.ADVERT && env.payload.isNotEmpty()) {
+            MeshCoreCodec.decodeAdvert(env.payload)?.let { adv ->
+                _meshCoreAdverts.update { (listOf(adv) + it).take(maxRxPackets) }
+            }
+        }
+
+        // MeshCore channel message (GRP_TXT): decrypt for display + ingest into the chat-app.
+        var sender: String? = null
+        var text: String? = null
+        if (env != null && env.isGroupText && env.payload.isNotEmpty()) {
+            for (secret in meshCoreChannelSecrets) {
+                val decoded = ChatChannel.decodePayload(secret, env.payload) ?: continue
+                sender = decoded.senderLabel
+                text = decoded.text
+                break
+            }
+            appendMessage(
+                ReceivedMessage(
+                    dg.source, dg.id, dg.protocol,
+                    chatKind = ChatKind.CHANNEL_TEXT,
+                    channelPayload = env.payload,
+                    path = dg.path,
+                    fromMeshCore = true,
+                )
+            )
+        }
+
+        val packet = MeshCorePacket(
+            timestampMs = System.currentTimeMillis(),
+            source = dg.source, datagramId = dg.id, path = dg.path,
+            directRssi = rssi, raw = dg.payload, envelope = env, contentId = contentId,
+            channelSender = sender, channelText = text,
+        )
+        _meshCorePackets.update { (listOf(packet) + it).take(maxRxPackets) }
+        _meshCoreTotal.update { it + 1 }
+    }
+
+    private fun sha256(bytes: ByteArray): ByteArray =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+
+    /** Chat-app pushes the joined-channel PSKs so the MeshCore Rx Log can render GRP_TXT plaintext. */
+    fun setMeshCoreChannelSecrets(secrets: List<ByteArray>) {
+        meshCoreChannelSecrets = secrets
     }
 
     private fun deliverControl(dg: Datagram) {

@@ -1,0 +1,151 @@
+package cz.arnal.bleedge.meshcore
+
+import cz.arnal.bleedge.protocol.NodeId
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * Decoded outer fields of a raw MeshCore over-the-air packet, as produced by
+ * meshpkt's `decodeEnvelope` op (see meshpkt/ops.go). The BLEEdge mesh carries
+ * these packets opaquely under `PayloadProtocol.MESHCORE_PACKET`; this is the
+ * structure we recover once we look inside.
+ */
+data class MeshCoreEnvelope(
+    val route: String,
+    val routeCode: Int,
+    val type: String,        // e.g. "GRP_TXT", "ADVERT", "TXT_MSG", "ACK", "TRACE"
+    val typeCode: Int,
+    val version: Int,
+    val pathHashSize: Int,
+    val hopCount: Int,
+    val hops: List<ByteArray>,
+    val payload: ByteArray,
+    val isTransport: Boolean,
+    val transportCodes: IntArray?,
+) {
+    val isGroupText: Boolean get() = type == MeshCoreType.GRP_TXT
+}
+
+/** MeshCore payload-type name strings emitted by meshpkt's `PayloadType.String()`. */
+object MeshCoreType {
+    const val REQ = "REQ"
+    const val RESPONSE = "RESPONSE"
+    const val TXT_MSG = "TXT_MSG"
+    const val ACK = "ACK"
+    const val ADVERT = "ADVERT"
+    const val GRP_TXT = "GRP_TXT"
+    const val GRP_DATA = "GRP_DATA"
+    const val ANON_REQ = "ANON_REQ"
+    const val PATH = "PATH"
+    const val TRACE = "TRACE"
+    const val MULTIPART = "MULTIPART"
+    const val CONTROL = "CONTROL"
+    const val RAW_CUSTOM = "RAW_CUSTOM"
+}
+
+/**
+ * Decoded MeshCore ADVERT (node advertisement) payload — all the properties meshpkt's
+ * `decodeAdvert` op exposes (§ advert.go). [timestampSec] is the advert's own broadcast time
+ * (epoch seconds). [nodeType]: 0=unknown 1=chat 2=repeater 3=room 4=sensor.
+ */
+data class MeshCoreAdvert(
+    val publicKeyHex: String,
+    val timestampSec: Long,
+    val name: String,
+    val nodeType: Int,
+    val hasGps: Boolean,
+    val lat: Double,
+    val lon: Double,
+    val sigVerified: Boolean,
+)
+
+/**
+ * A MeshCore packet observed on the BLEEdge mesh, captured for the MeshCore Rx Log.
+ * Combines the decoded MeshCore [envelope] with the BLEEdge carrier metadata (who
+ * relayed it, the datagram id/path) and, when a joined channel matched, the
+ * decrypted GRP_TXT [channelSender]/[channelText].
+ */
+data class MeshCorePacket(
+    val timestampMs: Long,
+    val source: NodeId,        // BLEEdge originator of the carrier datagram
+    val datagramId: ByteArray,
+    val path: List<NodeId>,
+    val directRssi: Int,
+    val raw: ByteArray,        // inner MeshCore packet bytes
+    val envelope: MeshCoreEnvelope?,
+    val contentId: String = "", // short hash of the inner packet bytes (dedup identity)
+    val channelSender: String? = null,
+    val channelText: String? = null,
+)
+
+/**
+ * Thin wrapper over the meshpkt gomobile binding. All JNI lives behind
+ * [decodeEnvelope]; the JSON→model mapping in [parseEnvelopeJson] is pure so it can
+ * be exercised in host JVM unit tests (the native `.so` cannot load off-device).
+ */
+object MeshCoreCodec {
+    /** Decodes the outer envelope of a raw MeshCore packet, or null if undecodable. */
+    fun decodeEnvelope(raw: ByteArray): MeshCoreEnvelope? = runCatching {
+        val args = JSONArray().put(raw.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("decodeEnvelope", args.toString())
+        parseEnvelopeJson(json)
+    }.getOrNull()
+
+    /** Decodes an ADVERT payload (e.g. an envelope's payload when type==ADVERT), or null. */
+    fun decodeAdvert(payload: ByteArray): MeshCoreAdvert? = runCatching {
+        val args = JSONArray().put(payload.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("decodeAdvert", args.toString())
+        parseAdvertJson(json)
+    }.getOrNull()
+
+    /** Pure JSON→[MeshCoreAdvert] mapping (host-testable). Returns null on error/bad shape. */
+    fun parseAdvertJson(json: String): MeshCoreAdvert? = runCatching {
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        val pub = o.optString("publicKey", "")
+        if (pub.isEmpty()) return null
+        MeshCoreAdvert(
+            publicKeyHex = pub,
+            timestampSec = o.optLong("timestamp", 0L),
+            name = o.optString("name", ""),
+            nodeType = o.optInt("nodeType", 0),
+            hasGps = o.optBoolean("hasGPS", false),
+            lat = o.optDouble("lat", 0.0),
+            lon = o.optDouble("lon", 0.0),
+            sigVerified = o.optBoolean("sigVerified", false),
+        )
+    }.getOrNull()
+
+    /** Pure JSON→[MeshCoreEnvelope] mapping. Returns null on an error result or bad shape. */
+    fun parseEnvelopeJson(json: String): MeshCoreEnvelope? = runCatching {
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        val hopsArr = o.optJSONArray("hops")
+        val hops = buildList {
+            if (hopsArr != null) for (i in 0 until hopsArr.length()) add(hopsArr.getString(i).hexToBytes())
+        }
+        val transport = if (o.optBoolean("isTransport", false)) {
+            o.optJSONArray("transportCodes")?.let { if (it.length() >= 2) intArrayOf(it.getInt(0), it.getInt(1)) else null }
+        } else null
+        MeshCoreEnvelope(
+            route = o.optString("route", ""),
+            routeCode = o.optInt("routeCode", -1),
+            type = o.optString("type", ""),
+            typeCode = o.optInt("typeCode", -1),
+            version = o.optInt("version", 0),
+            pathHashSize = o.optInt("pathHashSize", 0),
+            hopCount = o.optInt("hopCount", 0),
+            hops = hops,
+            payload = o.optString("payloadHex", "").hexToBytes(),
+            isTransport = o.optBoolean("isTransport", false),
+            transportCodes = transport,
+        )
+    }.getOrNull()
+}
+
+private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+
+private fun String.hexToBytes(): ByteArray {
+    if (length % 2 != 0) return ByteArray(0)
+    return ByteArray(length / 2) { substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+}

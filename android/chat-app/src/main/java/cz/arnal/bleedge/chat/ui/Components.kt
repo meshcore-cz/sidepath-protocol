@@ -326,6 +326,7 @@ fun MessageDetailsSheet(
                 }
             }
             DetailRow("Direction", if (msg.incoming) "Incoming" else "Outgoing")
+            if (msg.viaMeshCore) DetailRow("Origin", "MeshCore (bridged from LoRa)")
             DetailRow("Time", "${dayFmt.format(Date(msg.timestampMs))} ${formatClock(msg.timestampMs)}")
             if (!msg.incoming) {
                 DetailRow("Status", when (msg.status) {

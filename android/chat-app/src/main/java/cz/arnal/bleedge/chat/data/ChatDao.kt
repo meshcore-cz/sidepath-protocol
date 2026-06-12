@@ -58,4 +58,21 @@ interface ChatDao {
 
     @Query("DELETE FROM channels WHERE pskHex = :pskHex")
     suspend fun deleteChannel(pskHex: String)
+
+    // ---- discovered contacts ----
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertDiscovered(contact: DiscoveredContact)
+
+    @Query("SELECT * FROM discovered_contacts ORDER BY lastAdvertisedMs DESC")
+    fun discoveredContacts(): Flow<List<DiscoveredContact>>
+
+    @Query("SELECT * FROM discovered_contacts WHERE pubKeyHex = :pubKeyHex LIMIT 1")
+    suspend fun discoveredByPubKey(pubKeyHex: String): DiscoveredContact?
+
+    @Query("DELETE FROM discovered_contacts WHERE pubKeyHex = :pubKeyHex")
+    suspend fun deleteDiscovered(pubKeyHex: String)
+
+    /** Drops discovered contacts not heard from since [cutoffMs] (their TTL has elapsed). */
+    @Query("DELETE FROM discovered_contacts WHERE lastAdvertisedMs < :cutoffMs")
+    suspend fun pruneDiscovered(cutoffMs: Long)
 }
