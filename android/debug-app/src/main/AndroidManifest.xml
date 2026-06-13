@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Permissions, features and the SidepathService are declared in the :common library
+    <!-- Permissions, features and the SidepathService are declared in the :sidepath-networking library
          manifest and merged in. -->
     <application
         android:name="cz.meshcore.sidepath.debug.SidepathDebugApp"

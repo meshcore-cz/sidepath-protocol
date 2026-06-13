@@ -36,7 +36,7 @@ This can be useful during outages, at events, inside buildings, while travelling
 
 ### Extend access to MeshCore
 
-A Sidepath gateway can connect nearby devices to a [MeshCore](https://github.com/meshcore-dev) LoRa network.
+A Sidepath gateway can connect nearby devices to a MeshCore LoRa network.
 
 ```text
 phone  ↔  relay  ↔  gateway  ↔  MeshCore
@@ -125,7 +125,7 @@ Sidepath currently supports:
 
 ## MeshCore integration
 
-[MeshCore](https://github.com/meshcore-dev) is the first external protocol carried over Sidepath.
+MeshCore is the first external protocol carried over Sidepath.
 
 A [gateway](bridge/meshcore/) can encapsulate a complete MeshCore packet, relay it through nearby Sidepath nodes, and inject it back into MeshCore at another reachable node.
 
@@ -151,7 +151,7 @@ Sidepath does not partially reimplement MeshCore or modify its inner packet sema
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md)             | Sidepath v3 specification                  |
 | [`docs/CHAT_PROTOCOL.md`](docs/CHAT_PROTOCOL.md)   | Native chat payload specification          |
 | [`bridge/meshcore/`](bridge/meshcore/)             | MeshCore packet bridge                     |
-| [`android/`](android/)                             | Kotlin protocol libraries and Android apps |
+| [`android/`](android/)                             | Kotlin protocol, chat, MeshCore, and networking libraries |
 | [`linux/`](linux/)                                 | Linux BLE node using BlueZ                 |
 | [`macos/`](macos/)                                 | macOS development node                     |
 | [`firmware/xiao_esp32c6/`](firmware/xiao_esp32c6/) | ESP32-C6 relay firmware                    |
@@ -169,7 +169,7 @@ BLE Coded PHY can be enabled experimentally on supported hardware for longer-ran
 * [Sidepath Protocol repository](https://github.com/meshcore-cz/sidepath-protocol)
 * [Sidepath protocol specification](docs/PROTOCOL.md)
 * [Sidepath chat payload specification](docs/CHAT_PROTOCOL.md)
-* [Meshward Android app source](android/chat-app/)
+* [meshcore-cz/meshward](https://github.com/meshcore-cz/meshward)
 * [Android protocol libraries](android/)
 * [ESP32-C6 relay firmware](firmware/xiao_esp32c6/)
 * [MeshCore project](https://github.com/meshcore-dev)
@@ -195,7 +195,7 @@ go test ./...
 
 ## Meshward
 
-[**Meshward**](android/chat-app/) is the first chat app built on Sidepath.
+[**meshcore-cz/meshward**](https://github.com/meshcore-cz/meshward) is the first chat app built on Sidepath.
 
 It combines nearby Sidepath communication with optional MeshCore connectivity. Meshward uses the native [Sidepath chat payload](docs/CHAT_PROTOCOL.md).
 

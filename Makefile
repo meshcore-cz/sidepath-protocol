@@ -1,37 +1,10 @@
-ADB ?= adb
-CHAT_APK  := android/chat-app/build/outputs/apk/debug/chat-app-debug.apk
-DEBUG_APK := android/debug-app/build/outputs/apk/debug/debug-app-debug.apk
-# Which app `install-all` deploys: chat (default) or debug.
-APK ?= $(CHAT_APK)
-
-.PHONY: build test test-go build-macos bot install-all install-debug devices clean
+.PHONY: build test test-go build-macos bot clean
 
 build:
-	cd android && ./gradlew assembleDebug
+	cd android && ./gradlew :sidepath-protocol:build :sidepath-chat:build :sidepath-meshcore:assembleDebug :sidepath-networking:assembleDebug
 
 test:
-	cd android && ./gradlew :common:testDebugUnitTest
-
-devices:
-	$(ADB) devices -l
-
-install-all: build
-	@$(MAKE) APK="$(APK)" _install
-
-install-debug: build
-	@$(MAKE) APK="$(DEBUG_APK)" _install
-
-_install:
-	@set -e; \
-	devices="$$( $(ADB) devices | awk 'NR > 1 && $$2 == "device" { print $$1 }' )"; \
-	if [ -z "$$devices" ]; then \
-		echo "No authorized Android devices found."; \
-		exit 1; \
-	fi; \
-	for device in $$devices; do \
-		echo "Installing $(APK) on $$device..."; \
-		$(ADB) -s "$$device" install -r "$(APK)"; \
-	done
+	cd android && ./gradlew :sidepath-protocol:test :sidepath-chat:test :sidepath-meshcore:testDebugUnitTest :sidepath-networking:testDebugUnitTest
 
 clean:
 	cd android && ./gradlew clean

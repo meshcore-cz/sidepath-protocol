@@ -20,7 +20,7 @@ dependencyResolutionManagement {
 }
 rootProject.name = "Sidepath Protocol"
 include ':sidepath-protocol'
-include ':meshward-chat'
-include ':common'
+include ':sidepath-chat'
+include ':sidepath-meshcore'
+include ':sidepath-networking'
 // ':debug-app' is parked on the v2 protocol and excluded from the v3 build.
-include ':chat-app'
