@@ -234,7 +234,7 @@ private fun meshCoreMeta(env: MeshCoreEnvelope?): String {
 }
 
 @Composable
-private fun MeshCoreDetailDialog(p: MeshCorePacket, vm: ChatViewModel, onDismiss: () -> Unit) {
+internal fun MeshCoreDetailDialog(p: MeshCorePacket, vm: ChatViewModel, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },

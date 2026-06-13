@@ -15,8 +15,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
-	"github.com/bleedge/bleedge/core"
-	blenode "github.com/bleedge/bleedge/macos"
+	"github.com/burningtree/bleedge/core"
+	blenode "github.com/burningtree/bleedge/macos"
 )
 
 type uiEvent struct {

@@ -15,11 +15,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.DoneAll
@@ -29,6 +33,8 @@ import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -38,6 +44,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -57,6 +65,7 @@ import androidx.compose.ui.unit.sp
 import cz.arnal.bleedge.chat.AvatarStyle
 import cz.arnal.bleedge.chat.ChatViewModel
 import cz.arnal.bleedge.chat.ConnState
+import cz.arnal.bleedge.chat.toHex
 import cz.arnal.bleedge.chat.data.ChannelKind
 import cz.arnal.bleedge.chat.data.Message
 import cz.arnal.bleedge.chat.data.MsgStatus
@@ -364,6 +373,16 @@ fun shortDuration(ms: Long): String {
     }
 }
 
+/** Compact elapsed delay for an echo: "130ms", "2.3s", or "1m 5s" for longer round-trips. */
+fun formatEchoDelay(ms: Long): String {
+    val d = ms.coerceAtLeast(0)
+    return when {
+        d < 1_000 -> "${d}ms"
+        d < 60_000 -> "%.1fs".format(d / 1000.0)
+        else -> "${d / 60_000}m ${(d % 60_000) / 1000}s"
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MessageDetailsSheet(
@@ -372,12 +391,32 @@ fun MessageDetailsSheet(
     onOpenProfile: ((String) -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
-    val floodRepeats by vm.floodRepeats.collectAsState()
-    val repeatSamples = floodRepeats[msg.id].orEmpty()
+    // Echoes are persisted per-message (survive restart), unlike the in-memory routing logs.
+    val echoesMap by vm.echoes.collectAsState()
+    val repeatSamples = echoesMap[msg.id].orEmpty()
     val dmDeliveries by vm.dmDeliveries.collectAsState()
     val delivery = dmDeliveries[msg.id]
     val isChannel = isChannelPeer(msg.peerHex)
     val channelEchoed = isChannel && repeatSamples.isNotEmpty()
+
+    // Cross-link to the packet detail dialogs. For an outgoing message we keep its raw datagram on
+    // the message itself (persistent); otherwise fall back to the (trimmed) Rx Log. A MeshCore-
+    // bridged message also carries the inner MeshCore packet's content id.
+    val meshCorePackets by vm.meshCorePackets.collectAsState()
+    val rxPackets by vm.rxPackets.collectAsState()
+    val peers by vm.connectedPeers.collectAsState()
+    val blePacket = remember(msg.packetHex, rxPackets, msg.id) {
+        if (msg.packetHex.isNotBlank()) vm.decodePacket(msg.packetHex, timestampMs = msg.timestampMs)
+        else rxPackets.firstOrNull { it.id.toHex() == msg.id }
+    }
+    val meshPacket = remember(meshCorePackets, msg.meshCorePacketId) {
+        msg.meshCorePacketId.takeIf { it.isNotBlank() }?.let { id -> meshCorePackets.firstOrNull { it.contentId == id } }
+    }
+    var showBlePacket by remember { mutableStateOf(false) }
+    var showMeshPacket by remember { mutableStateOf(false) }
+    // A specific echo's reception packet, opened by tapping that echo row.
+    var echoPacket by remember { mutableStateOf<cz.arnal.bleedge.service.RxPacket?>(null) }
+
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Message details", style = MaterialTheme.typography.titleMedium)
@@ -421,7 +460,29 @@ fun MessageDetailsSheet(
                     val hops = if (msg.meshCoreHops > 0) " · ${msg.meshCoreHops} hop${if (msg.meshCoreHops == 1) "" else "s"}" else ""
                     DetailRow("MeshCore route", msg.meshCoreRoute + hops)
                 }
-                if (msg.meshCorePacketId.isNotBlank()) DetailRow("MeshCore packet", msg.meshCorePacketId)
+                if (msg.meshCorePacketId.isNotBlank()) {
+                    // Small inline "details" affordance opening the MeshCore packet's Rx Log dialog.
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text("MeshCore packet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(msg.meshCorePacketId, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace)
+                            if (meshPacket != null) {
+                                Surface(
+                                    color = Color(0xFF00838F).copy(alpha = 0.16f),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.clickable { showMeshPacket = true },
+                                ) {
+                                    Text(
+                                        "details",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFF00838F),
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // Outbound bridging: a gateway relayed this channel message onto MeshCore (ACK_BRIDGED).
             if (msg.bridgedToMeshCore) {
@@ -496,17 +557,64 @@ fun MessageDetailsSheet(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 repeatSamples.forEachIndexed { i, s ->
-                    val via = s.forwarderId?.let { vm.nameForHex(it.toHex()) }
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val via = if (s.viaMeshCore) "MeshCore"
+                    else s.forwarderHex.takeIf { it.isNotBlank() }?.let { vm.nameForHex(it) }
+                    // Round-trip delay since we sent the message — more useful than a wall-clock time.
+                    val delay = formatEchoDelay(s.timestampMs - msg.timestampMs)
+                    val clickable = s.packetHex.isNotBlank()
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .then(if (clickable) Modifier.clickable { echoPacket = vm.decodePacket(s.packetHex, s.rssi, s.timestampMs) } else Modifier),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         Text(
-                            "${i + 1}. ${formatClock(s.timestampMs)}${if (via != null) "  · via $via" else ""}",
+                            "${i + 1}. +$delay${if (via != null) "  · via $via" else ""}",
                             fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                            modifier = Modifier.weight(1f, fill = false),
                         )
-                        SignalLabel(s.rssi, "rssi")
+                        if (!s.viaMeshCore) SignalLabel(s.rssi, "rssi")
+                        if (clickable) Icon(
+                            Icons.Default.ChevronRight,
+                            contentDescription = "packet details",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
             }
+            // Jump to the raw BLEEdge packet in the Rx Log (when it's still buffered).
+            if (blePacket != null) {
+                OutlinedButton(onClick = { showBlePacket = true }, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Packet details")
+                }
+            }
         }
+    }
+
+    if (showBlePacket && blePacket != null) {
+        PacketDetailDialog(
+            p = blePacket,
+            vm = vm,
+            peers = peers,
+            onOpenProfile = { hex -> showBlePacket = false; onOpenProfile?.invoke(hex) },
+            onDismiss = { showBlePacket = false },
+        )
+    }
+    if (showMeshPacket && meshPacket != null) {
+        MeshCoreDetailDialog(meshPacket, vm, onDismiss = { showMeshPacket = false })
+    }
+    echoPacket?.let { ep ->
+        PacketDetailDialog(
+            p = ep,
+            vm = vm,
+            peers = peers,
+            onOpenProfile = { hex -> echoPacket = null; onOpenProfile?.invoke(hex) },
+            onDismiss = { echoPacket = null },
+        )
     }
 }
 

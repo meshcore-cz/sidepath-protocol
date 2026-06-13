@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	mcbridge "github.com/bleedge/bleedge/bridge/meshcore"
-	"github.com/bleedge/bleedge/core"
-	blenode "github.com/bleedge/bleedge/macos"
+	mcbridge "github.com/burningtree/bleedge/bridge/meshcore"
+	"github.com/burningtree/bleedge/core"
+	blenode "github.com/burningtree/bleedge/macos"
 )
 
 // stdoutIsTTY reports whether stdout is an interactive terminal (so we can run the

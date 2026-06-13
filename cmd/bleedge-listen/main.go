@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bleedge/bleedge/core"
-	"github.com/bleedge/bleedge/linux"
+	"github.com/burningtree/bleedge/core"
+	"github.com/burningtree/bleedge/linux"
 )
 
 type multiString []string

@@ -9,7 +9,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 )
 
 // GattClient connects to a remote BLEEdge peer and interacts with its GATT service.

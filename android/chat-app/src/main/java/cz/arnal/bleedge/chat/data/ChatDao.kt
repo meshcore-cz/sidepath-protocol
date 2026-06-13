@@ -79,6 +79,16 @@ interface ChatDao {
     @Query("DELETE FROM reactions WHERE messageId IN (SELECT id FROM messages WHERE peerHex = :peer)")
     suspend fun deleteReactionsForPeer(peer: String)
 
+    // ---- echoes (persisted flood/MeshCore echoes of our own messages) ----
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEcho(echo: Echo)
+
+    @Query("SELECT * FROM echoes ORDER BY timestampMs ASC")
+    fun allEchoes(): Flow<List<Echo>>
+
+    @Query("DELETE FROM echoes WHERE messageId IN (SELECT id FROM messages WHERE peerHex = :peer)")
+    suspend fun deleteEchoesForPeer(peer: String)
+
     // ---- discovered contacts ----
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertDiscovered(contact: DiscoveredContact)

@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bleedge/bleedge/core"
-	blenode "github.com/bleedge/bleedge/macos"
+	"github.com/burningtree/bleedge/core"
+	blenode "github.com/burningtree/bleedge/macos"
 )
 
 // bot bridges the BLEEdge node to a user script run by the Bun JS/TS runtime.

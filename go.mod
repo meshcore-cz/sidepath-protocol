@@ -1,4 +1,4 @@
-module github.com/bleedge/bleedge
+module github.com/burningtree/bleedge
 
 go 1.25.0
 

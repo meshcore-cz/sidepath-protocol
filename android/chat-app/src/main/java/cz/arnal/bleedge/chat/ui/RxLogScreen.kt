@@ -346,7 +346,7 @@ private fun destLabel(p: RxPacket, vm: ChatViewModel): String =
     if (p.destination.isBroadcast()) "broadcast" else vm.nameForHex(p.destination.toHex())
 
 @Composable
-private fun PacketDetailDialog(
+internal fun PacketDetailDialog(
     p: RxPacket,
     vm: ChatViewModel,
     peers: List<PeerInfo>,

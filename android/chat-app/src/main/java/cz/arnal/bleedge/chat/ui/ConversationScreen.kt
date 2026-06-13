@@ -17,8 +17,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -152,8 +152,8 @@ fun ConversationScreen(
     val typingPeers by vm.typingPeers.collectAsState()
     val peerTyping = !isChannel && peerHex in typingPeers
 
-    // Repeats of our own flooded messages heard back, keyed by packet-id hex (= message id).
-    val floodRepeats by vm.floodRepeats.collectAsState()
+    // Persisted echoes of our own flooded messages heard back, keyed by message id (survive restart).
+    val floodRepeats by vm.echoes.collectAsState()
     // Per-DM delivery progress (attempts/acked/failed), keyed by message id.
     val dmDeliveries by vm.dmDeliveries.collectAsState()
     // Saved contacts indexed by name — resolves a bridged declared sender / @mention to a profile.
@@ -352,10 +352,20 @@ fun ConversationScreen(
                 listState.animateScrollToItem(messages.size)
             }
         }
-        val imeVisible = WindowInsets.isImeVisible
-        LaunchedEffect(imeVisible) {
-            if (!searching && imeVisible && messages.isNotEmpty() && !listState.canScrollForward) {
-                listState.animateScrollToItem(messages.size)
+        // Follow the keyboard: as the IME animates in/out the content area shrinks/grows from the
+        // bottom, so re-pin the newest message to the bottom on every frame of that animation —
+        // but only when the user is parked at the bottom (don't yank them down while reading up).
+        // "Parked at bottom" is re-evaluated only while the keyboard is fully closed, because mid-
+        // animation the shrinking viewport makes canScrollForward true and would disable follow.
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val imeBottomPx = WindowInsets.ime.getBottom(density)
+        var stickToBottom by remember(peerHex) { mutableStateOf(true) }
+        LaunchedEffect(imeBottomPx, listState.canScrollForward) {
+            if (imeBottomPx == 0) stickToBottom = !listState.canScrollForward
+        }
+        LaunchedEffect(imeBottomPx) {
+            if (stickToBottom && !searching && messages.isNotEmpty()) {
+                listState.scrollToItem(messages.size)
             }
         }
         // When the peer starts typing, the "…" bubble is appended below the last message; scroll it

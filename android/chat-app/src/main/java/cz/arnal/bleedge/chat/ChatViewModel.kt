@@ -66,6 +66,7 @@ private val DM_RETRY_DELAY_KEY = intPreferencesKey("dm_retry_delay_ms")
 private val DM_MAX_TRIES_KEY = intPreferencesKey("dm_max_tries")
 private const val DEFAULT_DM_RETRY_DELAY_MS = 3000
 private const val DEFAULT_DM_MAX_TRIES = 3
+private val FLOOD_TTL_KEY = intPreferencesKey("flood_ttl")
 private val PHY_MODE_KEY = stringPreferencesKey("phy_mode")
 private val AVATAR_STYLE_KEY = stringPreferencesKey("avatar_style")
 private val THEME_KEY = stringPreferencesKey("theme_mode")
@@ -228,6 +229,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _dmMaxTries = MutableStateFlow(DEFAULT_DM_MAX_TRIES)
     val dmMaxTries: StateFlow<Int> = _dmMaxTries.asStateFlow()
 
+    /** Hop limit (TTL) applied to messages we originate — how far they flood across the mesh. */
+    private val _floodTtl = MutableStateFlow(BLEEdge.DEFAULT_FLOOD_TTL)
+    val floodTtl: StateFlow<Int> = _floodTtl.asStateFlow()
+
     private val _avatarStyle = MutableStateFlow(AvatarStyle.IDENTICON)
     val avatarStyle: StateFlow<AvatarStyle> = _avatarStyle.asStateFlow()
 
@@ -360,6 +365,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Emoji reactions grouped by the message id they target, for the conversation UI. */
     val reactions: StateFlow<Map<String, List<Reaction>>> =
         dao.allReactions().map { it.groupBy { r -> r.messageId } }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    /**
+     * Persisted echoes of our own messages, grouped by message id — the durable replacement for the
+     * service's in-memory floodRepeats, so the echo count / delivery proof survives a restart.
+     */
+    val echoes: StateFlow<Map<String, List<cz.arnal.bleedge.chat.data.Echo>>> =
+        dao.allEchoes().map { it.groupBy { e -> e.messageId } }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
     /**
@@ -548,6 +561,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _name.value = nodeName
         _dmRetryDelayMs.value = retryDelay
         _dmMaxTries.value = maxTries
+        _floodTtl.value = (pref[FLOOD_TTL_KEY] ?: BLEEdge.DEFAULT_FLOOD_TTL).coerceIn(1, BLEEdge.MAX_TTL)
         _avatarStyle.value = AvatarStyle.fromValue(pref[AVATAR_STYLE_KEY])
         _themeMode.value = ThemeMode.fromValue(pref[THEME_KEY])
 
@@ -714,6 +728,35 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 map.forEach { (idHex, d) ->
                     if (d.failed && !d.acked && processed.add("fail:$idHex")) {
                         dao.updateDelivery(idHex, MsgStatus.FAILED, "")
+                    }
+                }
+            }
+        }
+        // Persist the service's in-memory echoes (flood repeats / MeshCore round-trips) into Room so
+        // the echo list + delivery proof survive an app restart. The first echo of one of our own
+        // messages also confirms it propagated → mark it delivered.
+        viewModelScope.launch {
+            service.floodRepeats.collect { map ->
+                map.forEach { (idHex, samples) ->
+                    samples.forEach { s ->
+                        if (!processed.add("echo:$idHex:${s.timestampMs}")) return@forEach
+                        dao.insertEcho(
+                            cz.arnal.bleedge.chat.data.Echo(
+                                messageId = idHex,
+                                timestampMs = s.timestampMs,
+                                rssi = s.rssi,
+                                forwarderHex = s.forwarderId?.toHex().orEmpty(),
+                                viaMeshCore = s.viaMeshCore,
+                                packetHex = s.raw?.toHex().orEmpty(),
+                            ),
+                        )
+                        // A heard echo confirms a broadcast channel message propagated; flip it
+                        // SENT → DELIVERED (DMs are confirmed by their ACK, not by echoes).
+                        val msg = dao.messageById(idHex)
+                        if (msg != null && !msg.incoming && msg.status == MsgStatus.SENT &&
+                            cz.arnal.bleedge.chat.data.isChannelPeer(msg.peerHex)) {
+                            dao.updateDelivery(idHex, MsgStatus.DELIVERED, msg.routeHex)
+                        }
                     }
                 }
             }
@@ -1007,6 +1050,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             dao.deleteContact(nodeHex)
             dao.deleteReactionsForPeer(nodeHex)
+            dao.deleteEchoesForPeer(nodeHex)
             dao.deleteMessagesFor(nodeHex)
         }
     }
@@ -1069,7 +1113,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // Resolve the recipient's key from the saved contact (learned from a received DM
             // or the picker), falling back to topology inside the service.
             val pub = dao.contactByNode(peerHex)?.pubKeyHex?.takeIf { it.length == 64 }?.hexToBytes()
-            val id = service.sendChat(body, dst, pub)
+            val id = service.sendChat(body, dst, pub, floodTtl = _floodTtl.value)
             dao.insertMessage(
                 Message(
                     id = id?.toHex() ?: newId(),
@@ -1079,6 +1123,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     text = body,
                     timestampMs = System.currentTimeMillis(),
                     status = if (id == null) MsgStatus.FAILED else MsgStatus.SENT,
+                    packetHex = id?.let { service.originatedPacketHex(it.toHex()) }.orEmpty(),
                 )
             )
         }
@@ -1093,7 +1138,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // The channel sender label is our display name (deterministic name or override),
             // matching what everyone shows for us elsewhere — not the free-form description.
             val myLabel = myName.value.ifBlank { shortHex(nodeId.value.toHex()) }
-            val id = service.sendChannel(pskHex.hexToBytes(), myLabel, body)
+            val id = service.sendChannel(pskHex.hexToBytes(), myLabel, body, _floodTtl.value)
             dao.insertMessage(
                 Message(
                     id = id.toHex(),
@@ -1104,6 +1149,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     text = body,
                     timestampMs = System.currentTimeMillis(),
                     status = MsgStatus.SENT, // broadcast — no per-message ACK
+                    packetHex = service.originatedPacketHex(id.toHex()).orEmpty(),
                 )
             )
         }
@@ -1217,6 +1263,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun deleteChat(peerHex: String) {
         viewModelScope.launch {
             dao.deleteReactionsForPeer(peerHex)
+            dao.deleteEchoesForPeer(peerHex)
             dao.deleteMessagesFor(peerHex)
             if (!isChannelPeer(peerHex)) dao.deleteContact(peerHex)
         }
@@ -1242,6 +1289,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _dmRetryDelayMs.value = delay
             _dmMaxTries.value = tries
             _service.value?.setDmRetry(delay.toLong(), tries)
+        }
+    }
+
+    /** Sets the hop limit (TTL) for messages we originate; clamped to 1..MAX_TTL. */
+    fun setFloodTtl(ttl: Int) {
+        val clamped = ttl.coerceIn(1, BLEEdge.MAX_TTL)
+        viewModelScope.launch {
+            getApplication<Application>().dataStore.edit { it[FLOOD_TTL_KEY] = clamped }
+            _floodTtl.value = clamped
         }
     }
 
@@ -1298,6 +1354,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             serviceBound = false
         }
     }
+
+    /**
+     * Decodes a stored raw datagram (hex) back into an [RxPacket] for the packet-detail dialog —
+     * used to show our own outgoing packet and each persisted echo, both of which keep their raw
+     * bytes in Room. [rssi]/[timestampMs] override the reconstructed defaults for an echo reception.
+     */
+    fun decodePacket(
+        hex: String,
+        rssi: Int = cz.arnal.bleedge.service.RSSI_UNKNOWN,
+        timestampMs: Long = System.currentTimeMillis(),
+    ): cz.arnal.bleedge.service.RxPacket? = runCatching {
+        val data = hex.hexToBytes()
+        val dg = cz.arnal.bleedge.protocol.Datagram.decode(data)
+        val chatKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CHAT)
+            cz.arnal.bleedge.chatproto.Chat.peekKind(dg.payload) else null
+        val controlKind = if (dg.protocol == PayloadProtocol.BLEEDGE_CONTROL)
+            runCatching { cz.arnal.bleedge.protocol.ControlMessage.decode(dg.payload).kind }.getOrNull() else null
+        cz.arnal.bleedge.service.RxPacket(
+            timestampMs = timestampMs,
+            protocol = dg.protocol, chatKind = chatKind, controlKind = controlKind,
+            id = dg.id, source = dg.source, destination = dg.destination,
+            sourceRouted = dg.isSourceRouted, routeCursor = dg.routeCursor, ttl = dg.ttl,
+            flags = dg.flags, ackRequested = dg.ackRequested(),
+            path = dg.path, route = dg.route, payloadSize = dg.payload.size, raw = data,
+            forUs = dg.isBroadcast || dg.destination.toHex() == nodeId.value.toHex(),
+            rssi = rssi, droppedReason = null,
+        )
+    }.getOrNull()
 
     /** Resolves a node id (hex) to its best-known display name, for route detail rendering. */
     fun nameForHex(hex: String): String =

@@ -70,6 +70,7 @@ fun SettingsScreen(
     val themeMode by vm.themeMode.collectAsState()
     val dmRetryDelayMs by vm.dmRetryDelayMs.collectAsState()
     val dmMaxTries by vm.dmMaxTries.collectAsState()
+    val floodTtl by vm.floodTtl.collectAsState()
 
     val pubKeyHex = remember(seedHex) {
         runCatching { Identity.fromSeed(seedHex.hexToBytes()).publicKey.toHex() }.getOrDefault("")
@@ -80,6 +81,7 @@ fun SettingsScreen(
     var nameDraft by remember(name) { mutableStateOf(name) }
     var retryDelayDraft by remember(dmRetryDelayMs) { mutableStateOf((dmRetryDelayMs / 1000).toString()) }
     var triesDraft by remember(dmMaxTries) { mutableStateOf(dmMaxTries.toString()) }
+    var ttlDraft by remember(floodTtl) { mutableStateOf(floodTtl.toString()) }
     var seedDraft by remember(seedHex) { mutableStateOf(seedHex) }
     var revealSeed by remember { mutableStateOf(false) }
     var seedError by remember { mutableStateOf(false) }
@@ -223,6 +225,33 @@ fun SettingsScreen(
                         enabled = delaySecs >= 1 && tries in 1..10 &&
                             (delaySecs * 1000 != dmRetryDelayMs || tries != dmMaxTries),
                     ) { Text("Save delivery settings") }
+                }
+            }
+
+            // Message reach (flood TTL / hop limit)
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Message reach (TTL)", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Maximum hops a message you send may travel across the mesh. Higher reaches " +
+                            "farther nodes but adds traffic; lower keeps it nearby (1 = direct neighbors only). " +
+                            "Range 1–${cz.arnal.bleedge.protocol.BLEEdge.MAX_TTL}, default ${cz.arnal.bleedge.protocol.BLEEdge.DEFAULT_FLOOD_TTL}.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    val ttlVal = ttlDraft.toIntOrNull() ?: 0
+                    OutlinedTextField(
+                        value = ttlDraft,
+                        onValueChange = { ttlDraft = it.filter(Char::isDigit).take(2) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("TTL (hops)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    )
+                    Button(
+                        onClick = { vm.setFloodTtl(ttlVal) },
+                        enabled = ttlVal in 1..cz.arnal.bleedge.protocol.BLEEdge.MAX_TTL && ttlVal != floodTtl,
+                    ) { Text("Save TTL") }
                 }
             }
 

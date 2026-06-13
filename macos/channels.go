@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 )
 
 // Channel messaging mirrors the Android chat app: the node keeps a registry of

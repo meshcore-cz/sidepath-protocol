@@ -8,7 +8,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 )
 
 const (

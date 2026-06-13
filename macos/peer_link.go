@@ -3,7 +3,7 @@
 package macos
 
 import (
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 	"github.com/go-ble/ble"
 )
 

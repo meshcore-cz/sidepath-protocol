@@ -323,7 +323,7 @@ trace, peer disconnect, topology expiration, and large payload fragmentation.
 ## Repository layout
 
 ```
-go.mod                          Go module: github.com/bleedge/bleedge
+go.mod                          Go module: github.com/burningtree/bleedge
 core/                           Pure-Go routing engine (no BLE dependencies)
   types.go                      NodeID, PacketType, PHY, Capabilities, etc.
   packet.go                     CBOR encode/decode for Packet and AnnouncePayload

@@ -70,6 +70,22 @@ data class Reaction(
     val timestampMs: Long,
 )
 
+/**
+ * A persisted "echo" of one of our own flooded messages heard back across the mesh (a relay
+ * rebroadcast, or a MeshCore round-trip). Stored per-message so the echo count / delivery proof
+ * survives an app restart, unlike the in-memory routing logs. [packetHex] is the raw received
+ * datagram (hex) so the echo is clickable through to its packet detail.
+ */
+@Entity(tableName = "echoes", primaryKeys = ["messageId", "timestampMs"])
+data class Echo(
+    val messageId: String,
+    val timestampMs: Long,
+    val rssi: Int,
+    val forwarderHex: String = "",
+    val viaMeshCore: Boolean = false,
+    val packetHex: String = "",
+)
+
 /** Outgoing-message delivery state. */
 object MsgStatus {
     const val SENDING = 0
@@ -129,4 +145,7 @@ data class Message(
     // ACK_BRIDGED. [bridgedByHex] is the gateway NodeID hex.
     val bridgedToMeshCore: Boolean = false,
     val bridgedByHex: String = "",
+    // Raw outgoing datagram (hex) for messages we sent, so "Packet details" can show our own
+    // packet (persisted, unlike the trimmed Rx Log). Empty for incoming messages.
+    val packetHex: String = "",
 )

@@ -171,6 +171,11 @@ data class RepeatSample(
     val timestampMs: Long,
     val rssi: Int,
     val forwarderId: NodeId? = null,
+    // True when this echo of our own channel message came back via the MeshCore bridge (the message
+    // we bridged out was re-flooded onto MeshCore and returned), rather than a native BLEEdge relay.
+    val viaMeshCore: Boolean = false,
+    // The raw received datagram bytes for this echo, so it can be opened as a packet detail.
+    val raw: ByteArray? = null,
 )
 
 data class DmDelivery(
@@ -317,6 +322,18 @@ class BLEEdgeService : Service() {
     private val originatedFloodIds = ConcurrentHashMap<String, Long>()
     private val _floodRepeats = MutableStateFlow<Map<String, List<RepeatSample>>>(emptyMap())
     val floodRepeats: StateFlow<Map<String, List<RepeatSample>>> = _floodRepeats.asStateFlow()
+
+    // channel_payload hex -> originating channel datagram id hex. Lets us recognise a MeshCore
+    // GRP_TXT that is an echo of a channel message we bridged out (same deterministic payload),
+    // so we fold it into that message's flood-repeats instead of showing a duplicate inbound row.
+    private val originatedChannelCp = ConcurrentHashMap<String, String>()
+
+    // datagram id hex -> raw outgoing datagram bytes (hex), so the chat app can persist & show
+    // "Packet details" for a message we sent. Bounded.
+    private val originatedRaw = ConcurrentHashMap<String, String>()
+
+    /** Raw bytes (hex) of a datagram we originated, if still cached — for the outgoing packet detail. */
+    fun originatedPacketHex(idHex: String): String? = originatedRaw[idHex]
 
     private val _bleMacAddress = MutableStateFlow("")
     val bleMacAddress: StateFlow<String> = _bleMacAddress.asStateFlow()
@@ -714,7 +731,7 @@ class BLEEdgeService : Service() {
         val idHex = dg.id.toHex()
         if (originatedFloodIds.containsKey(idHex)) {
             val rssi = peers[addrHex]?.rssi ?: RSSI_UNKNOWN
-            _floodRepeats.update { m -> m + (idHex to ((m[idHex] ?: emptyList()) + RepeatSample(System.currentTimeMillis(), rssi, directPeer))) }
+            _floodRepeats.update { m -> m + (idHex to ((m[idHex] ?: emptyList()) + RepeatSample(System.currentTimeMillis(), rssi, directPeer, raw = data))) }
         }
 
         val actions = router.handle(dg, directPeer)
@@ -742,7 +759,7 @@ class BLEEdgeService : Service() {
         // MeshCore subsystem: record every MeshCore-carrying datagram we see. Side effects such
         // as chat/discovery ingestion are deduped inside handleMeshCorePacket.
         if (dg.protocol == PayloadProtocol.MESHCORE_PACKET) {
-            handleMeshCorePacket(dg, addrHex)
+            handleMeshCorePacket(dg, addrHex, data)
         }
 
         _stats.update { s ->
@@ -805,7 +822,7 @@ class BLEEdgeService : Service() {
      * Handles a received MeshCore-carrying datagram: every sighting updates the MeshCore Rx Log
      * receive count, while side effects are deduped on the inner MeshCore packet bytes.
      */
-    private fun handleMeshCorePacket(dg: Datagram, addrHex: String) {
+    private fun handleMeshCorePacket(dg: Datagram, addrHex: String, raw: ByteArray) {
         val hash = sha256(dg.payload)
         val contentId = hash.copyOf(6).toHex()
         val rssi = peers[addrHex]?.rssi ?: RSSI_UNKNOWN
@@ -835,21 +852,33 @@ class BLEEdgeService : Service() {
                 text = decoded.text
                 break
             }
-            val transport = if (env.isTransport && env.transportCodes != null)
-                " transport %04x/%04x".format(env.transportCodes!![0], env.transportCodes!![1]) else ""
-            appendMessage(
-                ReceivedMessage(
-                    dg.source, dg.id, dg.protocol,
-                    chatKind = ChatKind.CHANNEL_TEXT,
-                    channelPayload = env.payload,
-                    path = dg.path,
-                    fromMeshCore = true,
-                    meshCoreType = env.type,
-                    meshCoreRoute = env.route + transport,
-                    meshCoreHops = env.hopCount,
-                    meshCorePacketId = contentId,
+            // If this GRP_TXT is the echo of a channel message we bridged out, fold it into that
+            // message's flood-repeats (so it's marked delivered + shown like a normal echo) instead
+            // of surfacing a duplicate inbound bubble of our own message.
+            val originId = originatedChannelCp[env.payload.toHex()]
+            if (originId != null) {
+                _floodRepeats.update { m ->
+                    m + (originId to ((m[originId] ?: emptyList()) +
+                        RepeatSample(System.currentTimeMillis(), rssi, dg.source, viaMeshCore = true, raw = raw)))
+                }
+                log("meshcore echo of our channel msg dg=$originId content=$contentId", LogTag.MSG)
+            } else {
+                val transport = if (env.isTransport && env.transportCodes != null)
+                    " transport %04x/%04x".format(env.transportCodes!![0], env.transportCodes!![1]) else ""
+                appendMessage(
+                    ReceivedMessage(
+                        dg.source, dg.id, dg.protocol,
+                        chatKind = ChatKind.CHANNEL_TEXT,
+                        channelPayload = env.payload,
+                        path = dg.path,
+                        fromMeshCore = true,
+                        meshCoreType = env.type,
+                        meshCoreRoute = env.route + transport,
+                        meshCoreHops = env.hopCount,
+                        meshCorePacketId = contentId,
+                    )
                 )
-            )
+            }
         }
 
         val packet = MeshCorePacket(
@@ -1068,6 +1097,9 @@ class BLEEdgeService : Service() {
 
     /** Originates and transmits a datagram (flood or source-routed). */
     private fun transmit(dg: Datagram, trackFloodRepeat: Boolean = false) {
+        // Cache the raw bytes of everything we originate so the app can show our outgoing packet.
+        if (originatedRaw.size > 400) originatedRaw.keys.take(150).forEach { originatedRaw.remove(it) }
+        originatedRaw[dg.id.toHex()] = dg.encode().toHex()
         if (trackFloodRepeat && !dg.isSourceRouted) {
             if (originatedFloodIds.size > 300) {
                 originatedFloodIds.entries.sortedBy { it.value }.take(100).forEach { originatedFloodIds.remove(it.key) }
@@ -1125,6 +1157,14 @@ class BLEEdgeService : Service() {
         val id = identity!!
         val dgId = Datagram.newDatagramId()
         val payload = ChatChannel.build(secret, senderLabel, text, System.currentTimeMillis() / 1000)
+        // Remember this message's channel_payload so we can match the echo that returns over the
+        // MeshCore bridge (the bridge re-floods the same payload onto MeshCore). Bounded.
+        ChatChannel.channelPayload(payload)?.let { cp ->
+            if (originatedChannelCp.size > 500) {
+                originatedChannelCp.keys.take(200).forEach { originatedChannelCp.remove(it) }
+            }
+            originatedChannelCp[cp.toHex()] = dgId.toHex()
+        }
         val dg = Datagram(id = dgId, source = id.nodeId, destination = NodeId.BROADCAST, ttl = floodTtl,
             protocol = PayloadProtocol.BLEEDGE_CHAT, payload = payload)
         router.markOriginated(dg.id)

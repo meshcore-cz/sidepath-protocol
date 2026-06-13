@@ -12,7 +12,7 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/godbus/dbus/v5"
 
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 )
 
 // Node is the top-level Linux BLE node that coordinates all subsystems.

@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/go-ble/ble"
 	"github.com/go-ble/ble/darwin"

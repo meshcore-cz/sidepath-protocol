@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 )
 
 // ---- in-memory peer link ----------------------------------------------------

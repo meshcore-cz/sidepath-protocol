@@ -10,8 +10,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 // v3: NodeIDs widened 8→10 bytes (protocol v3), so old peer/contact ids are stale —
 // destructive migration wipes the v2 store. See docs/PROTOCOL.md migration §17.
 @Database(
-    entities = [Message::class, Contact::class, Channel::class, DiscoveredContact::class, Reaction::class],
-    version = 11,
+    entities = [Message::class, Contact::class, Channel::class, DiscoveredContact::class, Reaction::class, Echo::class],
+    version = 12,
     exportSchema = false,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -69,12 +69,27 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        // v11→v12: persist echoes of our own messages + the outgoing packet bytes, so the echo
+        // count / delivery proof / packet details survive an app restart. Additive.
+        private val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN packetHex TEXT NOT NULL DEFAULT ''")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `echoes` (" +
+                        "`messageId` TEXT NOT NULL, `timestampMs` INTEGER NOT NULL, " +
+                        "`rssi` INTEGER NOT NULL, `forwarderHex` TEXT NOT NULL, " +
+                        "`viaMeshCore` INTEGER NOT NULL, `packetHex` TEXT NOT NULL, " +
+                        "PRIMARY KEY(`messageId`, `timestampMs`))"
+                )
+            }
+        }
+
         fun get(context: Context): ChatDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 ChatDatabase::class.java,
                 "bleedge_chat.db",
-            ).addMigrations(MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11)
+            ).addMigrations(MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
                 .fallbackToDestructiveMigration()
                 .build().also { instance = it }
         }

@@ -265,8 +265,12 @@ func classify(raw []byte) (meshpkt.Packet, ForwardMode, []byte, string, error) {
 }
 
 func directTargetHash(pkt meshpkt.Packet) []byte {
-	if hops := pkt.Hops(); len(hops) > 0 {
-		return cloneBytes(hops[0])
+	// Data-bearing direct packets are addressed by the 1-byte destination hash at the start of
+	// their payload (e.g. TXT_MSG: [dest_hash:1][src_hash:1][mac:2][ct]). The path hops are the
+	// repeaters the packet has already traversed (its trace), NOT the final recipient — so the
+	// payload dest hash is the correct routing target and takes priority.
+	if payloadCarriesDestHash(pkt.Type) && len(pkt.Payload) > 0 {
+		return []byte{pkt.Payload[0]}
 	}
 	if pkt.Type == meshpkt.PayloadTrace {
 		trace, err := meshpkt.DecodeTracePayload(pkt.Payload)
@@ -276,8 +280,8 @@ func directTargetHash(pkt meshpkt.Packet) []byte {
 			}
 		}
 	}
-	if payloadCarriesDestHash(pkt.Type) && len(pkt.Payload) > 0 {
-		return []byte{pkt.Payload[0]}
+	if hops := pkt.Hops(); len(hops) > 0 {
+		return cloneBytes(hops[0])
 	}
 	return nil
 }

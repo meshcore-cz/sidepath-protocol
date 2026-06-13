@@ -1,7 +1,7 @@
 package linux
 
 import (
-	"github.com/bleedge/bleedge/core"
+	"github.com/burningtree/bleedge/core"
 )
 
 // BLEPeerLink implements core.PeerLink using a GATT client connection.
