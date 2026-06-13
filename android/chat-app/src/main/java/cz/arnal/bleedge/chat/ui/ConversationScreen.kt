@@ -352,6 +352,14 @@ fun ConversationScreen(
                 listState.animateScrollToItem(messages.size)
             }
         }
+        // A late ACK_BRIDGED adds the bridge pill to an already-sent message, growing its bubble
+        // without changing the list size. If it's the newest message and we're parked at the bottom,
+        // re-pin it so the taller bubble doesn't slip partly off-screen.
+        LaunchedEffect(shown.lastOrNull()?.bridgedToMeshCore) {
+            if (searching || messages.isEmpty()) return@LaunchedEffect
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            if (lastVisible >= messages.size) listState.animateScrollToItem(messages.size)
+        }
         // Follow the keyboard: as the IME animates in/out the content area shrinks/grows from the
         // bottom, so re-pin the newest message to the bottom on every frame of that animation —
         // but only when the user is parked at the bottom (don't yank them down while reading up).

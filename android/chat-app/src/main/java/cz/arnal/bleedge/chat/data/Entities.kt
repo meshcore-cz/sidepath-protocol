@@ -86,6 +86,31 @@ data class Echo(
     val packetHex: String = "",
 )
 
+/**
+ * One distinct-path reception ("heard") of a bridged MeshCore channel message. The same MeshCore
+ * packet floods to us along several routes; each arrives wrapped in its own BLEEdge carrier and
+ * carries a different accumulated path, so it dedups to a distinct [contentId]. Stored per-message
+ * so the full set of paths survives a restart (the chat [Message] itself collapses them to one row).
+ *
+ * [hopsHex] is the comma-separated list of per-hop path-hash prefixes (each [pathHashSize] bytes);
+ * [packetHex] is the inner MeshCore OTA packet and [carrierHex] the BLEEdge carrier datagram, both
+ * kept so the heard's path / packet detail can be rebuilt offline.
+ */
+@Entity(tableName = "meshcore_heards", primaryKeys = ["messageId", "contentId"])
+data class MeshCoreHeard(
+    val messageId: String,
+    val contentId: String,
+    val timestampMs: Long,
+    val rssi: Int,
+    val forwarderHex: String = "",
+    val hopCount: Int = 0,
+    val pathHashSize: Int = 0,
+    val routeLabel: String = "",
+    val hopsHex: String = "",
+    val packetHex: String = "",
+    val carrierHex: String = "",
+)
+
 /** Outgoing-message delivery state. */
 object MsgStatus {
     const val SENDING = 0
@@ -151,4 +176,11 @@ data class Message(
     // Raw inner MeshCore OTA packet (hex) for a bridged incoming message, so its "Examine" /
     // MeshCore packet details survive the packet ageing out of the Rx Log or an app restart.
     val meshCorePacketHex: String = "",
+    // RSSI (dBm) of the link this message was received on, for incoming messages. Int.MIN_VALUE
+    // (RSSI_UNKNOWN) when unknown. Shown as the reception signal in message details.
+    val rssi: Int = Int.MIN_VALUE,
+    // For a delivered direct message: the raw ACK datagram (hex) and the local time we received it,
+    // so the round-trip delay and the ACK packet detail survive an app restart.
+    val ackPacketHex: String = "",
+    val ackTimestampMs: Long = 0L,
 )

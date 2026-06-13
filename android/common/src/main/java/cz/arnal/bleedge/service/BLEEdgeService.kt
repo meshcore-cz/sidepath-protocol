@@ -140,6 +140,9 @@ data class ReceivedMessage(
     val meshCorePacketId: String? = null,
     val sentAtMs: Long = 0L,
     val timestampMs: Long = System.currentTimeMillis(),
+    // RSSI (dBm) of the direct link this datagram arrived on, or RSSI_UNKNOWN. Persisted on the
+    // stored message so its reception signal is shown in message details and survives a restart.
+    val rssi: Int = RSSI_UNKNOWN,
     // Raw wire datagram (re-encoded), persisted on the stored message so "Packet details" works
     // for incoming messages even after the packet ages out of the (trimmed) Rx Log. Native BLEEdge
     // text only — bridged MeshCore messages carry [meshCorePacketRaw] instead.
@@ -183,6 +186,24 @@ data class RepeatSample(
     val viaMeshCore: Boolean = false,
     // The raw received datagram bytes for this echo, so it can be opened as a packet detail.
     val raw: ByteArray? = null,
+)
+
+/**
+ * One distinct-path reception of a bridged MeshCore channel message — keyed by [contentId] (the
+ * hash of the inner packet, which includes its accumulated path, so each route is distinct). The
+ * chat app persists these per message to show every path the message reached us by.
+ */
+data class MeshCoreHeardSample(
+    val contentId: String,
+    val timestampMs: Long,
+    val rssi: Int,
+    val forwarderHex: String,
+    val hopCount: Int,
+    val pathHashSize: Int,
+    val routeLabel: String,
+    val hopsHex: String,    // comma-separated per-hop path-hash prefixes (hex)
+    val packetHex: String,  // inner MeshCore OTA packet bytes
+    val carrierHex: String, // BLEEdge carrier datagram bytes
 )
 
 data class DmDelivery(
@@ -312,6 +333,10 @@ class BLEEdgeService : Service() {
     // ---- MeshCore subsystem ----
     private val _meshCorePackets = MutableStateFlow<List<MeshCorePacket>>(emptyList())
     val meshCorePackets: StateFlow<List<MeshCorePacket>> = _meshCorePackets.asStateFlow()
+    // Distinct-path receptions ("heards") of bridged MeshCore channel messages, keyed by the channel
+    // payload hex (== the chat message's identity). The chat app persists these per message.
+    private val _meshCoreHeards = MutableStateFlow<Map<String, List<MeshCoreHeardSample>>>(emptyMap())
+    val meshCoreHeards: StateFlow<Map<String, List<MeshCoreHeardSample>>> = _meshCoreHeards.asStateFlow()
     private val _meshCoreTotal = MutableStateFlow(0)
     val meshCoreTotal: StateFlow<Int> = _meshCoreTotal.asStateFlow()
     // Decoded MeshCore ADVERTs (node advertisements) seen on the mesh — consumed by the chat-app
@@ -775,7 +800,7 @@ class BLEEdgeService : Service() {
                 duplicatesDropped = s.duplicatesDropped + actions.count { it.type == ActionType.DROP && it.reason == DropReason.DUPLICATE },
             )
         }
-        executeActions(actions)
+        executeActions(actions, peers[addrHex]?.rssi ?: RSSI_UNKNOWN)
     }
 
     private fun learnNeighbor(directPeer: NodeId?, addrHex: String, device: BluetoothDevice) {
@@ -800,10 +825,10 @@ class BLEEdgeService : Service() {
         }
     }
 
-    private fun executeActions(actions: List<Action>) {
+    private fun executeActions(actions: List<Action>, rxRssi: Int = RSSI_UNKNOWN) {
         for (action in actions) {
             when (action.type) {
-                ActionType.DELIVER_LOCAL -> deliverLocal(action.datagram)
+                ActionType.DELIVER_LOCAL -> deliverLocal(action.datagram, rxRssi)
                 ActionType.RELAY_FLOOD -> {
                     val jitter = router.floodJitterMs()
                     scope.launch { delay(jitter); relayFlood(action) }
@@ -815,10 +840,10 @@ class BLEEdgeService : Service() {
         }
     }
 
-    private fun deliverLocal(dg: Datagram) {
+    private fun deliverLocal(dg: Datagram, rxRssi: Int = RSSI_UNKNOWN) {
         when (dg.protocol) {
-            PayloadProtocol.BLEEDGE_CONTROL -> deliverControl(dg)
-            PayloadProtocol.BLEEDGE_CHAT -> deliverChat(dg)
+            PayloadProtocol.BLEEDGE_CONTROL -> deliverControl(dg, rxRssi)
+            PayloadProtocol.BLEEDGE_CHAT -> deliverChat(dg, rxRssi)
             // MeshCore packets are handled (deduped) in handleMeshCorePacket from the receive path.
             PayloadProtocol.MESHCORE_PACKET -> Unit
             else -> appendMessage(ReceivedMessage(dg.source, dg.id, dg.protocol, path = dg.path))
@@ -884,8 +909,36 @@ class BLEEdgeService : Service() {
                         meshCoreHops = env.hopCount,
                         meshCorePacketId = contentId,
                         meshCorePacketRaw = dg.payload,
+                        // The local BLEEdge datagram that carried this MeshCore packet — persisted so
+                        // the (BLEEdge-first) packet detail + its datagram id survive a restart.
+                        raw = dg.encode(),
+                        rssi = rssi,
                     )
                 )
+                // Record this reception as a distinct-path "heard" of the channel message (keyed by
+                // the path-independent channel payload). Different routes carry different paths, so
+                // each is a new contentId; the chat app persists the full set per message. Only for
+                // channels we've joined (text decrypted) — else we'd accrue orphan heards.
+                if (text != null) {
+                val payloadHex = env.payload.toHex()
+                val sample = MeshCoreHeardSample(
+                    contentId = contentId,
+                    timestampMs = System.currentTimeMillis(),
+                    rssi = rssi,
+                    forwarderHex = (dg.path.lastOrNull() ?: dg.source).toHex(),
+                    hopCount = env.hopCount,
+                    pathHashSize = env.pathHashSize,
+                    routeLabel = env.route,
+                    hopsHex = env.hops.joinToString(",") { it.toHex() },
+                    packetHex = dg.payload.toHex(),
+                    carrierHex = dg.encode().toHex(),
+                )
+                _meshCoreHeards.update { m ->
+                    val prev = m[payloadHex].orEmpty()
+                    if (prev.any { it.contentId == contentId }) m
+                    else m + (payloadHex to (prev + sample).takeLast(200))
+                }
+                }
             }
         }
 
@@ -910,7 +963,7 @@ class BLEEdgeService : Service() {
         meshCoreChannelSecrets = secrets
     }
 
-    private fun deliverControl(dg: Datagram) {
+    private fun deliverControl(dg: Datagram, rxRssi: Int = RSSI_UNKNOWN) {
         val ctrl = runCatching { ControlMessage.decode(dg.payload) }.getOrNull() ?: return
         when (ctrl.kind) {
             ControlKind.ANNOUNCE -> { /* topology already updated + verified in the router */ }
@@ -918,7 +971,7 @@ class BLEEdgeService : Service() {
                 val acked = runCatching { AckBody.decode(ctrl.body).ackedId }.getOrNull()
                 val resolved = resolveDmAck(acked)
                 log("ACK from=${dg.source.toHex()} acks=${acked?.take(4)?.toHex()}", LogTag.MSG)
-                appendMessage(ReceivedMessage(dg.source, dg.id, dg.protocol, isAck = true, ackedId = resolved, path = dg.path))
+                appendMessage(ReceivedMessage(dg.source, dg.id, dg.protocol, isAck = true, ackedId = resolved, path = dg.path, raw = dg.encode(), rssi = rxRssi))
             }
             ControlKind.TRACE_REQUEST -> respondToTrace(dg, ctrl)
             ControlKind.TRACE_RESPONSE -> {
@@ -943,7 +996,7 @@ class BLEEdgeService : Service() {
         }
     }
 
-    private fun deliverChat(dg: Datagram) {
+    private fun deliverChat(dg: Datagram, rxRssi: Int = RSSI_UNKNOWN) {
         val id = identity ?: return
         val ctx = ChatContext(dg.id, dg.source, dg.destination)
         val msg = when (Chat.peekKind(dg.payload)) {
@@ -970,7 +1023,7 @@ class BLEEdgeService : Service() {
                 ReceivedMessage(dg.source, dg.id, dg.protocol, ChatKind.CHANNEL_REACTION, channelReactionPayload = it, path = dg.path)
             }
             else -> null
-        } ?: return
+        }?.copy(rssi = rxRssi) ?: return
         appendMessage(msg)
         maybeNotify(msg)
     }

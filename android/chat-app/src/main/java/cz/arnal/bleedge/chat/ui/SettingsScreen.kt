@@ -18,6 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -60,6 +61,7 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onOpenProfile: (String) -> Unit = {},
     onOpenAbout: () -> Unit = {},
+    onOpenDebug: () -> Unit = {},
 ) {
     val seedHex by vm.seedHex.collectAsState()
     val description by vm.description.collectAsState()
@@ -367,6 +369,35 @@ fun SettingsScreen(
                         Text("About BLEEdge Chat", style = MaterialTheme.typography.titleMedium)
                         Text(
                             "App details, authors, and software licences.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Icon(
+                        Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            Card(
+                Modifier.fillMaxWidth().clickable(onClick = onOpenDebug),
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.BugReport,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.size(14.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Debug", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Database size & tables, mesh metrics, runtime info.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

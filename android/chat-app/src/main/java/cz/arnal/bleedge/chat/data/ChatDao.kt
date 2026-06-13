@@ -24,6 +24,19 @@ interface ChatDao {
     @Query("UPDATE messages SET status = :status, routeHex = :route WHERE id = :id")
     suspend fun updateDelivery(id: String, status: Int, route: String)
 
+    /** Mark a DM delivered and persist the ACK packet + receipt time for the round-trip detail. */
+    @Query(
+        "UPDATE messages SET status = :status, routeHex = :route, " +
+            "ackPacketHex = :ackPacketHex, ackTimestampMs = :ackTimestampMs WHERE id = :id"
+    )
+    suspend fun updateDeliveryWithAck(
+        id: String,
+        status: Int,
+        route: String,
+        ackPacketHex: String,
+        ackTimestampMs: Long,
+    )
+
     @Query("UPDATE messages SET bridgedToMeshCore = 1, bridgedByHex = :bridgeHex WHERE id = :id")
     suspend fun markBridgedToMeshCore(id: String, bridgeHex: String)
 
@@ -88,6 +101,16 @@ interface ChatDao {
 
     @Query("DELETE FROM echoes WHERE messageId IN (SELECT id FROM messages WHERE peerHex = :peer)")
     suspend fun deleteEchoesForPeer(peer: String)
+
+    // ---- MeshCore heards (persisted distinct-path receptions of a bridged channel message) ----
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertMeshCoreHeard(heard: MeshCoreHeard)
+
+    @Query("SELECT * FROM meshcore_heards ORDER BY timestampMs ASC")
+    fun allMeshCoreHeards(): Flow<List<MeshCoreHeard>>
+
+    @Query("DELETE FROM meshcore_heards WHERE messageId IN (SELECT id FROM messages WHERE peerHex = :peer)")
+    suspend fun deleteMeshCoreHeardsForPeer(peer: String)
 
     // ---- discovered contacts ----
     @Insert(onConflict = OnConflictStrategy.REPLACE)

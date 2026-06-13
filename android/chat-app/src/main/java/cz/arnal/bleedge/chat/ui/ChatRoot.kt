@@ -49,6 +49,7 @@ private sealed class Dest(val depth: Int) {
     data object MeshCoreLog : Dest(1)
     data object Topology : Dest(1)
     data object About : Dest(2)
+    data object Debug : Dest(2)
     data class Conversation(val peer: String) : Dest(1)
     data class Profile(val peer: String) : Dest(2)
     data class Trace(val peer: String) : Dest(3)
@@ -77,6 +78,7 @@ fun ChatRoot(vm: ChatViewModel) {
     var showMeshCoreLog by rememberSaveable { mutableStateOf(false) }
     var showTopology by rememberSaveable { mutableStateOf(false) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
+    var showDebug by rememberSaveable { mutableStateOf(false) }
     var tab by rememberSaveable { mutableStateOf(0) }
 
     // A meshcore:// deep link (contact/channel) asks us to open its conversation.
@@ -95,6 +97,7 @@ fun ChatRoot(vm: ChatViewModel) {
     val top: Dest = when {
         openTrace != null -> Dest.Trace(openTrace!!)
         showAbout -> Dest.About
+        showDebug -> Dest.Debug
         openProfile != null -> Dest.Profile(openProfile!!)
         openPeer != null -> Dest.Conversation(openPeer!!)
         showTopology -> Dest.Topology
@@ -111,6 +114,7 @@ fun ChatRoot(vm: ChatViewModel) {
                 openTrace = null
             }
             Dest.About -> showAbout = false
+            Dest.Debug -> showDebug = false
             is Dest.Profile -> openProfile = null
             is Dest.Conversation -> openPeer = null
             Dest.MeshCoreLog -> showMeshCoreLog = false
@@ -193,6 +197,7 @@ fun ChatRoot(vm: ChatViewModel) {
                 onBack = popTop,
                 onOpenProfile = { openProfile = it },
                 onOpenAbout = { showAbout = true },
+                onOpenDebug = { showDebug = true },
             )
             Dest.RxLog -> RxLogScreen(
                 vm,
@@ -211,6 +216,7 @@ fun ChatRoot(vm: ChatViewModel) {
                 onOpenProfile = { openProfile = it },
             )
             Dest.About -> AboutScreen(onBack = popTop)
+            Dest.Debug -> DebugScreen(vm, onBack = popTop)
             Dest.Tabs -> TabsScaffold(
                 vm,
                 tab = tab,

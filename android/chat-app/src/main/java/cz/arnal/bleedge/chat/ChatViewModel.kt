@@ -47,7 +47,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -106,6 +108,26 @@ data class TraceUi(
     val result: TraceResponseBody? = null,
     val error: String? = null,
 )
+
+/** A node matching a MeshCore path-hash prefix (see [ChatViewModel.meshCoreHopCandidates]). */
+data class MeshCoreHopMatch(val name: String, val nodeHex: String, val pubKeyHex: String)
+
+/** Row count and on-disk size (bytes, -1 if unavailable) of one database table. */
+data class TableStat(val name: String, val rows: Long, val bytes: Long)
+
+/** A snapshot of the Room database's on-disk footprint, for the debug screen. */
+data class DatabaseStats(
+    val path: String,
+    val fileBytes: Long,
+    val walBytes: Long,
+    val shmBytes: Long,
+    val pageSize: Long,
+    val pageCount: Long,
+    val dbStatAvailable: Boolean,
+    val tables: List<TableStat>,
+) {
+    val totalBytes: Long get() = fileBytes + walBytes + shmBytes
+}
 
 /** A row in the Chats list. */
 data class ConversationSummary(
@@ -373,6 +395,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      */
     val echoes: StateFlow<Map<String, List<cz.arnal.bleedge.chat.data.Echo>>> =
         dao.allEchoes().map { it.groupBy { e -> e.messageId } }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    /** Persisted distinct-path MeshCore receptions ("heards"), grouped by message id. */
+    val meshCoreHeards: StateFlow<Map<String, List<cz.arnal.bleedge.chat.data.MeshCoreHeard>>> =
+        dao.allMeshCoreHeards().map { it.groupBy { h -> h.messageId } }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
     /**
@@ -761,6 +788,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+        // Persist every distinct-path MeshCore reception ("heard") of a bridged channel message, so
+        // the full set of routes the message reached us by survives an app restart. Keyed by the
+        // channel payload hex, which is the chat message's "mc:" primary key.
+        viewModelScope.launch {
+            service.meshCoreHeards.collect { map ->
+                map.forEach { (payloadHex, samples) ->
+                    val msgId = "mc:$payloadHex"
+                    samples.forEach { s ->
+                        if (!processed.add("mcheard:$msgId:${s.contentId}")) return@forEach
+                        dao.insertMeshCoreHeard(
+                            cz.arnal.bleedge.chat.data.MeshCoreHeard(
+                                messageId = msgId,
+                                contentId = s.contentId,
+                                timestampMs = s.timestampMs,
+                                rssi = s.rssi,
+                                forwarderHex = s.forwarderHex,
+                                hopCount = s.hopCount,
+                                pathHashSize = s.pathHashSize,
+                                routeLabel = s.routeLabel,
+                                hopsHex = s.hopsHex,
+                                packetHex = s.packetHex,
+                                carrierHex = s.carrierHex,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private suspend fun handleIncoming(msg: ReceivedMessage) {
@@ -768,7 +823,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val acked = msg.ackedId ?: return
             val key = "ack:" + acked.toHex()
             if (!processed.add(key)) return
-            dao.updateDelivery(acked.toHex(), MsgStatus.DELIVERED, msg.path.toRouteHex())
+            dao.updateDeliveryWithAck(
+                acked.toHex(), MsgStatus.DELIVERED, msg.path.toRouteHex(),
+                ackPacketHex = msg.raw?.toHex().orEmpty(),
+                ackTimestampMs = msg.timestampMs,
+            )
             return
         }
         // ACK_BRIDGED: a gateway relayed one of our channel messages onto MeshCore. The bridged
@@ -854,6 +913,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 routeHex = msg.path.toRouteHex(),
                 read = false,
                 packetHex = msg.raw?.toHex().orEmpty(),
+                rssi = msg.rssi,
             )
         )
         // The service already verified outer.source == sender_public_key[:10]; save the
@@ -898,6 +958,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     // bridged MeshCore ones carry the inner MeshCore packet (examined separately).
                     packetHex = msg.raw?.toHex().orEmpty(),
                     meshCorePacketHex = msg.meshCorePacketRaw?.toHex().orEmpty(),
+                    rssi = msg.rssi,
                 )
             )
             return
@@ -1056,6 +1117,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             dao.deleteContact(nodeHex)
             dao.deleteReactionsForPeer(nodeHex)
             dao.deleteEchoesForPeer(nodeHex)
+            dao.deleteMeshCoreHeardsForPeer(nodeHex)
             dao.deleteMessagesFor(nodeHex)
         }
     }
@@ -1269,6 +1331,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             dao.deleteReactionsForPeer(peerHex)
             dao.deleteEchoesForPeer(peerHex)
+            dao.deleteMeshCoreHeardsForPeer(peerHex)
             dao.deleteMessagesFor(peerHex)
             if (!isChannelPeer(peerHex)) dao.deleteContact(peerHex)
         }
@@ -1414,6 +1477,72 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Resolves a node id (hex) to its best-known display name, for route detail rendering. */
     fun nameForHex(hex: String): String =
         displayName(hex, contacts.value.associateBy { it.nodeHex }, topology.value)
+
+    /**
+     * Every node whose public key begins with a MeshCore path-hash prefix (hex, the first
+     * [pathHashSize] bytes of a repeater's key — usually 1 byte). A 1-byte prefix can match several
+     * nodes, so this returns all candidates (deduped by public key); the UI surfaces the ambiguity.
+     */
+    fun meshCoreHopCandidates(prefixHex: String): List<MeshCoreHopMatch> {
+        if (prefixHex.isBlank()) return emptyList()
+        val p = prefixHex.lowercase()
+        val out = LinkedHashMap<String, MeshCoreHopMatch>()
+        discoveredContacts.value.forEach {
+            if (it.pubKeyHex.startsWith(p)) out[it.pubKeyHex] =
+                MeshCoreHopMatch(it.name.ifBlank { it.nodeHex.take(8) }, it.nodeHex, it.pubKeyHex)
+        }
+        contacts.value.forEach {
+            if (it.pubKeyHex.startsWith(p)) out.putIfAbsent(it.pubKeyHex, MeshCoreHopMatch(nameForHex(it.nodeHex), it.nodeHex, it.pubKeyHex))
+        }
+        return out.values.toList()
+    }
+
+    /** Best-known single display name for a MeshCore hop prefix, or "" if unknown ([meshCoreHopCandidates]). */
+    fun meshCoreHopName(prefixHex: String): String = meshCoreHopCandidates(prefixHex).firstOrNull()?.name.orEmpty()
+
+    /**
+     * Snapshot of the Room database on disk: file/WAL/SHM sizes, page geometry, and per-table row
+     * counts (plus per-table bytes when the `dbstat` virtual table is available). For the debug screen.
+     */
+    suspend fun databaseStats(): DatabaseStats = withContext(Dispatchers.IO) {
+        val ctx = getApplication<Application>()
+        val file = ctx.getDatabasePath("bleedge_chat.db")
+        val wal = java.io.File(file.path + "-wal")
+        val shm = java.io.File(file.path + "-shm")
+        val db = ChatDatabase.get(ctx).openHelper.readableDatabase
+
+        fun queryLong(sql: String): Long = db.query(sql).use { if (it.moveToFirst()) it.getLong(0) else 0L }
+
+        val tableNames = mutableListOf<String>()
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' " +
+                "AND name NOT LIKE 'room_master_table' AND name != 'android_metadata' ORDER BY name",
+        ).use { c -> while (c.moveToNext()) tableNames += c.getString(0) }
+
+        // dbstat is an optional SQLite virtual table; absent on some builds, so degrade gracefully.
+        val byTableBytes = runCatching {
+            val m = HashMap<String, Long>()
+            db.query("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name").use { c ->
+                while (c.moveToNext()) m[c.getString(0)] = c.getLong(1)
+            }
+            m
+        }.getOrNull()
+
+        val tables = tableNames.map { t ->
+            TableStat(t, queryLong("SELECT COUNT(*) FROM `$t`"), byTableBytes?.get(t) ?: -1L)
+        }.sortedByDescending { it.rows }
+
+        DatabaseStats(
+            path = file.path,
+            fileBytes = file.length(),
+            walBytes = wal.length(),
+            shmBytes = shm.length(),
+            pageSize = queryLong("PRAGMA page_size"),
+            pageCount = queryLong("PRAGMA page_count"),
+            dbStatAvailable = byTableBytes != null,
+            tables = tables,
+        )
+    }
 
     /** Resolves a node id (hex) to its OS/device platform string (from its ANNOUNCE), or "". */
     fun platformForHex(hex: String): String = nodePlatform(hex, topology.value)

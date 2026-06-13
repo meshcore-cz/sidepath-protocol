@@ -10,8 +10,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 // v3: NodeIDs widened 8→10 bytes (protocol v3), so old peer/contact ids are stale —
 // destructive migration wipes the v2 store. See docs/PROTOCOL.md migration §17.
 @Database(
-    entities = [Message::class, Contact::class, Channel::class, DiscoveredContact::class, Reaction::class, Echo::class],
-    version = 13,
+    entities = [Message::class, Contact::class, Channel::class, DiscoveredContact::class, Reaction::class, Echo::class, MeshCoreHeard::class],
+    version = 15,
     exportSchema = false,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -92,12 +92,39 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        // v13→v14: persist a received message's link RSSI and, for a delivered DM, the raw ACK
+        // datagram + its receipt time (so the round-trip delay and ACK packet detail survive a
+        // restart). Additive — migrate in place.
+        private val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN rssi INTEGER NOT NULL DEFAULT ${Int.MIN_VALUE}")
+                db.execSQL("ALTER TABLE messages ADD COLUMN ackPacketHex TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE messages ADD COLUMN ackTimestampMs INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        // v14→v15: persist every distinct-path reception ("heard") of a bridged MeshCore channel
+        // message, so the full set of MeshCore paths survives a restart. Additive — new table.
+        private val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `meshcore_heards` (" +
+                        "`messageId` TEXT NOT NULL, `contentId` TEXT NOT NULL, " +
+                        "`timestampMs` INTEGER NOT NULL, `rssi` INTEGER NOT NULL, " +
+                        "`forwarderHex` TEXT NOT NULL, `hopCount` INTEGER NOT NULL, " +
+                        "`pathHashSize` INTEGER NOT NULL, `routeLabel` TEXT NOT NULL, " +
+                        "`hopsHex` TEXT NOT NULL, `packetHex` TEXT NOT NULL, " +
+                        "`carrierHex` TEXT NOT NULL, PRIMARY KEY(`messageId`, `contentId`))"
+                )
+            }
+        }
+
         fun get(context: Context): ChatDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 ChatDatabase::class.java,
                 "bleedge_chat.db",
-            ).addMigrations(MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13)
+            ).addMigrations(MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15)
                 .fallbackToDestructiveMigration()
                 .build().also { instance = it }
         }
