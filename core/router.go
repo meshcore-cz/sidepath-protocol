@@ -255,7 +255,14 @@ func (r *Router) SelectRoute(dst NodeID) []NodeID {
 	if _, ok := r.Neighbors.Get(dst); ok {
 		return []NodeID{dst}
 	}
-	return r.Topology.BFSPath(r.LocalID, dst)
+	// Seed the search with our direct neighbors: we're never in our own topology, so a plain BFS
+	// from LocalID would dead-end and never find a multi-hop source route.
+	all := r.Neighbors.All()
+	localNeighbors := make([]NodeID, 0, len(all))
+	for _, nb := range all {
+		localNeighbors = append(localNeighbors, nb.ID)
+	}
+	return r.Topology.BFSPathFromSource(r.LocalID, dst, localNeighbors)
 }
 
 func (r *Router) MarkOriginated(id DatagramID) {

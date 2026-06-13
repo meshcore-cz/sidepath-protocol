@@ -108,6 +108,36 @@ func TestSignedAnnounceUpdatesTopologyAndRejectsTamper(t *testing.T) {
 	}
 }
 
+// A node is never in its own topology, so SelectRoute must seed the search with its direct
+// neighbors to find a multi-hop source route to a node reachable via a relay (the MeshCore
+// direct-bridge needs this — see Topology.BFSPathFromSource).
+func TestSelectRouteFindsMultiHopViaLocalNeighbors(t *testing.T) {
+	local := testNodeID(0x01)
+	relay := testNodeID(0x02)
+	dst := testNodeID(0x03)
+
+	r := NewRouter(local)
+	// We are directly connected to the relay only.
+	r.Neighbors.Upsert(Neighbor{ID: relay})
+	// Topology (from others' ANNOUNCEs): the relay neighbors both us and the destination.
+	r.Topology.Update(TopoNode{ID: relay, Neighbors: []NodeID{local, dst}, Epoch: 1, Seq: 1})
+	r.Topology.Update(TopoNode{ID: dst, Neighbors: []NodeID{relay}, Epoch: 1, Seq: 1})
+
+	route := r.SelectRoute(dst)
+	if len(route) != 2 || route[0] != relay || route[1] != dst {
+		t.Fatalf("SelectRoute(dst) = %v, want [relay dst]", route)
+	}
+
+	// A direct neighbor still routes directly.
+	if got := r.SelectRoute(relay); len(got) != 1 || got[0] != relay {
+		t.Fatalf("SelectRoute(relay) = %v, want [relay]", got)
+	}
+	// An unreachable node has no route.
+	if got := r.SelectRoute(testNodeID(0x09)); got != nil {
+		t.Fatalf("SelectRoute(unknown) = %v, want nil", got)
+	}
+}
+
 func TestRouterBuildsAckOnlyWhenRequested(t *testing.T) {
 	alice := testIdentity(1)
 	bob := testIdentity(30)

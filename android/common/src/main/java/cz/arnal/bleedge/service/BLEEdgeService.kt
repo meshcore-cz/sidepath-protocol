@@ -29,6 +29,7 @@ import cz.arnal.bleedge.chatproto.ChatPublicText
 import cz.arnal.bleedge.chatproto.ChatTyping
 import cz.arnal.bleedge.meshcore.MeshCoreAdvert
 import cz.arnal.bleedge.meshcore.MeshCoreCodec
+import cz.arnal.bleedge.meshcore.MeshCoreDirect
 import cz.arnal.bleedge.meshcore.MeshCorePacket
 import cz.arnal.bleedge.meshcore.MeshCoreType
 import cz.arnal.bleedge.protocol.AckBody
@@ -346,6 +347,10 @@ class BLEEdgeService : Service() {
     // Joined-channel PSKs (16-byte secrets), pushed in by the chat-app, used only to
     // render decrypted GRP_TXT plaintext in the MeshCore Rx Log.
     @Volatile private var meshCoreChannelSecrets: List<ByteArray> = emptyList()
+    // Known MeshCore contacts' 32-byte Ed25519 public keys, pushed in by the chat-app. Used to
+    // resolve the full sender key (from the 1-byte src hash) of an incoming MeshCore DM so it can
+    // be decrypted; recently-heard adverts are also tried.
+    @Volatile private var meshCoreContactKeys: List<ByteArray> = emptyList()
     // Content-level dedup for MeshCore side effects: the same logical MeshCore packet reaches us
     // via multiple LoRa paths / BLEEdge relays (each a distinct datagram), so we key on the stable
     // inner payload to ingest chat/discovery once while still counting every RX log sighting.
@@ -942,6 +947,56 @@ class BLEEdgeService : Service() {
             }
         }
 
+        // MeshCore direct message (TXT_MSG): if it's addressed (by hash) to us, decrypt it with our
+        // identity, surface it as a normal DM, and ACK back so the MeshCore sender stops retrying.
+        val self = identity
+        if (firstSight && env != null && env.type == MeshCoreType.TXT_MSG && self != null &&
+            env.payload.size >= 4 && (env.payload[0].toInt() and 0xFF) == (self.publicKey[0].toInt() and 0xFF)
+        ) {
+            val srcHash = env.payload[1].toInt() and 0xFF
+            // Candidate senders = known MeshCore contacts ∪ recently-heard adverts, restricted to keys
+            // whose first byte matches the 1-byte src hash. The MeshCore MAC picks the real one.
+            val candidates = (meshCoreContactKeys +
+                _meshCoreAdverts.value.mapNotNull { runCatching { it.publicKeyHex.hexToByteArray() }.getOrNull() })
+                .filter { it.size == 32 && (it[0].toInt() and 0xFF) == srcHash }
+                .distinctBy { it.toHex() }
+            for (senderPub in candidates) {
+                val dm = MeshCoreDirect.decode(self, senderPub, env.payload) ?: continue
+                val transport = if (env.isTransport && env.transportCodes != null)
+                    " transport %04x/%04x".format(env.transportCodes!![0], env.transportCodes!![1]) else ""
+                appendMessage(
+                    ReceivedMessage(
+                        fromNodeId = NodeId.fromPublicKey(senderPub),
+                        datagramId = dg.id, protocol = dg.protocol,
+                        chatKind = ChatKind.DIRECT_TEXT,
+                        text = dm.text,
+                        senderPublicKey = senderPub,
+                        // The encrypted TXT_MSG payload is identical across LoRa/BLEEdge paths (unlike
+                        // the full packet, whose hop header changes), so the chat-app keys the message
+                        // id on it to collapse multi-path duplicates.
+                        channelPayload = env.payload,
+                        path = dg.path,
+                        fromMeshCore = true,
+                        meshCoreType = env.type,
+                        meshCoreRoute = env.route + transport,
+                        meshCoreHops = env.hopCount,
+                        meshCorePacketId = contentId,
+                        meshCorePacketRaw = dg.payload,
+                        raw = dg.encode(),
+                        rssi = rssi,
+                        sentAtMs = dm.timestampSec * 1000,
+                    )
+                )
+                // ACK the message back onto MeshCore (built once, deterministic — the bridge dedups
+                // the inject; multiple BLEEdge paths arriving here are harmless).
+                MeshCoreCodec.encodeTextAck(dm.timestampSec, dm.attempt, dm.text, senderPub)?.let { ack ->
+                    sendMeshCoreRaw(ack)
+                    log("meshcore DM rx from=${senderPub.copyOf(2).toHex()} content=$contentId acked", LogTag.MSG)
+                }
+                break
+            }
+        }
+
         val packet = MeshCorePacket(
             timestampMs = System.currentTimeMillis(),
             source = dg.source, datagramId = dg.id, path = dg.path,
@@ -961,6 +1016,26 @@ class BLEEdgeService : Service() {
     /** Chat-app pushes the joined-channel PSKs so the MeshCore Rx Log can render GRP_TXT plaintext. */
     fun setMeshCoreChannelSecrets(secrets: List<ByteArray>) {
         meshCoreChannelSecrets = secrets
+    }
+
+    /** Chat-app pushes known MeshCore contacts' 32-byte public keys, used to decrypt incoming DMs. */
+    fun setMeshCoreContactKeys(keys: List<ByteArray>) {
+        meshCoreContactKeys = keys.filter { it.size == 32 }
+    }
+
+    /**
+     * Floods an opaque, fully-formed MeshCore OTA packet onto the BLEEdge mesh as a broadcast
+     * MESHCORE_PACKET datagram. A bridge node receives it and injects it onto the real MeshCore
+     * radio (see Bridge.BridgeRawOut). Used to return a DM ACK toward a MeshCore sender.
+     */
+    fun sendMeshCoreRaw(bytes: ByteArray) {
+        val id = identity ?: return
+        val dg = Datagram(
+            id = Datagram.newDatagramId(), source = id.nodeId, destination = NodeId.BROADCAST,
+            ttl = BLEEdge.DEFAULT_FLOOD_TTL, protocol = PayloadProtocol.MESHCORE_PACKET, payload = bytes,
+        )
+        router.markOriginated(dg.id)
+        transmit(dg)
     }
 
     private fun deliverControl(dg: Datagram, rxRssi: Int = RSSI_UNKNOWN) {

@@ -99,6 +99,23 @@ object MeshCoreCodec {
         parseAdvertJson(json)
     }.getOrNull()
 
+    /**
+     * Builds the MeshCore ACK packet a recipient returns for a received TXT_MSG, via meshpkt's
+     * `encodeTextAck` op (CRC = SHA-256(ts|attempt&3|text|senderPub)[:4], FLOOD-routed ACK packet).
+     * Returns the raw OTA packet bytes, or null on error.
+     */
+    fun encodeTextAck(timestampSec: Long, attempt: Int, text: String, senderPub: ByteArray): ByteArray? = runCatching {
+        val args = JSONArray()
+            .put(timestampSec)
+            .put(attempt)
+            .put(text)
+            .put(senderPub.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("encodeTextAck", args.toString())
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        o.optString("hex", "").takeIf { it.isNotEmpty() }?.hexToBytes()
+    }.getOrNull()
+
     /** Pure JSON→[MeshCoreAdvert] mapping (host-testable). Returns null on error/bad shape. */
     fun parseAdvertJson(json: String): MeshCoreAdvert? = runCatching {
         val o = JSONObject(json)

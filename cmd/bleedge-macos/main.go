@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -261,6 +262,22 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 					}(dg.Source, dg.ID, cp, idHex)
 				}
 			}
+			// A MESHCORE_PACKET datagram received from another BLEEdge node is a raw MeshCore
+			// packet that node wants placed on the real radio (e.g. an ACK it built for a MeshCore
+			// DM it received). Inject it verbatim, deduped by content. Our own re-floods of
+			// radio-tapped packets never reach here (they're marked originated), and Android never
+			// re-floods inbound MeshCore packets, so this does not loop.
+			if meshcoreBridge && br != nil && dg.Protocol == core.ProtocolMeshCorePacket {
+				go func(raw []byte, src core.NodeID) {
+					injected, err := br.BridgeRawOut(ctx, raw)
+					switch {
+					case err != nil:
+						outLog(fmt.Sprintf("meshcore bridge: raw out FAILED from=%s: %v", src, err))
+					case injected:
+						outLog(fmt.Sprintf("meshcore bridge: raw out from=%s -> MeshCore bytes=%d", src, len(raw)))
+					}
+				}(dg.Payload, dg.Source)
+			}
 			// The bot consumes every message; the TUI (when present) also shows it.
 			if theBot != nil {
 				theBot.onIncoming(dg)
@@ -306,18 +323,37 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 				bridgeLog(fmt.Sprintf("meshcore bridge: flooded dg=%s bytes=%d fragments=%d %s",
 					hex.EncodeToString(tx.DatagramID[:]), tx.DatagramBytes, tx.FragmentCount, pkt.Summary()))
 			case mcbridge.ForwardDirect:
-				dst, ok := node.MeshCoreNeighborForHash(pkt.TargetHash)
-				if !ok {
-					bridgeLog("meshcore bridge: skip direct " + pkt.Summary() + " reason=no reachable BLEEdge neighbor for MeshCore hash")
+				// MeshCore addresses the recipient by only a 1–2 byte public-key prefix, so
+				// the hash can match several distinct nodes on our mesh. Send the packet to
+				// EVERY node we have a route to whose key matches; the wrong recipients fail
+				// the MeshCore MAC and drop it. If none match, fall back to flooding.
+				targetHex := hex.EncodeToString(pkt.TargetHash)
+				cands := node.MeshCoreCandidatesForHash(pkt.TargetHash)
+				if len(cands) == 0 {
+					// Dump the known BLEEdge nodes' first key byte + name so a hash mismatch
+					// (recipient simply not on our mesh) is diagnosable at a glance.
+					bridgeLog(fmt.Sprintf("meshcore bridge: dest hash %s matches no BLEEdge node — known=[%s]",
+						targetHex, knownNodeHashes(node)))
+					tx, err := node.SendMeshCoreRawWithInfo(pkt.Bytes)
+					if err != nil {
+						bridgeLog(fmt.Sprintf("meshcore bridge: direct->flood failed: %v packet=%s", err, pkt.Summary()))
+						return
+					}
+					bridgeLog(fmt.Sprintf("meshcore bridge: direct->flood dest=%s dg=%s bytes=%d fragments=%d %s",
+						targetHex, hex.EncodeToString(tx.DatagramID[:]), tx.DatagramBytes, tx.FragmentCount, pkt.Summary()))
 					return
 				}
-				tx, err := node.SendMeshCoreRawToWithInfo(dst, pkt.Bytes)
-				if err != nil {
-					bridgeLog(fmt.Sprintf("meshcore bridge: direct failed dst=%s err=%v packet=%s", dst, err, pkt.Summary()))
-					return
+				bridgeLog(fmt.Sprintf("meshcore bridge: dest hash %s -> %d candidate(s): %s  [%s]",
+					targetHex, len(cands), describeCandidates(node, cands), pkt.Summary()))
+				for _, dst := range cands {
+					tx, err := node.SendMeshCoreRawToWithInfo(dst, pkt.Bytes)
+					if err != nil {
+						bridgeLog(fmt.Sprintf("meshcore bridge: direct failed dst=%s [%s] err=%v", dst, node.NameFor(dst), err))
+						continue
+					}
+					bridgeLog(fmt.Sprintf("meshcore bridge: direct dst=%s [%s] via=%s dg=%s bytes=%d fragments=%d",
+						dst, node.NameFor(dst), routeLabel(node, dst), hex.EncodeToString(tx.DatagramID[:]), tx.DatagramBytes, tx.FragmentCount))
 				}
-				bridgeLog(fmt.Sprintf("meshcore bridge: direct dst=%s dg=%s bytes=%d fragments=%d %s",
-					dst, hex.EncodeToString(tx.DatagramID[:]), tx.DatagramBytes, tx.FragmentCount, pkt.Summary()))
 			default:
 				bridgeLog("meshcore bridge: skip unknown forwarding mode " + pkt.Summary())
 			}
@@ -479,6 +515,65 @@ func idShort(id core.NodeID) string {
 		return s[:8]
 	}
 	return s
+}
+
+// routeLabel describes how the bridge reaches dst over BLEEdge: "direct" for a one-hop neighbor,
+// or "N hops: a -> b -> dst" for a source route. Used in MeshCore direct-bridge diagnostics.
+func routeLabel(node *blenode.Node, dst core.NodeID) string {
+	route, ok := node.RouteTo(dst)
+	switch {
+	case !ok:
+		return "no-route"
+	case len(route) == 0:
+		return "direct"
+	default:
+		return fmt.Sprintf("%d hops: %s", len(route), formatRoute(route))
+	}
+}
+
+// describeCandidates renders the MeshCore direct-bridge candidate set as
+// "be0d40fd…(tree 木, direct), d503…(three-walnut, 2 hops)".
+func describeCandidates(node *blenode.Node, cands []core.NodeID) string {
+	parts := make([]string, len(cands))
+	for i, id := range cands {
+		parts[i] = fmt.Sprintf("%s(%s, %s)", idShort(id), nameLabel(node.NameFor(id)), routeLabel(node, id))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// knownNodeHashes lists every BLEEdge node's 1-byte MeshCore hash (public-key[0]) and name, so an
+// unmatched MeshCore dest hash can be compared against what we actually know:
+// "be:tree 木 d5:three-walnut-zero 11:zero-velvet-five". Sorted by hash for readability.
+func knownNodeHashes(node *blenode.Node) string {
+	seen := make(map[core.NodeID]bool)
+	type entry struct {
+		hash byte
+		name string
+	}
+	var entries []entry
+	add := func(id core.NodeID) {
+		if seen[id] {
+			return
+		}
+		pub := node.PublicKeyFor(id)
+		if len(pub) == 0 {
+			return
+		}
+		seen[id] = true
+		entries = append(entries, entry{hash: pub[0], name: nameLabel(node.NameFor(id))})
+	}
+	for _, nb := range node.Neighbors() {
+		add(nb.ID)
+	}
+	for _, tn := range node.Topology() {
+		add(tn.ID)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].hash < entries[j].hash })
+	parts := make([]string, len(entries))
+	for i, e := range entries {
+		parts[i] = fmt.Sprintf("%02x:%s", e.hash, e.name)
+	}
+	return strings.Join(parts, " ")
 }
 
 // descLabel renders a node's free-form bio as "(desc)", or "" when empty.

@@ -53,6 +53,27 @@ func TestClassifyDirectTxtMsgRoutesByDestHashNotPath(t *testing.T) {
 	}
 }
 
+// A DM with no known MeshCore path is sent RouteFlood, but it still carries a payload dest hash and
+// is destined for a single node — classify must route it directly (caller floods as a fallback).
+func TestClassifyFloodTxtMsgRoutesByDestHash(t *testing.T) {
+	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
+		Route:        meshpkt.RouteFlood,
+		Type:         meshpkt.PayloadTxtMsg,
+		PathHashSize: 2,
+		Payload:      []byte{0xbe, 0x72, 0, 0},
+	})
+	if err != nil {
+		t.Fatalf("EncodePacket: %v", err)
+	}
+	_, mode, target, reason, err := classify(raw)
+	if err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	if mode != ForwardDirect || string(target) != string([]byte{0xbe}) || reason != "" {
+		t.Fatalf("classify flood txt got mode=%v target=%x reason=%q (want dest hash be)", mode, target, reason)
+	}
+}
+
 func TestClassifyDirectPacketWithPayloadDestHash(t *testing.T) {
 	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
 		Route:        meshpkt.RouteDirect,
@@ -246,5 +267,20 @@ func TestShouldBridgeOutDedup(t *testing.T) {
 	}
 	if !b.shouldBridgeOut("ddeeff") {
 		t.Fatal("a different datagram id should bridge")
+	}
+}
+
+func TestShouldInjectRawDedup(t *testing.T) {
+	b := New(Config{DedupTTL: time.Minute})
+	packet := []byte{0x10, 0x20, 0x30, 0x40}
+	other := []byte{0x10, 0x20, 0x30, 0x41}
+	if !b.shouldInjectRaw(packet) {
+		t.Fatal("first sight should inject")
+	}
+	if b.shouldInjectRaw(packet) {
+		t.Fatal("identical raw packet must not inject twice")
+	}
+	if !b.shouldInjectRaw(other) {
+		t.Fatal("a different raw packet should inject")
 	}
 }

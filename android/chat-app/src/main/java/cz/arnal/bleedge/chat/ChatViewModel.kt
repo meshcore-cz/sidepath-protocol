@@ -706,6 +706,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 service.setMeshCoreChannelSecrets(chans.map { it.pskHex.hexToBytes() })
             }
         }
+        // Push known MeshCore contacts' public keys so the service can resolve the full sender key
+        // (from a DM's 1-byte src hash) and decrypt incoming MeshCore direct messages.
+        viewModelScope.launch {
+            contacts.collect { list ->
+                service.setMeshCoreContactKeys(
+                    list.filter { it.isMeshCore && it.pubKeyHex.length == 64 }
+                        .mapNotNull { runCatching { it.pubKeyHex.hexToBytes() }.getOrNull() },
+                )
+            }
+        }
         // Ingest discovered BLEEdge nodes from the live topology into the discovered-contacts table.
         viewModelScope.launch {
             combine(topology, nodeId) { topo, me -> topo to me.toHex() }.collect { (topo, meHex) ->
@@ -899,8 +909,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun handleIncomingDm(msg: ReceivedMessage) {
-        if (!processed.add(msg.datagramId.toHex())) return
         val peer = msg.fromNodeId.toHex()
+        // A bridged MeshCore DM arrives over several LoRa/BLEEdge paths as distinct carrier datagrams
+        // but with an identical encrypted payload, so key its id on that payload (path-independent) to
+        // collapse duplicates. Native BLEEdge DMs keep their unique datagram id.
+        val dedupPayload = msg.channelPayload
+        val id = if (msg.fromMeshCore && dedupPayload != null)
+            "mcdm:" + sha256Hex(dedupPayload)
+        else msg.datagramId.toHex().ifEmpty { newId() }
+        if (!processed.add(id)) return
         if (msg.sentAtMs > 0L) {
             lastRealMessageSentAtMs[peer] = maxOf(lastRealMessageSentAtMs[peer] ?: 0L, msg.sentAtMs)
         }
@@ -908,7 +925,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         clearTyping(peer)
         dao.insertMessage(
             Message(
-                id = msg.datagramId.toHex().ifEmpty { newId() },
+                id = id,
                 peerHex = peer,
                 senderHex = peer,
                 incoming = true,
@@ -917,13 +934,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 status = MsgStatus.DELIVERED,
                 routeHex = msg.path.toRouteHex(),
                 read = false,
+                viaMeshCore = msg.fromMeshCore,
+                meshCoreType = msg.meshCoreType.orEmpty(),
+                meshCoreRoute = msg.meshCoreRoute.orEmpty(),
+                meshCoreHops = msg.meshCoreHops,
+                meshCorePacketId = msg.meshCorePacketId.orEmpty(),
                 packetHex = msg.raw?.toHex().orEmpty(),
+                meshCorePacketHex = msg.meshCorePacketRaw?.toHex().orEmpty(),
                 rssi = msg.rssi,
             )
         )
-        // The service already verified outer.source == sender_public_key[:10]; save the
-        // sender's key so we can reply even if the node isn't (yet) in our topology.
-        learnContact(peer, msg.senderPublicKey)
+        // The service verified the sender (MeshCore MAC, or outer.source == sender_public_key[:10] for
+        // native DMs); save the sender's key so we can reply even if it's not (yet) in our topology.
+        learnContact(peer, msg.senderPublicKey, isMeshCore = msg.fromMeshCore)
     }
 
     private suspend fun handleIncomingChannel(msg: ReceivedMessage) {
@@ -971,16 +994,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Saves/updates a contact's public key. Prefers an explicit key, else the topology key. */
-    private suspend fun learnContact(nodeHex: String, pub: ByteArray?) {
+    private suspend fun learnContact(nodeHex: String, pub: ByteArray?, isMeshCore: Boolean = false) {
         val topo = topology.value.firstOrNull { it.nodeId.toHex() == nodeHex }
         val key = pub?.takeIf { it.size == 32 } ?: topo?.publicKey?.takeIf { it.size == 32 } ?: return
         val existing = dao.contactByNode(nodeHex)
         val desc = topo?.description ?: existing?.description ?: ""
         dao.upsertContact(
             Contact(nodeHex, key.toHex(), desc, localName = existing?.localName.orEmpty(),
-                isMeshCore = existing?.isMeshCore ?: false, nameIsCustom = existing?.nameIsCustom ?: false),
+                isMeshCore = (existing?.isMeshCore ?: false) || isMeshCore,
+                nameIsCustom = existing?.nameIsCustom ?: false),
         )
     }
+
+    private fun sha256Hex(b: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(b).toHex()
 
     // ---- actions -------------------------------------------------------------
 

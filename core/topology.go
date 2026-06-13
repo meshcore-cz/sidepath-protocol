@@ -52,6 +52,15 @@ func (t *Topology) Update(n TopoNode) bool {
 // BFSPath returns the source-route path from `from` to `to` (excluding `from`, including `to`).
 // Returns nil if no path found.
 func (t *Topology) BFSPath(from, to NodeID) []NodeID {
+	return t.BFSPathFromSource(from, to, nil)
+}
+
+// BFSPathFromSource is BFSPath but seeds `from`'s adjacency with fromNeighbors. A node never
+// appears in its own topology (it doesn't process its own ANNOUNCE), so a plain BFS from LocalID
+// dead-ends immediately — every route would be nil and every unicast would silently flood. Passing
+// the local node's direct neighbor IDs here lets the search take its first hop and find real
+// multi-hop source routes (used by Router.SelectRoute with the local NeighborTable).
+func (t *Topology) BFSPathFromSource(from, to NodeID, fromNeighbors []NodeID) []NodeID {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -75,11 +84,15 @@ func (t *Topology) BFSPath(from, to NodeID) []NodeID {
 			}
 			return path
 		}
-		node, ok := t.nodes[cur]
-		if !ok {
-			continue
+		// Adjacency: topology entry's neighbors, plus the seeded neighbors for the source node.
+		var neighbors []NodeID
+		if node, ok := t.nodes[cur]; ok {
+			neighbors = node.Neighbors
 		}
-		for _, nb := range node.Neighbors {
+		if cur == from {
+			neighbors = append(append([]NodeID(nil), neighbors...), fromNeighbors...)
+		}
+		for _, nb := range neighbors {
 			if !visited[nb] {
 				visited[nb] = true
 				prev[nb] = cur

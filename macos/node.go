@@ -779,25 +779,43 @@ func (n *Node) SendBridgedAck(dst core.NodeID, bridgedID core.DatagramID, meshHa
 	return n.transmit(dg)
 }
 
-// MeshCoreNeighborForHash resolves a MeshCore node hash to a currently
-// reachable BLEEdge neighbor. MeshCore hashes are public-key prefixes.
-func (n *Node) MeshCoreNeighborForHash(hash []byte) (core.NodeID, bool) {
+// MeshCoreCandidatesForHash resolves a MeshCore node hash (a 1–2 byte public-key
+// prefix) to every BLEEdge node whose public key matches the prefix AND to which we
+// currently have a route — direct neighbors or multi-hop source routes via topology.
+//
+// MeshCore direct messages address the recipient by only the first byte(s) of its
+// public key, so the prefix can match multiple distinct nodes on our mesh. Returning
+// all of them lets the caller fan the message out to every plausible target; the
+// (wrong) recipients simply fail the MeshCore MAC check and drop it.
+func (n *Node) MeshCoreCandidatesForHash(hash []byte) []core.NodeID {
 	if len(hash) == 0 || len(hash) > core.PublicKeyBytes {
-		return core.NodeID{}, false
+		return nil
 	}
+	seen := make(map[core.NodeID]bool)
+	var out []core.NodeID
+	consider := func(id core.NodeID) {
+		if id == n.nodeID || seen[id] {
+			return
+		}
+		pub := n.router.PublicKeyFor(id)
+		if len(pub) < len(hash) || !bytes.Equal(pub[:len(hash)], hash) {
+			return
+		}
+		if len(n.router.SelectRoute(id)) == 0 {
+			return // no direct/source route to this node
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	// Neighbors first (covers inbound-only peers not yet in topology), then the wider
+	// topology for multi-hop reachable nodes.
 	for _, nb := range n.router.Neighbors.All() {
-		if !n.isReachablePeer(nb.ID) {
-			continue
-		}
-		pub := nb.PublicKey
-		if len(pub) != core.PublicKeyBytes {
-			pub = n.router.PublicKeyFor(nb.ID)
-		}
-		if len(pub) >= len(hash) && bytes.Equal(pub[:len(hash)], hash) {
-			return nb.ID, true
-		}
+		consider(nb.ID)
 	}
-	return core.NodeID{}, false
+	for _, tn := range n.router.Topology.Nodes() {
+		consider(tn.ID)
+	}
+	return out
 }
 
 // SendTyping sends an ephemeral "I'm typing" hint to dst (empty TYPING payload,

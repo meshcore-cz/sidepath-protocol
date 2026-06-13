@@ -129,9 +129,10 @@ type Config struct {
 type Bridge struct {
 	cfg Config
 
-	mu      sync.Mutex
-	seen    map[[32]byte]time.Time // content hash -> last-forwarded time (MeshCore -> BLEEdge)
-	seenOut map[string]time.Time   // BLEEdge datagram id hex -> last-bridged time (BLEEdge -> MeshCore)
+	mu         sync.Mutex
+	seen       map[[32]byte]time.Time // content hash -> last-forwarded time (MeshCore -> BLEEdge)
+	seenOut    map[string]time.Time   // BLEEdge datagram id hex -> last-bridged time (BLEEdge -> MeshCore)
+	seenRawOut map[[32]byte]time.Time // raw MeshCore packet hash -> last-injected time (BLEEdge -> MeshCore)
 }
 
 // New creates a Bridge from cfg, applying defaults.
@@ -145,7 +146,12 @@ func New(cfg Config) *Bridge {
 	if cfg.ReconnectDelay <= 0 {
 		cfg.ReconnectDelay = 2 * time.Second
 	}
-	return &Bridge{cfg: cfg, seen: make(map[[32]byte]time.Time), seenOut: make(map[string]time.Time)}
+	return &Bridge{
+		cfg:        cfg,
+		seen:       make(map[[32]byte]time.Time),
+		seenOut:    make(map[string]time.Time),
+		seenRawOut: make(map[[32]byte]time.Time),
+	}
 }
 
 func (b *Bridge) logf(format string, args ...any) {
@@ -249,6 +255,14 @@ func classify(raw []byte) (meshpkt.Packet, ForwardMode, []byte, string, error) {
 	// no routable target hash and would otherwise be skipped below).
 	if pkt.Type == meshpkt.PayloadAdvert {
 		return pkt, ForwardFlood, nil, "", nil
+	}
+	// Data-bearing direct messages (TXT_MSG etc.) are addressed by a 1-byte dest hash in their
+	// payload, INDEPENDENT of the MeshCore route mode: a sender with no known path emits a DM as
+	// RouteFlood, but it is still destined for a single node. Resolve BLEEdge candidates by that
+	// dest hash and deliver directly (the caller floods as a fallback when no candidate matches),
+	// rather than blindly flooding every FLOOD-routed DM.
+	if payloadCarriesDestHash(pkt.Type) && len(pkt.Payload) > 0 {
+		return pkt, ForwardDirect, []byte{pkt.Payload[0]}, "", nil
 	}
 	switch pkt.Route {
 	case meshpkt.RouteFlood, meshpkt.RouteTransportFlood:
@@ -444,6 +458,46 @@ func (b *Bridge) BridgeChannelOut(ctx context.Context, datagramIDHex string, cha
 	}
 	sum := sha256.Sum256(raw)
 	return sum[:8], true, nil
+}
+
+// shouldInjectRaw returns true the first time a given raw MeshCore packet (by content hash) is
+// offered for outbound injection within DedupTTL. A BLEEdge node's outbound MeshCore packet (e.g. a
+// DM ACK) reaches us over multiple BLEEdge paths as distinct datagrams carrying identical inner
+// bytes; this guarantees we inject it onto the radio at most once.
+func (b *Bridge) shouldInjectRaw(rawMeshBytes []byte) bool {
+	h := sha256.Sum256(rawMeshBytes)
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k, t := range b.seenRawOut {
+		if now.Sub(t) > b.cfg.DedupTTL {
+			delete(b.seenRawOut, k)
+		}
+	}
+	if t, ok := b.seenRawOut[h]; ok && now.Sub(t) <= b.cfg.DedupTTL {
+		return false
+	}
+	b.seenRawOut[h] = now
+	return true
+}
+
+// BridgeRawOut injects an opaque, fully-formed MeshCore OTA packet that originated on the BLEEdge
+// mesh (e.g. an ACK a BLEEdge node built for a received MeshCore DM) onto the real MeshCore radio,
+// exactly once per identical packet within DedupTTL. The bytes are passed verbatim to
+// send_mesh_packet; the bridge does not decode or alter them.
+//
+// Returns injected=false (nil error) when this packet was already injected recently.
+func (b *Bridge) BridgeRawOut(ctx context.Context, rawMeshBytes []byte) (injected bool, err error) {
+	if len(rawMeshBytes) == 0 {
+		return false, fmt.Errorf("empty MeshCore packet")
+	}
+	if !b.shouldInjectRaw(rawMeshBytes) {
+		return false, nil
+	}
+	if err := b.SendMeshPacket(ctx, 0, rawMeshBytes); err != nil {
+		return false, fmt.Errorf("send_mesh_packet: %w", err)
+	}
+	return true, nil
 }
 
 // SendMeshPacket injects an opaque, fully-formed MeshCore OTA packet onto the radio via the
