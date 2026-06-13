@@ -1,373 +1,232 @@
-# Sidepath Protocol — Bluetooth LE Coded PHY Mesh Transport PoC
+# Sidepath Protocol
 
-Sidepath Protocol is a proof-of-concept long-range BLE mesh transport layer using
-**LE Coded PHY** (S=8 coding, 125 kbps, ~4× standard range improvement).
-It consists of:
+> **A nearby mesh for when the usual path is not enough.**
 
-- A pure-Go routing engine with no Bluetooth dependencies (`core/`)
-- A Linux CLI daemon (`sidepath-listen`) using BlueZ D-Bus — **primary Long Range target**
-- A macOS CLI daemon (`sidepath-macos`) using CoreBluetooth — 1M PHY debug only
-- An in-memory Go simulator (`sidepath-simulate`) with no BLE hardware needed
-- A native Kotlin Android app with Jetpack Compose UI
+[Sidepath](docs/PROTOCOL.md) is an experimental local-first mesh protocol for nearby devices.
+
+Phones, computers, embedded boards, and small relays can discover each other and exchange packets directly over [Bluetooth Low Energy](https://www.bluetooth.com/learn-about-bluetooth/tech-overview/). Messages can travel across multiple hops without requiring internet access, cloud infrastructure, or a central server.
+
+```text
+phone  ↔  phone  ↔  relay  ↔  laptop  ↔  phone
+```
+
+Sidepath is useful on its own. It can power nearby chat, local services, sensors, and offline applications.
+
+It can also run alongside another network. A gateway may connect the nearby Sidepath mesh to a longer-range system such as [MeshCore](https://github.com/meshcore-dev):
+
+```text
+nearby Sidepath mesh  ↔  gateway  ↔  MeshCore LoRa mesh
+```
+
+The first implementation focuses on **BLE** and **MeshCore**, but the routing layer is designed to carry other [payload protocols](docs/PROTOCOL.md) as well.
 
 ---
 
-## Architecture
+## What can Sidepath do?
 
-```
-┌──────────────────────────────────────────────────────┐
-│                    core/                             │
-│  types.go   packet.go  fragment.go  dedup.go         │
-│  neighbor.go  topology.go  router.go                 │
-│  (pure Go, no BLE/OS dependencies)                   │
-└──────────────┬───────────────────────────────────────┘
-               │ imported by
-   ┌───────────┴──────────────┐
-   │                          │
-┌──▼──────────────┐  ┌──────────────────┐  ┌────────▼────────────────────────┐
-│ linux/          │  │ macos/           │  │ android/app/.../                 │
-│ adapter.go      │  │ node.go          │  │ core/     (Kotlin port)          │
-│ scanner.go      │  │ peer_link.go     │  │ ble/      (BLEManager etc.)      │
-│ gatt_server.go  │  │ (CoreBluetooth,  │  │ service/  (Sidepath service)     │
-│                 │  │  1M debug only)  │  │
-│ gatt_client.go  │  │ ui/       (Compose UI)           │
-│ peer_link.go    │  └─────────────────────────────────┘
-│ node.go         │
-└────────┬────────┘
-         │
-┌────────▼────────────────────────────────────────────┐
-│ cmd/sidepath-listen/main.go   (Linux CLI)            │
-│ cmd/sidepath-simulate/main.go (In-memory simulator)  │
-└────────────────────────────────────────────────────┘
+### Nearby communication without the cloud
+
+Devices can exchange messages directly with nearby peers and relay them across multiple hops.
+
+```text
+Alice  ↔  relay  ↔  Bob  ↔  Carol
 ```
 
-### Packet format
+This can be useful during outages, at events, inside buildings, while travelling, or anywhere a local network should remain useful without internet access.
 
-Packets are CBOR-encoded with compact integer keys (1–13) for cross-language
-interoperability between Go and Kotlin. A packet is fragmented into GATT frames
-(23-byte header + payload) for BLE transport.
+### Extend access to MeshCore
 
-### Routing
+A Sidepath gateway can connect nearby devices to a [MeshCore](https://github.com/meshcore-dev) LoRa network.
 
-Two modes:
-- **Flood** (TTL-limited): broadcast or unicast; all peers relay with random jitter (10–100 ms)
-- **Source Route**: explicit hop list; built from BFS over topology learned via ANNOUNCE packets
+```text
+phone  ↔  relay  ↔  gateway  ↔  MeshCore
+```
 
-Deduplication uses a PacketID cache (4096 entries, 5-minute TTL). Loop detection
-uses a `Trace` field appended at each hop.
+A user may reach the wider MeshCore network without carrying a directly connected LoRa radio.
 
-### PHY modes
+### Add lightweight relays
 
-| Mode | PHY used | Notes |
-|------|----------|-------|
-| `1m` | 1M legacy | **Default.** Universally supported for advertising *and* scanning |
-| `coded-only` | LE Coded (S=8) | Long Range; rejects connections on wrong PHY |
-| `coded-preferred` | LE Coded preferred | Falls back to 1M if peer doesn't support Coded |
+A small [BLE relay](firmware/xiao_esp32c6/) can extend the local mesh around a corner, through a building, or across an area with weak coverage.
 
-> **Note on Coded PHY (Long Range):** many devices report `isLeCodedPhySupported = true`
-> and can *advertise* on Coded PHY but cannot reliably *scan/receive* it, so two such
-> devices never discover each other in `coded-only`. Android exposes no API for the
-> coded *scan* capability. `1m` is therefore the default; Coded PHY is an opt-in
-> extension that needs a device with a known-good Coded-PHY receiver.
+Relays can be placed in homes, vehicles, cafés, hackerspaces, event venues, or other useful locations. They do not need to be full LoRa nodes.
+
+### Connect network islands
+
+Where useful, Sidepath can also [bridge](bridge/meshcore/) separate MeshCore coverage areas.
+
+```text
+MeshCore  ↔  gateway  ↔  Sidepath mesh  ↔  gateway  ↔  MeshCore
+```
+
+### Carry new applications
+
+Sidepath forwards opaque [payloads](docs/PROTOCOL.md). The routing layer does not need to understand the application data it carries.
+
+The current protocol includes:
+
+* Sidepath control messages
+* complete MeshCore packets
+* native [chat messages](docs/CHAT_PROTOCOL.md)
+* space for future and experimental payload protocols
 
 ---
 
-## Android Permissions
+## A node can run almost anywhere
 
-The app declares the following permissions in `AndroidManifest.xml`:
+A Sidepath node is not tied to one type of hardware.
 
-| Permission | API level | Reason |
-|---|---|---|
-| `BLUETOOTH` | ≤30 | Legacy BLE access on Android ≤11 |
-| `BLUETOOTH_ADMIN` | ≤30 | Legacy scan/advertise control on Android ≤11 |
-| `BLUETOOTH_SCAN` | 31+ | Required for all BLE scanning on Android 12+ |
-| `BLUETOOTH_CONNECT` | 31+ | Required to connect to GATT peers on Android 12+ |
-| `BLUETOOTH_ADVERTISE` | 31+ | Required for extended advertising (Coded PHY) |
-| `ACCESS_FINE_LOCATION` | ≤30 | Required by Android ≤11 for BLE scanning |
-| `FOREGROUND_SERVICE_CONNECTED_DEVICE` | 31+ | Required for foreground service type `connectedDevice` |
+It can run on:
 
----
+* phones and tablets
+* laptops and desktop computers
+* Linux servers and small gateways
+* Raspberry Pi and similar boards
+* routers and home-automation hosts
+* BLE-capable microcontrollers
+* battery-powered or solar-powered relays
+* sensors and other embedded devices
 
-## Android build and install
+Different devices can contribute in different ways. A phone may provide chat and routing. A fixed gateway may bridge into MeshCore. A constrained embedded board may act as a simple relay.
 
-### Prerequisites
-
-- Android Studio Hedgehog or later, or Android SDK command-line tools
-- JDK 17
-- Android device running API 26+ (Android 8.0+) with BLE support
-
-### Build
-
-```bash
-cd android
-./gradlew assembleDebug
-```
-
-The APK is produced at:
-```
-android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-### Install
-
-```bash
-adb install -r android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-### Verify LE Coded PHY support on device
-
-**In-app:** Open the app → Overview tab → Capabilities section → check "Coded PHY: yes".
-
-**Via ADB:**
-```bash
-adb shell dumpsys bluetooth_manager | grep -i "coded"
-# Look for: "le_coded_phy_support: true"
-```
-
-Or check the chipset datasheet for your device. Devices confirmed to support LE Coded PHY:
-- Qualcomm QCA6391 / QCA6490 (Snapdragon 865+, 888)
-- Samsung Exynos 2100 / 2200
-- MediaTek MT6893 (Dimensity 1200)
-
-**Note:** Not all Android 8+ phones support LE Coded PHY in hardware. Pixel 4 and
-older do **not**. Pixel 6+ (with Google Tensor), most 2021+ flagship Snapdragon devices do.
-In-app the app will show "Coded PHY support: no" and fall back to 1M PHY if `coded-only`
-mode is forced.
+The first embedded implementation currently targets the [XIAO ESP32-C6](firmware/xiao_esp32c6/), but the protocol is not specific to that board.
 
 ---
 
-## Linux build
+## How it works
 
-### Prerequisites
+Sidepath has three layers:
 
-- Go 1.22+
-- BlueZ 5.56+ (`bluetoothd --version`)
-- Linux kernel 5.4+ (for extended advertising / LE Coded PHY)
-- `btmgmt` utility (from BlueZ)
-- Either `sudo` or `CAP_NET_ADMIN + CAP_NET_RAW` capabilities on the binary
-
-```bash
-# Check BlueZ version
-bluetoothd --version
-
-# Check kernel version
-uname -r
+```text
+BLE GATT frame
+└── Sidepath datagram
+    └── Payload protocol
+        ├── Sidepath control
+        ├── MeshCore packet
+        ├── Sidepath chat
+        └── application-defined protocol
 ```
 
-### Build
+| Layer             | Responsibility                                            |
+| ----------------- | --------------------------------------------------------- |
+| BLE GATT frame    | Fragmentation, reassembly, and CRC validation             |
+| Sidepath datagram | Identity, routing, TTL, deduplication, and path recording |
+| Payload protocol  | Chat messages, encapsulated packets, or application data  |
 
-```bash
-go build -o sidepath-listen ./cmd/sidepath-listen
-```
+Sidepath currently supports:
 
-### Required capabilities
-
-Either run as root:
-```bash
-sudo ./sidepath-listen --adapter hci0
-```
-
-Or grant capabilities to the binary:
-```bash
-sudo setcap 'cap_net_admin+eip cap_net_raw+eip' ./sidepath-listen
-./sidepath-listen --adapter hci0
-```
-
-### Usage
-
-```
-sidepath-listen [flags]
-
-Flags:
-  --adapter      hci0             Bluetooth adapter (default: hci0)
-  --node-id      <hex>            8-byte NodeID in hex; loaded from ~/.sidepath/node-id if omitted
-  --phy          1m               PHY mode: 1m (default) | coded-only | coded-preferred
-  --allow-peer   <hex>            Allowed peer NodeID; repeatable; empty = allow all
-  --json                          Output log as JSON lines
-  --verbose                       Verbose logging
-```
+* TTL-limited flood routing
+* source routing over known topology
+* signed node announcements
+* compact Ed25519-based identities
+* acknowledgements and route diagnostics
+* forwarding of unknown payload protocols
 
 ---
 
-## macOS build
+## MeshCore integration
 
-> **Important:** macOS CoreBluetooth does **not** expose LE Coded PHY control,
-> and cannot broadcast manufacturer data as a peripheral. `sidepath-macos` always
-> operates in `1m` mode and is discovered by peers via its Sidepath service UUID.
-> It is useful for smoke-testing the routing engine and packet format, but
-> **cannot** be used as a node in the Long Range demonstration. Use
-> `sidepath-listen` on Linux for Coded PHY testing.
+[MeshCore](https://github.com/meshcore-dev) is the first external protocol carried over Sidepath.
 
-### Prerequisites
+A [gateway](bridge/meshcore/) can encapsulate a complete MeshCore packet, relay it through nearby Sidepath nodes, and inject it back into MeshCore at another reachable node.
 
-- Go 1.22+
-- macOS 12 Monterey or newer (CoreBluetooth with peripheral + central roles)
-- Xcode Command Line Tools (`xcode-select --install`) — required for CGo
-
-### Build
-
-```bash
-go build -o sidepath-macos ./cmd/sidepath-macos
+```text
+MeshCore packet
+      ↓
+Sidepath datagram
+      ↓
+BLE relay path
+      ↓
+MeshCore packet
 ```
 
-### Permissions
-
-macOS will prompt for Bluetooth access the first time the binary runs.
-If running in a terminal, grant access when prompted. If the prompt is suppressed,
-go to **System Settings → Privacy & Security → Bluetooth** and add Terminal (or
-your IDE) to the allowed apps list.
-
-### Usage
-
-```
-sidepath-macos [flags]
-
-Flags:
-  --node-id      <hex>    8-byte NodeID in hex; loaded from ~/.sidepath/node-id if omitted
-  --allow-peer   <hex>    Allowed peer NodeIDs, comma-separated; empty = allow all
-  --send         <text>   Send a broadcast text message 3 s after startup (smoke test)
-  --json                  Output log as JSON lines
-  --verbose               Log neighbor table every 30 s
-```
-
-### Example — smoke test with Android phone in 1m mode
-
-1. The Android app defaults to `1m` (no change needed; selectable on the Overview tab).
-2. Start the macOS listener:
-   ```bash
-   ./sidepath-macos --verbose
-   ```
-3. The app and the Mac will discover each other and connect.
-4. Send a message from the Android app — it should appear in the macOS log:
-   ```
-   15:04:05  deliver payload-type=1 payload="hello from android" trace=[...]
-   ```
-
-### What macOS CANNOT do
-
-- LE Coded PHY scanning or advertising
-- Reporting actual TX/RX PHY (CoreBluetooth does not expose this)
-- Acting as a relay in the Long Range A → B → Linux demonstration
+Sidepath does not partially reimplement MeshCore or modify its inner packet semantics. It simply gives the packet another way through.
 
 ---
 
-## Test scenarios
+## Current implementation
 
-### Scenario 1: Direct A → B test
+| Component                                          | Purpose                                    |
+| -------------------------------------------------- | ------------------------------------------ |
+| [`core/`](core/)                                   | Pure-Go routing engine                     |
+| [`docs/PROTOCOL.md`](docs/PROTOCOL.md)             | Sidepath v3 specification                  |
+| [`docs/CHAT_PROTOCOL.md`](docs/CHAT_PROTOCOL.md)   | Native chat payload specification          |
+| [`bridge/meshcore/`](bridge/meshcore/)             | MeshCore packet bridge                     |
+| [`android/`](android/)                             | Kotlin protocol libraries and Android apps |
+| [`linux/`](linux/)                                 | Linux BLE node using BlueZ                 |
+| [`macos/`](macos/)                                 | macOS development node                     |
+| [`firmware/xiao_esp32c6/`](firmware/xiao_esp32c6/) | ESP32-C6 relay firmware                    |
+| [`bots/`](bots/)                                   | JavaScript and TypeScript bot examples     |
+| [`cmd/sidepath-simulate`](cmd/sidepath-simulate/)  | In-memory simulator                        |
 
-On device A (Linux or Android), note the Node ID displayed at startup:
-```
-sidepath listener started node=aabbccdd11223344 phy=coded-only
-```
+The default transport uses the broadly compatible BLE **1M PHY**.
 
-On device B (Android), enter device A's Node ID in the Destination field and tap Send.
-
-Device A should log:
-```
-rx packet id=... source=... ttl=3
-deliver payload-type=1 payload="hello"
-send ack route=[...]
-```
-
-### Scenario 2: A → B → Linux relay
-
-Topology: `Android-A  ←LE Coded→  Android-B  ←LE Coded→  Linux-gateway`
-
-1. Start Linux gateway, note its Node ID (call it `gateway-id`):
-   ```bash
-   sudo ./sidepath-listen --adapter hci0 --phy coded-only --verbose
-   ```
-
-2. Start Android-B, add Android-A to its allowlist (or leave empty to allow all).
-
-3. On Android-A, enter `gateway-id` as destination and send.
-
-4. Android-B relays the flood packet to the Linux gateway.
-
-5. Linux gateway logs:
-   ```
-   scan found node=<android-b-addr> rssi=-72
-   connected peer=<android-b-id> tx-phy=coded rx-phy=coded
-   rx packet id=... source=<android-a-id> ttl=2
-   trace=[<android-a-id>, <android-b-id>]
-   deliver payload-type=text payload="hello relay"
-   send ack route=[<android-b-id>, <android-a-id>]
-   ```
-
-### Allowlist configuration (Linux)
-
-Only accept packets from specific Android nodes:
-```bash
-sudo ./sidepath-listen \
-  --allow-peer aabbccdd11223344 \
-  --allow-peer 1122334455667788 \
-  --phy coded-only
-```
+BLE Coded PHY can be enabled experimentally on supported hardware for longer-range tests. Hardware and operating-system support varies between devices.
 
 ---
 
-## Simulator
+## Useful links
 
-No BLE hardware required:
+* [Sidepath Protocol repository](https://github.com/meshcore-cz/sidepath-protocol)
+* [Sidepath protocol specification](docs/PROTOCOL.md)
+* [Sidepath chat payload specification](docs/CHAT_PROTOCOL.md)
+* [Meshward Android app source](android/chat-app/)
+* [Android protocol libraries](android/)
+* [ESP32-C6 relay firmware](firmware/xiao_esp32c6/)
+* [MeshCore project](https://github.com/meshcore-dev)
+* [MeshCore CZ organization](https://github.com/meshcore-cz)
+
+---
+
+## Try the simulator
+
+Explore the [routing engine](core/) without Bluetooth hardware:
 
 ```bash
 go run ./cmd/sidepath-simulate
 ```
 
-Runs 35 deterministic test scenarios covering flood routing, deduplication, TTL exhaustion,
-loop detection, source routing, BFS path calculation, fallback to flood, ACK via reversed
-trace, peer disconnect, topology expiration, and large payload fragmentation.
+Run the Go test suite:
 
----
-
-## Repository layout
-
-```
-go.mod                          Go module: github.com/meshcore-cz/sidepath-protocol
-core/                           Pure-Go routing engine (no BLE dependencies)
-  types.go                      NodeID, PacketType, PHY, Capabilities, etc.
-  packet.go                     CBOR encode/decode for Packet and AnnouncePayload
-  fragment.go                   GATT fragmentation / reassembly with CRC32
-  dedup.go                      Packet ID deduplication cache
-  neighbor.go                   Direct-link neighbor table
-  topology.go                   Global mesh topology with BFS path finding
-  router.go                     Routing decisions: flood, source route, ACK, announce
-  router_test.go                40 unit tests
-linux/                          BlueZ D-Bus bindings
-  adapter.go                    Adapter discovery, PHY capability check
-  scanner.go                    D-Bus ObjectManager scanning
-  advertiser.go                 LEAdvertisement1 D-Bus object
-  gatt_server.go                GATT application (GattService1 + 3 characteristics)
-  gatt_client.go                GATT client: connect, discover, subscribe
-  peer_link.go                  core.PeerLink implementation over GattClient
-  node.go                       Top-level node: scan, connect, route, announce
-cmd/
-  sidepath-listen/main.go        Linux CLI (BlueZ, LE Coded PHY)
-  sidepath-macos/main.go         macOS CLI (CoreBluetooth, 1M debug only)
-  sidepath-simulate/main.go      In-memory simulator (35 test scenarios)
-android/
-  settings.gradle
-  build.gradle
-  gradle.properties
-  sidepath-protocol/            Pure-Kotlin Sidepath protocol library
-  meshward-chat/                Pure-Kotlin Meshward payload protocol library
-  common/src/main/java/cz/meshcore/sidepath/
-    ble/                        BLEManager, Advertiser, Scanner, GattServer, GattClient, PeerLink
-    service/SidepathService.kt   Foreground service with StateFlows
-  chat-app/src/main/java/cz/meshcore/meshward/
-    ui/                         Compose UI, including ChatRoot
+```bash
+go test ./...
 ```
 
 ---
 
-## Known hardware limitations
+## Meshward
 
-- **LE Coded PHY** (LE Long Range) requires explicit hardware + driver support. It is part
-  of the Bluetooth 5.0 spec but optional. Not all BT 5.0 chips implement it.
-- Confirmed working on Android: Pixel 6/7/8 (Tensor), Samsung Galaxy S21+/S22+ (Exynos/Snapdragon 888).
-- **Not** supported on: Pixel 4/4a, most mid-range Snapdragon 7xx pre-2021.
-- On Linux: requires kernel ≥5.4 and BlueZ ≥5.56. Some USB BT adapters (CSR8510) do not
-  support extended HCI commands needed for Coded PHY scanning.
-- The raw HCI socket path for setting `LE_Set_Extended_Scan_Parameters` (OGF=0x08, OCF=0x0041)
-  and `LE_Set_PHY` (OGF=0x08, OCF=0x0031) is partially stubbed with `// TODO` comments —
-  BlueZ's own extended scan support handles this when kernel and adapter support it.
+[**Meshward**](android/chat-app/) is the first chat app built on Sidepath.
+
+It combines nearby Sidepath communication with optional MeshCore connectivity. Meshward uses the native [Sidepath chat payload](docs/CHAT_PROTOCOL.md).
+
+---
+
+## Status
+
+Sidepath is experimental and under active development.
+
+The initial scope is intentionally focused:
+
+```text
+Sidepath Protocol
+├── nearby multi-hop communication
+├── Bluetooth Low Energy transport
+├── native chat payloads
+├── MeshCore packet bridging
+├── Android, Linux, and macOS nodes
+└── ESP32-C6 relay firmware
+```
+
+Expect protocol changes and hardware-specific limitations while the project evolves.
+
+---
+
+## Vision
+
+A useful network should not depend on one radio, one route, one class of device, or a permanent connection to the cloud.
+
+A phone can relay a message.
+A tiny board can extend the path.
+A gateway can connect the local mesh to MeshCore.
+
+> **Sidepath gives packets another way through.**
