@@ -116,6 +116,24 @@ object MeshCoreCodec {
         o.optString("hex", "").takeIf { it.isNotEmpty() }?.hexToBytes()
     }.getOrNull()
 
+    /**
+     * Builds a MeshCore TXT_MSG (direct message) OTA packet addressed to [peerPub], encrypted with
+     * the firmware-compatible shared secret derived from our identity [seed] (meshpkt op
+     * `encodeDirectTextIdentity`). Returns the raw OTA packet bytes, or null on error.
+     */
+    fun encodeDirectText(seed: ByteArray, peerPub: ByteArray, text: String, timestampSec: Long, attempt: Int): ByteArray? = runCatching {
+        val args = JSONArray()
+            .put(seed.toHex())
+            .put(peerPub.toHex())
+            .put(text)
+            .put(timestampSec)
+            .put(attempt)
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("encodeDirectTextIdentity", args.toString())
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        o.optString("hex", "").takeIf { it.isNotEmpty() }?.hexToBytes()
+    }.getOrNull()
+
     /** Pure JSON→[MeshCoreAdvert] mapping (host-testable). Returns null on error/bad shape. */
     fun parseAdvertJson(json: String): MeshCoreAdvert? = runCatching {
         val o = JSONObject(json)

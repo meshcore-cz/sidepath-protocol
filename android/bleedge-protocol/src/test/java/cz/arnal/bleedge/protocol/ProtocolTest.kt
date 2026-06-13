@@ -93,6 +93,22 @@ class ProtocolTest {
         assertTrue(topo.update(node(2, 0)))    // higher epoch wins even with lower seq
     }
 
+    @Test fun selectRouteFindsMultiHopViaLocalNeighbors() {
+        // A node is never in its own topology, so selectRoute must seed BFS with its direct
+        // neighbors to find a multi-hop source route (§10.4).
+        val local = Identity.fromSeed(seed(60))
+        val relay = Identity.fromSeed(seed(61)).nodeId
+        val dst = Identity.fromSeed(seed(62)).nodeId
+        val r = Router(local)
+        r.neighbors.upsert(NeighborEntry(id = relay)) // directly connected to the relay only
+        r.topology.update(TopoNode(relay, ByteArray(32), Capabilities(1), listOf(local.nodeId, dst), 1, 1, 0))
+        r.topology.update(TopoNode(dst, ByteArray(32), Capabilities(1), listOf(relay), 1, 1, 0))
+
+        assertEquals(listOf(relay, dst), r.selectRoute(dst))
+        assertEquals(listOf(relay), r.selectRoute(relay))
+        assertNull(r.selectRoute(Identity.fromSeed(seed(69)).nodeId))
+    }
+
     @Test fun routerFloodDeliversAndRelays() {
         val a = Identity.fromSeed(seed(20))
         val relay = Router(Identity.fromSeed(seed(21)))

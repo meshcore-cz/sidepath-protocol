@@ -659,12 +659,18 @@ A source-routed datagram MUST NOT be flood-relayed if its next hop is unavailabl
 To send a unicast datagram to `destination`:
 
 1. if destination is a direct neighbor, use `route = [destination]`;
-2. otherwise run BFS over the learned topology graph;
+2. otherwise run BFS over the learned topology graph, using the originating node's
+   **own neighbor table** as the source node's adjacency. A node never appears in
+   its own topology (it does not process its own `ANNOUNCE`), so its first hop MUST
+   be taken from the neighbor table — a BFS that only reads topology adjacency would
+   dead-end at the source and find no multi-hop route;
 3. if a path is known, use that complete route including destination; and
 4. if no path is known, MAY fall back to flood routing for protocols that permit
    flooding.
 
 Applications MAY require an explicit known route and disable fallback flooding.
+Constrained flood-only nodes (e.g. the ESP32 relay) do not perform route selection
+and always flood; this is conformant.
 
 ---
 

@@ -1211,10 +1211,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val service = _service.value ?: return
         stopTyping(peerHex)
         viewModelScope.launch {
+            val contact = dao.contactByNode(peerHex)
+            val pub = contact?.pubKeyHex?.takeIf { it.length == 64 }?.hexToBytes()
+            // A MeshCore contact is reached over the bridge as a MeshCore TXT_MSG (not a native
+            // encrypted BLEEdge DM). Delivery (✓✓) comes from the radio ACK via the same isAck path.
+            if (contact?.isMeshCore == true && pub != null) {
+                val id = service.sendMeshCoreDirect(pub, body)
+                dao.insertMessage(
+                    Message(
+                        id = id?.toHex() ?: newId(),
+                        peerHex = peerHex,
+                        senderHex = nodeId.value.toHex(),
+                        incoming = false,
+                        text = body,
+                        timestampMs = System.currentTimeMillis(),
+                        status = if (id == null) MsgStatus.FAILED else MsgStatus.SENT,
+                        viaMeshCore = true,
+                        packetHex = id?.let { service.originatedPacketHex(it.toHex()) }.orEmpty(),
+                    )
+                )
+                return@launch
+            }
             val dst = NodeId.fromHex(peerHex)
             // Resolve the recipient's key from the saved contact (learned from a received DM
             // or the picker), falling back to topology inside the service.
-            val pub = dao.contactByNode(peerHex)?.pubKeyHex?.takeIf { it.length == 64 }?.hexToBytes()
             val id = service.sendChat(body, dst, pub, floodTtl = _floodTtl.value)
             dao.insertMessage(
                 Message(

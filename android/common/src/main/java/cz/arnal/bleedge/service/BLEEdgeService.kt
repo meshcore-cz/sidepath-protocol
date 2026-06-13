@@ -351,6 +351,10 @@ class BLEEdgeService : Service() {
     // resolve the full sender key (from the 1-byte src hash) of an incoming MeshCore DM so it can
     // be decrypted; recently-heard adverts are also tried.
     @Volatile private var meshCoreContactKeys: List<ByteArray> = emptyList()
+    // Outgoing MeshCore DMs awaiting their radio ACK: expected ACK crc -> BLEEdge carrier dg id (the
+    // chat Message id). When a MeshCore ACK with a matching crc floods back in, the message is marked
+    // delivered. Bounded; one-shot (removed on match).
+    private val pendingMeshCoreAck = ConcurrentHashMap<Long, ByteArray>()
     // Content-level dedup for MeshCore side effects: the same logical MeshCore packet reaches us
     // via multiple LoRa paths / BLEEdge relays (each a distinct datagram), so we key on the stable
     // inner payload to ingest chat/discovery once while still counting every RX log sighting.
@@ -997,6 +1001,22 @@ class BLEEdgeService : Service() {
             }
         }
 
+        // MeshCore ACK: a recipient acked one of our outgoing MeshCore DMs. Match its crc against the
+        // pending map and mark the message delivered via the chat-app's normal ACK path.
+        if (env != null && env.type == MeshCoreType.ACK && env.payload.size >= 4) {
+            val crc = leUint32(env.payload)
+            pendingMeshCoreAck.remove(crc)?.let { dgId ->
+                log("meshcore ACK crc=%08x -> dg=${dgId.take(4).toHex()} delivered".format(crc), LogTag.MSG)
+                appendMessage(
+                    ReceivedMessage(
+                        fromNodeId = dg.source, datagramId = dg.id, protocol = dg.protocol,
+                        isAck = true, ackedId = dgId, path = dg.path, raw = dg.encode(),
+                        fromMeshCore = true, rssi = rssi,
+                    )
+                )
+            }
+        }
+
         val packet = MeshCorePacket(
             timestampMs = System.currentTimeMillis(),
             source = dg.source, datagramId = dg.id, path = dg.path,
@@ -1026,16 +1046,40 @@ class BLEEdgeService : Service() {
     /**
      * Floods an opaque, fully-formed MeshCore OTA packet onto the BLEEdge mesh as a broadcast
      * MESHCORE_PACKET datagram. A bridge node receives it and injects it onto the real MeshCore
-     * radio (see Bridge.BridgeRawOut). Used to return a DM ACK toward a MeshCore sender.
+     * radio (see Bridge.BridgeRawOut). Used to return a DM ACK toward a MeshCore sender and to send
+     * outgoing MeshCore DMs. Returns the BLEEdge carrier datagram id, or null if not initialized.
      */
-    fun sendMeshCoreRaw(bytes: ByteArray) {
-        val id = identity ?: return
+    fun sendMeshCoreRaw(bytes: ByteArray): ByteArray? {
+        val id = identity ?: return null
         val dg = Datagram(
             id = Datagram.newDatagramId(), source = id.nodeId, destination = NodeId.BROADCAST,
             ttl = BLEEdge.DEFAULT_FLOOD_TTL, protocol = PayloadProtocol.MESHCORE_PACKET, payload = bytes,
         )
         router.markOriginated(dg.id)
         transmit(dg)
+        return dg.id
+    }
+
+    /**
+     * Sends an outgoing MeshCore direct message to a MeshCore contact ([recipientPub] = their 32-byte
+     * Ed25519 key). Encodes a firmware-compatible TXT_MSG and floods it as a MESHCORE_PACKET so a
+     * bridge injects it onto the radio. Registers the expected ACK CRC so the returning MeshCore ACK
+     * flips the message to delivered. Returns the BLEEdge carrier datagram id (used as the chat
+     * Message id), or null on failure.
+     */
+    fun sendMeshCoreDirect(recipientPub: ByteArray, text: String): ByteArray? {
+        val id = identity ?: return null
+        if (recipientPub.size != 32) return null
+        val ts = System.currentTimeMillis() / 1000
+        val raw = MeshCoreCodec.encodeDirectText(id.seed, recipientPub, text, ts, 0) ?: return null
+        val dgId = sendMeshCoreRaw(raw) ?: return null
+        // The recipient's ACK carries crc = SHA256(ts|attempt&3|text|OUR pubkey)[:4]; map it back to
+        // this message so the inbound-ACK branch can mark it delivered.
+        val crc = MeshCoreDirect.ackCrc(ts, 0, text, id.publicKey)
+        if (pendingMeshCoreAck.size > 200) pendingMeshCoreAck.keys.take(80).forEach { pendingMeshCoreAck.remove(it) }
+        pendingMeshCoreAck[crc] = dgId
+        log("meshcore DM tx to=${recipientPub.copyOf(2).toHex()} crc=%08x dg=${dgId.take(4).toHex()}".format(crc), LogTag.MSG)
+        return dgId
     }
 
     private fun deliverControl(dg: Datagram, rxRssi: Int = RSSI_UNKNOWN) {
@@ -1572,5 +1616,9 @@ class BLEEdgeService : Service() {
 // ---- Extensions -------------------------------------------------------------
 
 private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
+/** Reads the first 4 bytes as a little-endian unsigned 32-bit value (MeshCore ACK crc). */
+private fun leUint32(b: ByteArray): Long =
+    (b[0].toLong() and 0xFF) or ((b[1].toLong() and 0xFF) shl 8) or
+        ((b[2].toLong() and 0xFF) shl 16) or ((b[3].toLong() and 0xFF) shl 24)
 private fun ByteArray.take(n: Int) = copyOfRange(0, minOf(n, size))
 private fun String.hexToByteArray() = ByteArray(length / 2) { substring(it * 2, it * 2 + 2).toInt(16).toByte() }

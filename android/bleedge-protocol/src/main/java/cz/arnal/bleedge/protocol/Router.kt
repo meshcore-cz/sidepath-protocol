@@ -200,7 +200,9 @@ class Router(val identity: Identity) {
      */
     fun selectRoute(dst: NodeId): List<NodeId>? {
         if (neighbors.get(dst) != null) return listOf(dst)
-        val path = topology.bfsPath(localId, dst)
+        // Seed the search with our direct neighbors: we're never in our own topology, so a plain
+        // BFS from localId would dead-end and never find a multi-hop source route.
+        val path = topology.bfsPathFromSource(localId, dst, neighbors.all().map { it.id })
         return if (path != null && path.isNotEmpty()) path else null
     }
 

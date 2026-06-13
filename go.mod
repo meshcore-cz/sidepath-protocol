@@ -10,7 +10,7 @@ require (
 	github.com/go-ble/ble v0.0.0-20240122180141-8c5522f54333
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/mattn/go-runewidth v0.0.19
-	github.com/meshcore-cz/meshpkt v0.1.6
+	github.com/meshcore-cz/meshpkt v0.1.8
 	github.com/pkg/errors v0.8.1
 )
 

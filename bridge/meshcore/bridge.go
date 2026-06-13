@@ -234,7 +234,7 @@ func (b *Bridge) stream(ctx context.Context, forward func(Packet)) error {
 			b.logf("meshcore bridge: skip %s: %s", packetSummary(mesh, pkt.Bytes, 0, nil, pkt.RSSI, pkt.SNR), reason)
 			continue
 		}
-		if !b.shouldForwardPacket(mesh, pkt.Bytes) {
+		if !b.shouldForwardPacket(mesh) {
 			continue
 		}
 		forwardPkt := Packet{Bytes: pkt.Bytes, Mesh: mesh, Mode: mode, TargetHash: target, SNR: pkt.SNR, RSSI: pkt.RSSI, At: pkt.Timestamp}
@@ -385,10 +385,9 @@ func allZero(b []byte) bool {
 	return true
 }
 
-// shouldForward returns true if this packet's content has not been forwarded
-// within DedupTTL. It also opportunistically prunes expired entries.
-func (b *Bridge) shouldForward(otaBytes []byte) bool {
-	h := sha256.Sum256(otaBytes)
+// shouldForwardDigest returns true if a packet with this content digest has not
+// been forwarded within DedupTTL. It also opportunistically prunes expired entries.
+func (b *Bridge) shouldForwardDigest(digest [32]byte) bool {
 	now := time.Now()
 
 	b.mu.Lock()
@@ -398,18 +397,24 @@ func (b *Bridge) shouldForward(otaBytes []byte) bool {
 			delete(b.seen, k)
 		}
 	}
-	if t, ok := b.seen[h]; ok && now.Sub(t) <= b.cfg.DedupTTL {
+	if t, ok := b.seen[digest]; ok && now.Sub(t) <= b.cfg.DedupTTL {
 		return false
 	}
-	b.seen[h] = now
+	b.seen[digest] = now
 	return true
 }
 
-func (b *Bridge) shouldForwardPacket(pkt meshpkt.Packet, otaBytes []byte) bool {
+// shouldForwardPacket decides whether an inbound MeshCore packet should be forwarded into BLEEdge.
+// Deduplication keys on the route-independent CoreScope-compatible content digest
+// (meshpkt.ContentDigest), so the same logical packet arriving over different routes, paths, or
+// transport encodings is forwarded only once. The packet is already decoded by classify, so it is
+// not parsed again here. ADVERTs are node announcements and bypass content dedup — repeated adverts
+// must keep propagating so nodes stay discoverable.
+func (b *Bridge) shouldForwardPacket(pkt meshpkt.Packet) bool {
 	if pkt.Type == meshpkt.PayloadAdvert {
 		return true
 	}
-	return b.shouldForward(otaBytes)
+	return b.shouldForwardDigest(meshpkt.ContentDigest(pkt))
 }
 
 // shouldBridgeOut returns true the first time a given BLEEdge channel datagram (keyed by its id
@@ -437,7 +442,8 @@ func (b *Bridge) shouldBridgeOut(datagramIDHex string) bool {
 // so it is wrapped verbatim in a flood OTA packet and injected via send_mesh_packet.
 //
 // Returns bridged=false (with nil error) when this datagram id was already bridged. On success it
-// returns a short hash of the emitted OTA packet for the ACK_BRIDGED correlation id.
+// returns the CoreScope-compatible short MeshCore content hash of the emitted packet, used as the
+// ACK_BRIDGED correlation id.
 func (b *Bridge) BridgeChannelOut(ctx context.Context, datagramIDHex string, channelPayload []byte) (meshHash []byte, bridged bool, err error) {
 	if len(channelPayload) == 0 {
 		return nil, false, fmt.Errorf("empty channel payload")
@@ -456,14 +462,22 @@ func (b *Bridge) BridgeChannelOut(ctx context.Context, datagramIDHex string, cha
 	if err := b.SendMeshPacket(ctx, 0, raw); err != nil {
 		return nil, false, fmt.Errorf("send_mesh_packet: %w", err)
 	}
-	sum := sha256.Sum256(raw)
-	return sum[:8], true, nil
+	hash, err := meshpkt.DecodeContentHash(raw)
+	if err != nil {
+		return nil, false, fmt.Errorf("compute MeshCore content hash: %w", err)
+	}
+	return hash[:], true, nil
 }
 
-// shouldInjectRaw returns true the first time a given raw MeshCore packet (by content hash) is
-// offered for outbound injection within DedupTTL. A BLEEdge node's outbound MeshCore packet (e.g. a
-// DM ACK) reaches us over multiple BLEEdge paths as distinct datagrams carrying identical inner
-// bytes; this guarantees we inject it onto the radio at most once.
+// shouldInjectRaw returns true the first time a given raw MeshCore packet is offered for outbound
+// injection within DedupTTL. A BLEEdge node's outbound MeshCore packet (e.g. a DM ACK) reaches us
+// over multiple BLEEdge paths as distinct datagrams carrying identical inner bytes; this guarantees
+// we inject it onto the radio at most once.
+//
+// This is INTENTIONALLY a hash of the exact raw OTA wire bytes (sha256.Sum256(rawMeshBytes)), NOT
+// the route-independent logical content hash (meshpkt.ContentHash) used for inbound dedup. Its job
+// is to suppress re-injecting the identical byte-for-byte wire packet; two logically-equal packets
+// with different routes/paths are distinct wire representations and may legitimately be injected.
 func (b *Bridge) shouldInjectRaw(rawMeshBytes []byte) bool {
 	h := sha256.Sum256(rawMeshBytes)
 	now := time.Now()

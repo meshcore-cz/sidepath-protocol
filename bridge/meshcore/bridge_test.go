@@ -1,13 +1,37 @@
 package meshcore
 
 import (
-	"crypto/sha256"
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/hex"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/meshcore-cz/meshpkt"
 )
+
+func hexBytes(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("bad hex %q: %v", s, err)
+	}
+	return b
+}
+
+func decodePkt(t *testing.T, hexStr string) meshpkt.Packet {
+	t.Helper()
+	pkt, err := meshpkt.DecodePacket(hexBytes(t, hexStr))
+	if err != nil {
+		t.Fatalf("DecodePacket(%s): %v", hexStr, err)
+	}
+	return pkt
+}
 
 func TestClassifyFloodPacket(t *testing.T) {
 	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
@@ -133,26 +157,36 @@ func TestClassifyDirectAdvertIsFlooded(t *testing.T) {
 	}
 }
 
-func TestShouldForwardDedup(t *testing.T) {
+// Inbound dedup keys on the route-independent CoreScope content digest: route variants of the same
+// logical packet forward only once, a different payload forwards, and an expired entry forwards again.
+func TestShouldForwardDedupByContentDigest(t *testing.T) {
 	b := New(Config{DedupTTL: time.Hour})
-	packet := []byte{0x11, 1, 2, 3}
-	other := []byte{0x11, 9, 9, 9}
 
-	if !b.shouldForward(packet) {
+	// Three route variants of the same logical GRP_TXT payload (aabbcc): FLOOD, DIRECT w/ path, and
+	// TRANSPORT_FLOOD w/ transport codes.
+	flood := decodePkt(t, "1500aabbcc")
+	direct := decodePkt(t, "164211223344aabbcc")
+	transport := decodePkt(t, "140102030400aabbcc")
+
+	if !b.shouldForwardPacket(flood) {
 		t.Fatal("first sighting should forward")
 	}
-	if b.shouldForward(packet) {
-		t.Fatal("identical packet within TTL should be suppressed")
+	if b.shouldForwardPacket(direct) {
+		t.Fatal("DIRECT route variant of the same content must be suppressed")
 	}
-	if !b.shouldForward(other) {
-		t.Fatal("a different packet should forward")
+	if b.shouldForwardPacket(transport) {
+		t.Fatal("TRANSPORT route variant of the same content must be suppressed")
 	}
 
-	// Expire the dedup entry and confirm it forwards again.
-	h := sha256.Sum256(packet)
-	b.seen[h] = time.Now().Add(-2 * time.Hour)
-	if !b.shouldForward(packet) {
-		t.Fatal("packet past TTL should forward again")
+	// A different logical payload forwards.
+	if !b.shouldForwardPacket(decodePkt(t, "1500aabbcd")) {
+		t.Fatal("a different content should forward")
+	}
+
+	// Expire the content-hash entry and confirm it forwards again.
+	b.seen[meshpkt.ContentDigest(flood)] = time.Now().Add(-2 * time.Hour)
+	if !b.shouldForwardPacket(flood) {
+		t.Fatal("content past TTL should forward again")
 	}
 }
 
@@ -175,11 +209,67 @@ func TestClassifyAdvertBypassesForwardDedup(t *testing.T) {
 	}
 
 	b := New(Config{DedupTTL: time.Hour})
-	if !b.shouldForwardPacket(pkt, raw) {
+	if !b.shouldForwardPacket(pkt) {
 		t.Fatal("first advert should forward")
 	}
-	if !b.shouldForwardPacket(pkt, raw) {
+	if !b.shouldForwardPacket(pkt) {
 		t.Fatal("duplicate advert should bypass content dedup")
+	}
+}
+
+// BridgeChannelOut returns the CoreScope-compatible short (8-byte) MeshCore content hash of the
+// emitted GRP_TXT packet. Uses a fake meshcore-go backend socket that acks every request.
+func TestBridgeChannelOutReturnsContentHash(t *testing.T) {
+	// Short dir: macOS caps unix socket paths at ~104 bytes, and t.TempDir() embeds the long test name.
+	dir, err := os.MkdirTemp("", "mcb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "b.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = bufio.NewReader(c).ReadBytes('\n')
+				_, _ = c.Write([]byte("{\"id\":1,\"ok\":true}\n"))
+			}(conn)
+		}
+	}()
+
+	b := New(Config{Socket: sock, DedupTTL: time.Minute})
+	cp := hexBytes(t, "11aabbccddeeff0011223344")
+	hash, bridged, err := b.BridgeChannelOut(context.Background(), "dg-1", cp)
+	if err != nil {
+		t.Fatalf("BridgeChannelOut: %v", err)
+	}
+	if !bridged {
+		t.Fatal("expected bridged=true on first emit")
+	}
+	if len(hash) != 8 {
+		t.Fatalf("hash len = %d, want 8", len(hash))
+	}
+
+	// It must equal the shared content hash of the GRP_TXT packet that was emitted.
+	raw, err := meshpkt.EncodePacket(meshpkt.Packet{Type: meshpkt.PayloadGrpTxt, Route: meshpkt.RouteFlood, Payload: cp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := meshpkt.DecodeContentHash(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(hash, want[:]) {
+		t.Fatalf("hash = %x, want CoreScope content hash %x", hash, want)
 	}
 }
 
