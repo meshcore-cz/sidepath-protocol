@@ -457,7 +457,9 @@ private fun RenameDialog(
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var text by remember { mutableStateOf(current) }
+    // Start empty with the current name only as a placeholder — leaving it blank keeps the
+    // current name (no need to clear the field first just to rename).
+    var text by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (isChannel) "Rename channel" else "Rename contact") },
@@ -467,10 +469,11 @@ private fun RenameDialog(
                 onValueChange = { text = it },
                 singleLine = true,
                 label = { Text("Name") },
+                placeholder = { Text(current) },
             )
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(text) }, enabled = text.isNotBlank()) { Text("Save") }
+            TextButton(onClick = { if (text.isBlank()) onDismiss() else onConfirm(text) }) { Text("Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )

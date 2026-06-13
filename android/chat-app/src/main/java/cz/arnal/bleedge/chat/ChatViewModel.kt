@@ -733,10 +733,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     if (!processed.add("disc:mc:${a.publicKeyHex}:${a.timestampSec}")) continue
                     val heardMs = System.currentTimeMillis()
                     val nodeAdvertisedMs = if (a.timestampSec > 0) a.timestampSec * 1000 else 0L
+                    val nodeHex = a.publicKeyHex.take(20) // BLEEdge-style NodeId = pubkey[:10]
+                    val advertName = a.name.ifBlank { nameFromPubKey(a.publicKeyHex) }
+                    // If this node is already a saved contact, refresh its name from the advert
+                    // (unless the user has manually renamed it) so a name change propagates.
+                    dao.refreshMeshCoreName(nodeHex, advertName)
                     upsertDiscovered(
                         pubKeyHex = a.publicKeyHex,
-                        nodeHex = a.publicKeyHex.take(20), // BLEEdge-style NodeId = pubkey[:10]
-                        name = a.name.ifBlank { nameFromPubKey(a.publicKeyHex) },
+                        nodeHex = nodeHex,
+                        name = advertName,
                         source = DiscoverySource.MESHCORE,
                         nodeType = a.nodeType,
                         hasGps = a.hasGps,
@@ -973,7 +978,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val desc = topo?.description ?: existing?.description ?: ""
         dao.upsertContact(
             Contact(nodeHex, key.toHex(), desc, localName = existing?.localName.orEmpty(),
-                isMeshCore = existing?.isMeshCore ?: false),
+                isMeshCore = existing?.isMeshCore ?: false, nameIsCustom = existing?.nameIsCustom ?: false),
         )
     }
 
@@ -985,7 +990,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val existing = dao.contactByNode(node.nodeHex)
             dao.upsertContact(
                 Contact(node.nodeHex, node.pubKeyHex, node.description,
-                    localName = existing?.localName.orEmpty(), isMeshCore = existing?.isMeshCore ?: false),
+                    localName = existing?.localName.orEmpty(), isMeshCore = existing?.isMeshCore ?: false,
+                    nameIsCustom = existing?.nameIsCustom ?: false),
             )
         }
     }
@@ -1007,11 +1013,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 ?: ""
             val isMeshCore = existing?.isMeshCore ?: (disc?.source == DiscoverySource.MESHCORE)
             // Keep a chosen alias; else seed a MeshCore node's advertised name as the local name.
+            // A seeded advert name is not "custom", so later adverts can refresh it.
             val localName = existing?.localName?.takeIf { it.isNotBlank() }
                 ?: disc?.name?.takeIf { isMeshCore && it.isNotBlank() }
                 ?: ""
             dao.upsertContact(
-                Contact(peerHex, pub, existing?.description.orEmpty(), localName = localName, isMeshCore = isMeshCore),
+                Contact(peerHex, pub, existing?.description.orEmpty(), localName = localName,
+                    isMeshCore = isMeshCore, nameIsCustom = existing?.nameIsCustom ?: false),
             )
         }
     }
@@ -1102,7 +1110,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 ?: ""
             dao.upsertContact(
                 Contact(nodeHex, pub, existing?.description.orEmpty(), localName = newName.trim(),
-                    isMeshCore = existing?.isMeshCore ?: false),
+                    isMeshCore = existing?.isMeshCore ?: false, nameIsCustom = true),
             )
         }
     }
@@ -1297,7 +1305,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val existing = dao.contactByNode(nodeHex)
                 dao.upsertContact(
                     Contact(nodeHex, c.publicKeyHex, existing?.description.orEmpty(), localName = c.name,
-                        isMeshCore = existing?.isMeshCore ?: false),
+                        isMeshCore = existing?.isMeshCore ?: false, nameIsCustom = true),
                 )
             }
             _pendingOpenPeer.value = nodeHex

@@ -128,9 +128,13 @@ data class Contact(
     @PrimaryKey val nodeHex: String,
     val pubKeyHex: String,
     val description: String,
-    // A user-chosen local alias (from Rename). Overrides the node's wire/derived name in all
-    // views; empty means "use the node's advertised name". Distinct from [description].
+    // A user-chosen local alias (from Rename) OR a MeshCore node's last advertised name. Overrides
+    // the node's wire/derived name in all views; empty means "use the node's advertised name".
+    // Distinct from [description].
     val localName: String = "",
+    // True if [localName] was set by the user (Rename / shared QR) rather than seeded from a
+    // MeshCore advert. A manual name is pinned; an advert-seeded name is refreshed by later adverts.
+    val nameIsCustom: Boolean = false,
     // True if this contact was added from a bridged MeshCore node. Such nodes aren't directly
     // reachable over BLEEdge (DMs to them will fail), but they're kept as full contacts so their
     // name resolves and they appear in Chats. Surfaced as a "MeshCore" label on the profile.

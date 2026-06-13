@@ -11,7 +11,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 // destructive migration wipes the v2 store. See docs/PROTOCOL.md migration §17.
 @Database(
     entities = [Message::class, Contact::class, Channel::class, DiscoveredContact::class, Reaction::class, Echo::class, MeshCoreHeard::class],
-    version = 15,
+    version = 16,
     exportSchema = false,
 )
 abstract class ChatDatabase : RoomDatabase() {
@@ -119,12 +119,23 @@ abstract class ChatDatabase : RoomDatabase() {
             }
         }
 
+        // v15→v16: distinguish a manually-set contact name from a MeshCore advert-seeded one, so
+        // later adverts can refresh the seeded name without overwriting a user's Rename. Additive.
+        private val MIGRATION_15_16 = object : Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE contacts ADD COLUMN nameIsCustom INTEGER NOT NULL DEFAULT 0")
+                // Existing non-blank names predate the advert-refresh feature; treat them as pinned
+                // so we don't suddenly overwrite a name the user may have chosen.
+                db.execSQL("UPDATE contacts SET nameIsCustom = 1 WHERE localName != ''")
+            }
+        }
+
         fun get(context: Context): ChatDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 ChatDatabase::class.java,
                 "bleedge_chat.db",
-            ).addMigrations(MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15)
+            ).addMigrations(MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16)
                 .fallbackToDestructiveMigration()
                 .build().also { instance = it }
         }

@@ -56,6 +56,17 @@ interface ChatDao {
     @Query("SELECT * FROM contacts WHERE nodeHex = :nodeHex LIMIT 1")
     suspend fun contactByNode(nodeHex: String): Contact?
 
+    /**
+     * Refreshes a MeshCore contact's display name from its latest advert. No-op unless the contact
+     * exists, came from MeshCore, and hasn't been manually renamed (nameIsCustom = 0), so a user's
+     * Rename is never overwritten.
+     */
+    @Query(
+        "UPDATE contacts SET localName = :name " +
+            "WHERE nodeHex = :nodeHex AND isMeshCore = 1 AND nameIsCustom = 0 AND localName != :name"
+    )
+    suspend fun refreshMeshCoreName(nodeHex: String, name: String)
+
     @Query("DELETE FROM contacts WHERE nodeHex = :nodeHex")
     suspend fun deleteContact(nodeHex: String)
 
