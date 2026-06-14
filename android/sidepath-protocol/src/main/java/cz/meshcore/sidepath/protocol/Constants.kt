@@ -8,7 +8,12 @@ object Sidepath {
     const val FRAME_VERSION: Int = 2
     const val DATAGRAM_VERSION: Int = 3
     const val NODE_INFO_VERSION: Int = 1
-    const val ANNOUNCE_VERSION: Int = 1
+    // Current (max) announce version we emit. v2 adds the optional trailing `bridges` section
+    // (§8.3). A node emits v1 (byte-identical to the original layout) when it has no bridges, and
+    // v2 only when it bridges one or more networks. Verifiers accept any version in
+    // [MIN_ANNOUNCE_VERSION]..[ANNOUNCE_VERSION] and reconstruct the signed bytes per that version.
+    const val ANNOUNCE_VERSION: Int = 2
+    const val MIN_ANNOUNCE_VERSION: Int = 1
 
     const val NODE_ID_BYTES: Int = 10
     const val DATAGRAM_ID_BYTES: Int = 16
@@ -41,6 +46,40 @@ object Sidepath {
     const val MAX_NAME_BYTES: Int = 64
     const val MAX_DESCRIPTION_BYTES: Int = 255
     const val MAX_PLATFORM_BYTES: Int = 64
+
+    // Announce v2 `bridges` limits (§8.3). A gateway advertises the external networks it bridges.
+    const val MAX_BRIDGES: Int = 8
+    const val MAX_NETWORK_CODE_BYTES: Int = 5
+}
+
+/**
+ * One external network a gateway node bridges, advertised in the v2 ANNOUNCE `bridges` array (§8.3).
+ * [code] is the short network code (e.g. "CZ", ≤[Sidepath.MAX_NETWORK_CODE_BYTES] bytes). Radio params
+ * are carried only when they differ from the code's canonical definition ([isCustom]); otherwise the
+ * receiver resolves them from its network-definitions dataset. [freqHz]/[bandwidthHz] are integer Hz
+ * (no float on the wire); [sf] is the spreading factor; [cr] is the N in coding rate 4/N.
+ */
+data class BridgeAd(
+    val code: String,
+    val freqHz: Long = 0L,
+    val bandwidthHz: Long = 0L,
+    val sf: Int = 0,
+    val cr: Int = 0,
+) {
+    /** True when this entry carries explicit radio params (they differ from the code's canonical set). */
+    val isCustom: Boolean get() = freqHz > 0L || bandwidthHz > 0L || sf > 0 || cr > 0
+
+    fun isValid(): Boolean {
+        val codeLen = code.toByteArray(Charsets.UTF_8).size
+        if (codeLen < 1 || codeLen > Sidepath.MAX_NETWORK_CODE_BYTES) return false
+        if (isCustom) {
+            // A custom entry must fully specify the radio params and keep them in range.
+            if (freqHz <= 0L || freqHz > 0xFFFFFFFFL) return false
+            if (bandwidthHz <= 0L || bandwidthHz > 0xFFFFFFFFL) return false
+            if (sf !in 5..12 || cr !in 5..8) return false
+        }
+        return true
+    }
 }
 
 /** Payload protocol registry values (§6.4). */

@@ -95,6 +95,9 @@ type Config struct {
 	Platform         string // OS/device string; empty = core.PlatformDescription()
 	Description      string // free-form bio for ANNOUNCE/NODE_INFO; default empty
 	Caps             core.Capabilities
+	// Bridges lists the external networks this gateway bridges, advertised in the v2 ANNOUNCE
+	// `bridges` section (§8.3). Non-empty makes the node emit v2 announces; empty keeps it on v1.
+	Bridges          []core.BridgeAd
 	Allowlist        []core.NodeID
 	Verbose          bool
 	AnnounceEpoch    uint64
@@ -119,6 +122,7 @@ func New(cfg Config) *Node {
 	router.Description = description
 	router.Name = name
 	router.Platform = platform
+	router.Bridges = cfg.Bridges
 	n := &Node{
 		nodeID:        cfg.Identity.NodeID(),
 		identity:      cfg.Identity,

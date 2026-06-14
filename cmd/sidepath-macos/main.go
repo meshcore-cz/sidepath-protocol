@@ -54,10 +54,15 @@ func main() {
 	meshcoreBridge := false
 	meshcoreSocket := ""
 	verbose := false
+	var bridgeSpecs []string
 	for i, arg := range os.Args[1:] {
 		switch {
 		case arg == "--verbose" || arg == "-v":
 			verbose = true
+		case strings.HasPrefix(arg, "--bridge="):
+			bridgeSpecs = append(bridgeSpecs, strings.TrimPrefix(arg, "--bridge="))
+		case arg == "--bridge" && i+1 < len(os.Args[1:]):
+			bridgeSpecs = append(bridgeSpecs, os.Args[i+2])
 		case arg == "--meshcore-bridge":
 			meshcoreBridge = true
 		case strings.HasPrefix(arg, "--meshcore-socket="):
@@ -99,6 +104,7 @@ Usage:
   sidepath-macos [--seed-hex <hex>] [--description <str>] [--allow-peer <id,...>] [--verbose]
   sidepath-macos --bot <script.ts> [--bun <path>] [--channels <name,...>]   # run as a bot driven by a Bun script
   sidepath-macos --meshcore-bridge [--meshcore-socket <path>]               # bridge MeshCore packets into the Sidepath mesh
+  sidepath-macos --bridge CZ [--bridge EU:869525000,250000,11,5]            # advertise the Meshcore Network(s) this node bridges (v2 ANNOUNCE)
 
 Interactive commands (type and press Enter):
   <text>             broadcast a message on the public channel
@@ -216,12 +222,29 @@ NOTE: macOS CoreBluetooth does NOT support LE Coded PHY.
 		}
 		emitBridge(fmt.Sprintf("%s  %s", time.Now().Format("15:04:05"), s))
 	}
+	// Parse bridged-network specs; advertising one (or more) sets the gateway capability so peers
+	// know this node bridges those networks, and emits them in the v2 ANNOUNCE.
+	var bridges []core.BridgeAd
+	for _, s := range bridgeSpecs {
+		b, err := core.ParseBridgeSpec(s)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --bridge %q: %v\n", s, err)
+			os.Exit(1)
+		}
+		bridges = append(bridges, b)
+	}
+	caps := core.Capabilities(core.CapSender | core.CapReceiver | core.CapRelay)
+	if len(bridges) > 0 {
+		caps |= core.Capabilities(core.CapGateway)
+	}
+
 	var br *mcbridge.Bridge
 	node = blenode.New(blenode.Config{
 		Identity:      identity,
 		Name:          nodeName,
 		Description:   description,
-		Caps:          core.Capabilities(core.CapSender | core.CapReceiver | core.CapRelay),
+		Caps:          caps,
+		Bridges:       bridges,
 		Allowlist:     allowlist,
 		Verbose:       verbose,
 		AnnounceEpoch: announceEpoch,

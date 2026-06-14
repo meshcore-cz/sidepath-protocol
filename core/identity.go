@@ -80,10 +80,24 @@ func appendString16(buf []byte, s string) []byte {
 	return append(buf, b...)
 }
 
-func AnnounceSignedMessage(pub []byte, epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string) []byte {
+// AnnounceSignedMessage builds the fixed binary layout the ANNOUNCE Ed25519 signature covers (§8.3):
+//
+//	magic "SIDEPATH-ANNOUNCE-V1\0" | version[1] | pub[32]
+//	| epoch[8 LE] | seq[4 LE] | timestamp[8 LE] | caps[2 LE]
+//	| neighbor_count[2 LE] | neighbors[count*10]
+//	| name_len[2 LE] | name | desc_len[2 LE] | desc | platform_len[2 LE] | platform
+//
+// When version >= 2 a trailing `bridges` section is appended:
+//
+//	bridge_count[2 LE] | per bridge: code_len[1] | code | flags[1]
+//	| if custom: freq_hz[4 LE] | bandwidth_hz[4 LE] | sf[1] | cr[1]
+//
+// The magic stays "SIDEPATH-ANNOUNCE-V1" (a domain-separation tag); the layout is selected by the
+// version field, so v1 announces sign byte-identically to the original layout.
+func AnnounceSignedMessage(pub []byte, epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string, version uint8, bridges []BridgeAd) []byte {
 	buf := make([]byte, 0, 128+len(neighbors)*NodeIDBytes+len(name)+len(desc)+len(platform))
 	buf = append(buf, asciiNul("SIDEPATH-ANNOUNCE-V1")...)
-	buf = append(buf, AnnounceVersion)
+	buf = append(buf, version)
 	buf = append(buf, pub...)
 	buf = appendLE64(buf, epoch)
 	buf = appendLE32(buf, seq)
@@ -96,18 +110,35 @@ func AnnounceSignedMessage(pub []byte, epoch uint64, seq uint32, timestamp int64
 	buf = appendString16(buf, name)
 	buf = appendString16(buf, desc)
 	buf = appendString16(buf, platform)
+	if version >= 2 {
+		buf = appendLE16(buf, uint16(len(bridges)))
+		for _, b := range bridges {
+			code := []byte(b.Code)
+			buf = append(buf, uint8(len(code)))
+			buf = append(buf, code...)
+			if b.IsCustom() {
+				buf = append(buf, 0x01)
+				buf = appendLE32(buf, uint32(b.FreqHz))
+				buf = appendLE32(buf, uint32(b.BandwidthHz))
+				buf = append(buf, uint8(b.SF))
+				buf = append(buf, uint8(b.CR))
+			} else {
+				buf = append(buf, 0x00)
+			}
+		}
+	}
 	return buf
 }
 
 // SignAnnounce signs the canonical announce message with this identity.
-func (id *Identity) SignAnnounce(epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string) []byte {
-	return ed25519.Sign(id.Priv, AnnounceSignedMessage(id.Pub, epoch, seq, timestamp, caps, neighbors, name, desc, platform))
+func (id *Identity) SignAnnounce(epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string, version uint8, bridges []BridgeAd) []byte {
+	return ed25519.Sign(id.Priv, AnnounceSignedMessage(id.Pub, epoch, seq, timestamp, caps, neighbors, name, desc, platform, version, bridges))
 }
 
 // VerifyAnnounce verifies an announce signature against the carried public key.
-func VerifyAnnounce(pub, sig []byte, epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string) bool {
+func VerifyAnnounce(pub, sig []byte, epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string, version uint8, bridges []BridgeAd) bool {
 	if len(pub) != ed25519.PublicKeySize || len(sig) != ed25519.SignatureSize {
 		return false
 	}
-	return ed25519.Verify(ed25519.PublicKey(pub), AnnounceSignedMessage(pub, epoch, seq, timestamp, caps, neighbors, name, desc, platform), sig)
+	return ed25519.Verify(ed25519.PublicKey(pub), AnnounceSignedMessage(pub, epoch, seq, timestamp, caps, neighbors, name, desc, platform, version, bridges), sig)
 }

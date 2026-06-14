@@ -46,8 +46,12 @@ class Identity private constructor(
         name: String,
         description: String,
         platform: String,
+        version: Int = Sidepath.ANNOUNCE_VERSION,
+        bridges: List<BridgeAd> = emptyList(),
     ): ByteArray {
-        val msg = announceSignedMessage(publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform)
+        val msg = announceSignedMessage(
+            publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform, version, bridges,
+        )
         val sig = ByteArray(Ed25519.SIGNATURE_SIZE)
         Ed25519.sign(seed, 0, msg, 0, msg.size, sig, 0)
         return sig
@@ -71,6 +75,14 @@ class Identity private constructor(
          *   | epoch[8 LE] | seq[4 LE] | timestamp[8 LE] | caps[2 LE]
          *   | neighbor_count[2 LE] | neighbors[count*10]
          *   | name_len[2 LE] | name | desc_len[2 LE] | desc | platform_len[2 LE] | platform
+         *
+         * When [version] >= 2 a trailing `bridges` section is appended (§8.3):
+         *
+         *   bridge_count[2 LE] | per bridge: code_len[1] | code | flags[1]
+         *   | if custom: freq_hz[4 LE] | bandwidth_hz[4 LE] | sf[1] | cr[1]
+         *
+         * The magic stays "SIDEPATH-ANNOUNCE-V1" (a domain-separation tag); the layout is selected
+         * by the [version] field, so v1 announces sign byte-identically to the original layout.
          */
         fun announceSignedMessage(
             publicKey: ByteArray,
@@ -82,13 +94,15 @@ class Identity private constructor(
             name: String,
             description: String,
             platform: String,
+            version: Int = Sidepath.ANNOUNCE_VERSION,
+            bridges: List<BridgeAd> = emptyList(),
         ): ByteArray {
             val nameB = name.toByteArray(Charsets.UTF_8)
             val descB = description.toByteArray(Charsets.UTF_8)
             val platB = platform.toByteArray(Charsets.UTF_8)
             val out = ByteArrayOutputStream()
             out.write(Wire.asciiNul("SIDEPATH-ANNOUNCE-V1"))
-            out.write(Sidepath.ANNOUNCE_VERSION)
+            out.write(version)
             out.write(publicKey)
             out.write(Wire.le64(epoch))
             out.write(Wire.le32(seq))
@@ -99,6 +113,21 @@ class Identity private constructor(
             out.write(Wire.le16(nameB.size)); out.write(nameB)
             out.write(Wire.le16(descB.size)); out.write(descB)
             out.write(Wire.le16(platB.size)); out.write(platB)
+            if (version >= 2) {
+                out.write(Wire.le16(bridges.size))
+                bridges.forEach { b ->
+                    val codeB = b.code.toByteArray(Charsets.UTF_8)
+                    out.write(codeB.size)
+                    out.write(codeB)
+                    out.write(if (b.isCustom) 0x01 else 0x00)
+                    if (b.isCustom) {
+                        out.write(Wire.le32(b.freqHz))
+                        out.write(Wire.le32(b.bandwidthHz))
+                        out.write(b.sf)
+                        out.write(b.cr)
+                    }
+                }
+            }
             return out.toByteArray()
         }
 
@@ -114,9 +143,13 @@ class Identity private constructor(
             name: String,
             description: String,
             platform: String,
+            version: Int = Sidepath.ANNOUNCE_VERSION,
+            bridges: List<BridgeAd> = emptyList(),
         ): Boolean {
             if (publicKey.size != Ed25519.PUBLIC_KEY_SIZE || signature.size != Ed25519.SIGNATURE_SIZE) return false
-            val msg = announceSignedMessage(publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform)
+            val msg = announceSignedMessage(
+                publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform, version, bridges,
+            )
             return runCatching { Ed25519.verify(signature, 0, publicKey, 0, msg, 0, msg.size) }.getOrDefault(false)
         }
 

@@ -36,6 +36,8 @@ func main() {
 	)
 	var allowPeers multiString
 	flag.Var(&allowPeers, "allow-peer", "Allowed peer NodeID (hex); repeatable; empty = allow all")
+	var bridgeFlags multiString
+	flag.Var(&bridgeFlags, "bridge", "External network this gateway bridges; repeatable. Format: CODE (canonical radio params) or CODE:freqHz,bwHz,sf,cr (custom). e.g. -bridge CZ or -bridge CZ:869525000,250000,11,5")
 	flag.Parse()
 
 	// Parse PHY mode
@@ -76,6 +78,17 @@ func main() {
 		allowlist = append(allowlist, id)
 	}
 
+	// Parse bridged networks
+	var bridges []core.BridgeAd
+	for _, s := range bridgeFlags {
+		b, err := core.ParseBridgeSpec(s)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid -bridge %q: %v\n", s, err)
+			os.Exit(1)
+		}
+		bridges = append(bridges, b)
+	}
+
 	cfg := linux.NodeConfig{
 		AdapterName: *adapterFlag,
 		Identity:    identity,
@@ -83,6 +96,7 @@ func main() {
 		Name:        *nameFlag,
 		PHYMode:     phyMode,
 		Allowlist:   allowlist,
+		Bridges:     bridges,
 		Verbose:     *verboseFlag,
 		JSONLog:     *jsonFlag,
 	}

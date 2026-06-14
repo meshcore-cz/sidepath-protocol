@@ -46,6 +46,37 @@ private fun shortList(obj: CBORObject?): List<Short> {
     return (0 until obj.size()).map { obj[k(it)].AsInt32().toShort() }
 }
 
+/** Encodes the v2 announce `bridges` array: each entry a map {1:code, [2:freqHz,3:bwHz,4:sf,5:cr]}. */
+private fun bridgeArray(bridges: List<BridgeAd>): CBORObject {
+    val arr = CBORObject.NewArray()
+    bridges.forEach { b ->
+        val m = CBORObject.NewOrderedMap()
+        m[k(1)] = CBORObject.FromObject(b.code)
+        if (b.isCustom) {
+            m[k(2)] = CBORObject.FromObject(b.freqHz)
+            m[k(3)] = CBORObject.FromObject(b.bandwidthHz)
+            m[k(4)] = CBORObject.FromObject(b.sf)
+            m[k(5)] = CBORObject.FromObject(b.cr)
+        }
+        arr.Add(m)
+    }
+    return arr
+}
+
+private fun bridgeList(obj: CBORObject?): List<BridgeAd> {
+    if (obj == null || obj.isNull || obj.isUndefined) return emptyList()
+    return (0 until obj.size()).map { i ->
+        val m = obj[k(i)]
+        BridgeAd(
+            code = m[k(1)].AsString(),
+            freqHz = m[k(2)]?.AsInt64Value() ?: 0L,
+            bandwidthHz = m[k(3)]?.AsInt64Value() ?: 0L,
+            sf = m[k(4)]?.AsInt32() ?: 0,
+            cr = m[k(5)]?.AsInt32() ?: 0,
+        )
+    }
+}
+
 /**
  * A signed ANNOUNCE body (§8.2). [neighbors] MUST be sorted lexicographically and
  * unique. The signature covers the fixed layout from [Identity.announceSignedMessage],
@@ -63,18 +94,25 @@ data class AnnounceBody(
     val description: String,
     val platform: String,
     val signature: ByteArray,
+    // v2 ANNOUNCE: the external networks this (gateway) node bridges. Empty on v1 and on non-gateways.
+    val bridges: List<BridgeAd> = emptyList(),
 ) {
     /** Verifies field-length limits, sorted/unique neighbors, and the Ed25519 signature (§8.4). */
     fun isValid(): Boolean {
-        if (announceVersion != Sidepath.ANNOUNCE_VERSION) return false
+        if (announceVersion < Sidepath.MIN_ANNOUNCE_VERSION || announceVersion > Sidepath.ANNOUNCE_VERSION) return false
         if (publicKey.size != Sidepath.PUBLIC_KEY_BYTES) return false
         if (neighbors.size > Sidepath.MAX_NEIGHBORS) return false
         if (name.toByteArray(Charsets.UTF_8).size > Sidepath.MAX_NAME_BYTES) return false
         if (description.toByteArray(Charsets.UTF_8).size > Sidepath.MAX_DESCRIPTION_BYTES) return false
         if (platform.toByteArray(Charsets.UTF_8).size > Sidepath.MAX_PLATFORM_BYTES) return false
         if (!neighborsSortedUnique()) return false
+        // Bridges only exist from v2; reject any carried on a v1 body, and bound/validate v2 entries.
+        if (announceVersion < 2 && bridges.isNotEmpty()) return false
+        if (bridges.size > Sidepath.MAX_BRIDGES) return false
+        if (bridges.any { !it.isValid() }) return false
         return Identity.verifyAnnounce(
             publicKey, signature, epoch, seq, timestamp, caps, neighbors, name, description, platform,
+            announceVersion, bridges,
         )
     }
 
@@ -100,6 +138,8 @@ data class AnnounceBody(
         map[k(9)] = CBORObject.FromObject(description)
         map[k(10)] = CBORObject.FromObject(platform)
         map[k(11)] = CBORObject.FromObject(signature)
+        // Only present on v2 gateway announces; absent keeps v1 bodies byte-for-byte unchanged.
+        if (bridges.isNotEmpty()) map[k(12)] = bridgeArray(bridges)
         return map
     }
 
@@ -116,9 +156,13 @@ data class AnnounceBody(
             description = body[k(9)].AsString(),
             platform = body[k(10)].AsString(),
             signature = body[k(11)].GetByteString(),
+            bridges = bridgeList(body[k(12)]),
         )
 
-        /** Builds and signs an announce body for [identity]. */
+        /**
+         * Builds and signs an announce body for [identity]. Emits v1 (byte-identical to the original
+         * layout) when [bridges] is empty, or v2 with the `bridges` section when it isn't.
+         */
         fun create(
             identity: Identity,
             epoch: Long,
@@ -129,12 +173,16 @@ data class AnnounceBody(
             name: String,
             description: String,
             platform: String,
+            bridges: List<BridgeAd> = emptyList(),
         ): AnnounceBody {
             val sorted = neighbors.distinctBy { it.toHex() }.sortedWith { a, b -> a.compareTo(b) }
-            val sig = identity.signAnnounce(epoch, seq, timestamp, caps, sorted, name, description, platform)
+            val version = if (bridges.isEmpty()) 1 else Sidepath.ANNOUNCE_VERSION
+            val sig = identity.signAnnounce(
+                epoch, seq, timestamp, caps, sorted, name, description, platform, version, bridges,
+            )
             return AnnounceBody(
-                Sidepath.ANNOUNCE_VERSION, identity.publicKey, epoch, seq, timestamp, caps,
-                sorted, name, description, platform, sig,
+                version, identity.publicKey, epoch, seq, timestamp, caps,
+                sorted, name, description, platform, sig, bridges,
             )
         }
     }

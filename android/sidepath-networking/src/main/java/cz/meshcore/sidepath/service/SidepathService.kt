@@ -37,6 +37,7 @@ import cz.meshcore.sidepath.protocol.BridgedBody
 import cz.meshcore.sidepath.protocol.Action
 import cz.meshcore.sidepath.protocol.ActionType
 import cz.meshcore.sidepath.protocol.AnnounceBody
+import cz.meshcore.sidepath.protocol.BridgeAd
 import cz.meshcore.sidepath.protocol.Sidepath
 import cz.meshcore.sidepath.protocol.Capabilities
 import cz.meshcore.sidepath.protocol.ControlKind
@@ -238,6 +239,8 @@ data class TopologyEntry(
     val description: String = "",
     val platform: String = "",
     val publicKey: ByteArray = ByteArray(0),
+    // External networks this node bridges (v2 ANNOUNCE, §8.3); empty for non-gateway nodes.
+    val bridges: List<BridgeAd> = emptyList(),
 )
 
 data class MeshStats(
@@ -1586,7 +1589,7 @@ class SidepathService : Service() {
             NeighborEntry(it.id, it.rssi, it.provisionalCaps, router.nameFor(it.id))
         }
         _knownTopology.value = router.topology.allNodes().map { tn ->
-            TopologyEntry(tn.id, tn.caps, tn.neighbors, tn.receivedAtMs, router.nameFor(tn.id), tn.description, tn.platform, tn.publicKey)
+            TopologyEntry(tn.id, tn.caps, tn.neighbors, tn.receivedAtMs, router.nameFor(tn.id), tn.description, tn.platform, tn.publicKey, tn.bridges)
         }
         updatePeersState()
     }

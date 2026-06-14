@@ -83,6 +83,7 @@ class Router(val identity: Identity) {
                 id = derived, publicKey = body.publicKey, caps = body.caps, neighbors = body.neighbors,
                 epoch = body.epoch, seq = body.seq, timestamp = body.timestamp,
                 name = body.name, description = body.description, platform = body.platform,
+                bridges = body.bridges,
             ),
         )
         return true

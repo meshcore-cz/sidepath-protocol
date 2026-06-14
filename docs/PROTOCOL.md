@@ -405,7 +405,7 @@ kind        = ANNOUNCE
 
 | Key | Field              | Type               | Required | Notes                                                                            |
 | --: | ------------------ | ------------------ | -------- | -------------------------------------------------------------------------------- |
-|   1 | `announce_version` | uint8              | yes      | Must equal `1`                                                                   |
+|   1 | `announce_version` | uint8              | yes      | `1`, or `2` when `bridges` is present (see §8.7)                                  |
 |   2 | `public_key`       | bytes(32)          | yes      | Ed25519 public key                                                               |
 |   3 | `epoch`            | uint64             | yes      | Persisted generation counter incremented before the first announce after startup |
 |   4 | `seq`              | uint32             | yes      | Monotonically increasing within one `epoch`                                      |
@@ -416,6 +416,7 @@ kind        = ANNOUNCE
 |   9 | `description`      | text               | yes      | Free-form description or empty string                                            |
 |  10 | `platform`         | text               | yes      | Platform string or empty string                                                  |
 |  11 | `signature`        | bytes(64)          | yes      | Ed25519 signature                                                                |
+|  12 | `bridges`          | array of map       | no       | External networks this gateway bridges; present only on `announce_version >= 2` (§8.7) |
 
 Constraints:
 
@@ -425,11 +426,16 @@ Constraints:
 | `name`        |                 64 UTF-8 bytes |
 | `description` |                255 UTF-8 bytes |
 | `platform`    |                 64 UTF-8 bytes |
+| `bridges`     |                      8 entries |
 
 `neighbors` MUST be sorted lexicographically and MUST NOT contain duplicates.
 
 An empty `name` means that peers SHOULD display the deterministic fallback name
 derived from `public_key`.
+
+`bridges` MUST be absent on a `announce_version == 1` body. A node emits
+`announce_version == 2` only when it advertises one or more bridges; otherwise it
+emits `announce_version == 1`, which is byte-identical to the original layout.
 
 ### 8.3 Announce signature message
 
@@ -456,6 +462,26 @@ platform_length        [2]   uint16 little-endian
 platform_utf8          [platform_length]
 ```
 
+When `announce_version >= 2`, the `bridges` section (§8.7) is appended to the
+signed bytes immediately after `platform_utf8`:
+
+```text
+bridge_count           [2]   uint16 little-endian
+  per bridge:
+    code_length        [1]   uint8 (1..MAX_NETWORK_CODE_BYTES)
+    code_utf8          [code_length]
+    flags              [1]   bit0 = has custom radio params
+    if custom:
+      freq_hz          [4]   uint32 little-endian
+      bandwidth_hz     [4]   uint32 little-endian
+      spreading_factor [1]   uint8
+      coding_rate      [1]   uint8 (the N in 4/N)
+```
+
+The magic stays `SIDEPATH-ANNOUNCE-V1\0` (it is a domain-separation tag, not a
+version selector); the layout is chosen by the `announce_version` field, so a v1
+announce signs byte-identically to the original layout.
+
 The signature is:
 
 ```text
@@ -467,15 +493,19 @@ signature = Ed25519.Sign(private_key, signed_bytes)
 Before accepting or relaying an announce, a verifying node MUST:
 
 1. decode the control payload and announce body;
-2. require `announce_version == 1`;
+2. require `announce_version` to be in `MIN_ANNOUNCE_VERSION..ANNOUNCE_VERSION`
+   (currently `{1, 2}`);
 3. require `public_key` to be exactly 32 bytes;
 4. derive `node_id = public_key[0:10]`;
 5. require outer datagram `source == node_id`;
 6. validate length limits;
 7. require the neighbor list to be sorted and unique;
-8. reconstruct the exact signed byte sequence;
-9. verify the Ed25519 signature; and
-10. reject the announce on any failure.
+8. reject any `bridges` on a v1 body, bound the array to `MAX_BRIDGES`, and
+   validate each entry (§8.7);
+9. reconstruct the exact signed byte sequence **for the carried
+   `announce_version`** (appending the `bridges` section when `>= 2`);
+10. verify the Ed25519 signature; and
+11. reject the announce on any failure.
 
 A valid announce MAY then update topology state and MAY be flood-relayed.
 
@@ -521,6 +551,43 @@ announce.
 
 Unknown capability bits MUST be preserved when storing or forwarding announces
 and MUST be ignored by implementations that do not understand them.
+
+### 8.7 Bridged networks (`bridges`, announce v2)
+
+A node that acts as a gateway to an external network (e.g. a MeshCore bridge)
+MAY advertise the networks it bridges so that hearing nodes can auto-detect which
+external network they are adjacent to. Such a node SHOULD set the `GATEWAY`
+capability and MUST emit `announce_version == 2` with a non-empty `bridges`
+array. The signature covers the bridges (§8.3), so the advertisement is
+authenticated.
+
+Each bridge entry is a CBOR map. Radio parameters are carried **only when they
+differ** from the network code's canonical definition; otherwise the receiver
+resolves them from its own network-definitions dataset by `code`.
+
+| Key | Field              | Type   | Required | Notes                                     |
+| --: | ------------------ | ------ | -------- | ----------------------------------------- |
+|   1 | `code`             | text   | yes      | Short network code, 1..`MAX_NETWORK_CODE_BYTES` UTF-8 bytes (e.g. `CZ`) |
+|   2 | `freq_hz`          | uint32 | no       | Carrier frequency in Hz; present only when custom |
+|   3 | `bandwidth_hz`     | uint32 | no       | Bandwidth in Hz; present only when custom         |
+|   4 | `spreading_factor` | uint8  | no       | LoRa SF, `7..12`; present only when custom        |
+|   5 | `coding_rate`      | uint8  | no       | The N in coding rate 4/N, `5..8`; present only when custom |
+
+An entry is **custom** when any of keys 2–5 is present. A custom entry MUST
+specify all four radio parameters and keep them in range; a non-custom entry MUST
+omit all four. Integer Hz are used (rather than floats) so the signed binary
+layout (§8.3) is byte-identical across implementations.
+
+Validation (part of §8.4): reject any `bridges` on a v1 body; reject more than
+`MAX_BRIDGES` entries; reject an entry whose `code` is empty or exceeds
+`MAX_NETWORK_CODE_BYTES`; and reject a custom entry with out-of-range or
+incompletely specified radio parameters.
+
+Radio parameters are display/identification metadata only; they MUST NOT be used
+to reconfigure a receiver's radio. The mapping from `code` to a full network
+definition (display name, canonical radio parameters, territory, links) is **not**
+part of this wire protocol — it is owned by the application's network-definitions
+dataset.
 
 ---
 
@@ -823,7 +890,10 @@ leave `name`, `description`, and `platform` empty to reduce exposed metadata.
 | `FRAME_VERSION`      |         `2` |
 | `DATAGRAM_VERSION`   |         `3` |
 | `NODE_INFO_VERSION`  |         `1` |
-| `ANNOUNCE_VERSION`   |         `1` |
+| `ANNOUNCE_VERSION`   |         `2` |
+| `MIN_ANNOUNCE_VERSION` |       `1` |
+| `MAX_BRIDGES`        |           `8` |
+| `MAX_NETWORK_CODE_BYTES` |       `5` |
 | `NODE_ID_BYTES`      |  `10` bytes |
 | `MAX_FRAME_SIZE`     | `200` bytes |
 | `MAX_FRAME_DATA`     | `177` bytes |
@@ -861,6 +931,8 @@ A conforming implementation MUST:
 * [ ] use `SIDEPATH_CONTROL` for native announces, ACKs, and traces;
 * [ ] sign every announce field except the signature itself;
 * [ ] verify the exact announce signature layout before trusting topology data;
+* [ ] accept `announce_version` in `{1, 2}` and reconstruct the signed bytes for
+  the carried version, appending the `bridges` section when `>= 2` (§8.7);
 * [ ] persist and increment `epoch` on startup and use `epoch` plus `seq` for announce freshness;
 * [ ] generate ACKs only when `ACK_REQUESTED` is set;
 * [ ] mark locally originated datagram IDs as seen before sending;

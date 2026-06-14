@@ -3,10 +3,43 @@ package core
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/fxamacker/cbor/v2"
 )
+
+// ParseBridgeSpec parses a CLI bridge spec into a BridgeAd. The format is either "CODE" (canonical
+// radio params, resolved by receivers from the code's definition) or "CODE:freqHz,bwHz,sf,cr" for
+// custom radio params that differ from the canonical set. e.g. "CZ" or "CZ:869525000,250000,11,5".
+func ParseBridgeSpec(s string) (BridgeAd, error) {
+	code, rest, custom := strings.Cut(s, ":")
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > MaxNetworkCodeBytes {
+		return BridgeAd{}, fmt.Errorf("network code must be 1..%d chars", MaxNetworkCodeBytes)
+	}
+	b := BridgeAd{Code: code}
+	if custom {
+		parts := strings.Split(rest, ",")
+		if len(parts) != 4 {
+			return BridgeAd{}, fmt.Errorf("custom params must be freqHz,bwHz,sf,cr")
+		}
+		freq, e1 := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 32)
+		bw, e2 := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 32)
+		sf, e3 := strconv.ParseUint(strings.TrimSpace(parts[2]), 10, 8)
+		cr, e4 := strconv.ParseUint(strings.TrimSpace(parts[3]), 10, 8)
+		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+			return BridgeAd{}, fmt.Errorf("custom params must be integers")
+		}
+		b.FreqHz, b.BandwidthHz, b.SF, b.CR = freq, bw, uint8(sf), uint8(cr)
+	}
+	if !b.Valid() {
+		return BridgeAd{}, fmt.Errorf("invalid bridge params (sf 5..12, cr 5..8)")
+	}
+	return b, nil
+}
 
 func NewDatagramID() DatagramID {
 	var id DatagramID
@@ -69,6 +102,47 @@ func DecodeControl(data []byte) (ControlMessage, error) {
 	return c, err
 }
 
+// BridgeAd is one external network a gateway node bridges, advertised in the v2 ANNOUNCE `bridges`
+// array (§8.3). Code is the short network code (e.g. "CZ", <= MaxNetworkCodeBytes). Radio params are
+// carried only when they differ from the code's canonical definition (IsCustom); otherwise the
+// receiver resolves them from its network-definitions dataset. FreqHz/BandwidthHz are integer Hz (no
+// float on the wire); SF is the spreading factor; CR is the N in coding rate 4/N. The radio keys are
+// present in CBOR only when custom.
+type BridgeAd struct {
+	Code        string `cbor:"1,keyasint"`
+	FreqHz      uint64 `cbor:"2,keyasint,omitempty"`
+	BandwidthHz uint64 `cbor:"3,keyasint,omitempty"`
+	SF          uint8  `cbor:"4,keyasint,omitempty"`
+	CR          uint8  `cbor:"5,keyasint,omitempty"`
+}
+
+// IsCustom reports whether this entry carries explicit radio params (they differ from the code's
+// canonical set).
+func (b BridgeAd) IsCustom() bool {
+	return b.FreqHz > 0 || b.BandwidthHz > 0 || b.SF > 0 || b.CR > 0
+}
+
+// Valid checks the code length and, for custom entries, that the radio params are fully specified
+// and in range.
+func (b BridgeAd) Valid() bool {
+	codeLen := len([]byte(b.Code))
+	if codeLen < 1 || codeLen > MaxNetworkCodeBytes {
+		return false
+	}
+	if b.IsCustom() {
+		if b.FreqHz == 0 || b.FreqHz > 0xFFFFFFFF {
+			return false
+		}
+		if b.BandwidthHz == 0 || b.BandwidthHz > 0xFFFFFFFF {
+			return false
+		}
+		if b.SF < 5 || b.SF > 12 || b.CR < 5 || b.CR > 8 {
+			return false
+		}
+	}
+	return true
+}
+
 type AnnounceBody struct {
 	AnnounceVersion uint8        `cbor:"1,keyasint"`
 	PublicKey       []byte       `cbor:"2,keyasint"`
@@ -81,6 +155,9 @@ type AnnounceBody struct {
 	Description     string       `cbor:"9,keyasint"`
 	Platform        string       `cbor:"10,keyasint"`
 	Signature       []byte       `cbor:"11,keyasint"`
+	// Bridges is present (CBOR k12) only on v2 gateway announces; omitempty keeps v1 bodies
+	// byte-for-byte unchanged. CBOR is transport; the signed binary (§8.3) is the authenticated form.
+	Bridges []BridgeAd `cbor:"12,keyasint,omitempty"`
 }
 
 func (a AnnounceBody) EncodeBody() ([]byte, error) { return cbor.Marshal(a) }
@@ -100,7 +177,7 @@ func DecodeAnnounceBody(raw []byte) (AnnounceBody, error) {
 }
 
 func (a AnnounceBody) Valid() bool {
-	if a.AnnounceVersion != AnnounceVersion {
+	if a.AnnounceVersion < MinAnnounceVersion || a.AnnounceVersion > AnnounceVersion {
 		return false
 	}
 	if len(a.PublicKey) != PublicKeyBytes || len(a.Signature) != SignatureBytes {
@@ -117,10 +194,24 @@ func (a AnnounceBody) Valid() bool {
 			return false
 		}
 	}
-	return VerifyAnnounce(a.PublicKey, a.Signature, a.Epoch, a.Seq, a.Timestamp, a.Caps, a.Neighbors, a.Name, a.Description, a.Platform)
+	// Bridges only exist from v2; reject any carried on a v1 body, and bound/validate v2 entries.
+	if a.AnnounceVersion < 2 && len(a.Bridges) > 0 {
+		return false
+	}
+	if len(a.Bridges) > MaxBridges {
+		return false
+	}
+	for _, b := range a.Bridges {
+		if !b.Valid() {
+			return false
+		}
+	}
+	return VerifyAnnounce(a.PublicKey, a.Signature, a.Epoch, a.Seq, a.Timestamp, a.Caps, a.Neighbors, a.Name, a.Description, a.Platform, a.AnnounceVersion, a.Bridges)
 }
 
-func NewAnnounceBody(id *Identity, epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string) AnnounceBody {
+// NewAnnounceBody builds and signs an announce body. It emits v1 (byte-identical to the original
+// layout) when bridges is empty, or v2 with the `bridges` section when it isn't.
+func NewAnnounceBody(id *Identity, epoch uint64, seq uint32, timestamp int64, caps Capabilities, neighbors []NodeID, name, desc, platform string, bridges []BridgeAd) AnnounceBody {
 	nbs := append([]NodeID(nil), neighbors...)
 	sort.Slice(nbs, func(i, j int) bool { return nbs[i].Less(nbs[j]) })
 	uniq := nbs[:0]
@@ -129,9 +220,13 @@ func NewAnnounceBody(id *Identity, epoch uint64, seq uint32, timestamp int64, ca
 			uniq = append(uniq, nb)
 		}
 	}
-	sig := id.SignAnnounce(epoch, seq, timestamp, caps, uniq, name, desc, platform)
+	version := uint8(MinAnnounceVersion)
+	if len(bridges) > 0 {
+		version = AnnounceVersion
+	}
+	sig := id.SignAnnounce(epoch, seq, timestamp, caps, uniq, name, desc, platform, version, bridges)
 	return AnnounceBody{
-		AnnounceVersion: AnnounceVersion,
+		AnnounceVersion: version,
 		PublicKey:       append([]byte(nil), id.Pub...),
 		Epoch:           epoch,
 		Seq:             seq,
@@ -142,6 +237,7 @@ func NewAnnounceBody(id *Identity, epoch uint64, seq uint32, timestamp int64, ca
 		Description:     desc,
 		Platform:        platform,
 		Signature:       sig,
+		Bridges:         bridges,
 	}
 }
 

@@ -38,10 +38,13 @@ type Router struct {
 	Name        string
 	Platform    string
 	Description string
-	dedup       *DedupCache
-	Neighbors   *NeighborTable
-	Topology    *Topology
-	Allowlist   map[NodeID]bool
+	// Bridges advertises the external networks this node bridges (v2 ANNOUNCE, §8.3). Empty on
+	// non-gateways, which keeps their announces at v1 (byte-identical to the original layout).
+	Bridges   []BridgeAd
+	dedup     *DedupCache
+	Neighbors *NeighborTable
+	Topology  *Topology
+	Allowlist map[NodeID]bool
 }
 
 func NewRouter(id NodeID) *Router {
@@ -118,6 +121,7 @@ func (r *Router) verifyControlIfAnnounce(dg Datagram) *bool {
 		Name:        body.Name,
 		Platform:    body.Platform,
 		PublicKey:   body.PublicKey,
+		Bridges:     body.Bridges,
 	})
 	v := true
 	return &v
@@ -206,7 +210,7 @@ func (r *Router) BuildAnnounce(caps Capabilities, epoch uint64, seq uint32) (Dat
 	if r.Identity == nil {
 		return Datagram{}, fmt.Errorf("router has no signing identity")
 	}
-	body := NewAnnounceBody(r.Identity, epoch, seq, time.Now().Unix(), caps, r.Neighbors.IDs(), r.Name, r.Description, r.Platform)
+	body := NewAnnounceBody(r.Identity, epoch, seq, time.Now().Unix(), caps, r.Neighbors.IDs(), r.Name, r.Description, r.Platform, r.Bridges)
 	payload, err := body.ToControl()
 	if err != nil {
 		return Datagram{}, err

@@ -19,6 +19,8 @@ data class TopoNode(
     val name: String = "",
     val description: String = "",
     val platform: String = "",
+    // External networks this node bridges (v2 ANNOUNCE, §8.3). Empty for non-gateways and v1 announces.
+    val bridges: List<BridgeAd> = emptyList(),
     val receivedAtMs: Long = System.currentTimeMillis(),
 )
 

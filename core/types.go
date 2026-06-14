@@ -7,24 +7,33 @@ import (
 )
 
 const (
-	FrameVersion     = 2
-	DatagramVersion  = 3
-	NodeInfoVersion  = 1
-	AnnounceVersion  = 1
-	NodeIDBytes      = 10
-	DatagramIDBytes  = 16
-	TransferIDBytes  = 16
-	PublicKeyBytes   = 32
-	SignatureBytes   = 64
-	SeedSize         = 32
-	MaxTTL           = 16
-	DefaultFloodTTL  = 5
-	MaxRouteHops     = 16
-	AnnounceTTL      = 5
-	MaxNeighbors     = 255
-	MaxNameBytes     = 64
-	MaxDescBytes     = 255
-	MaxPlatformBytes = 64
+	FrameVersion    = 2
+	DatagramVersion = 3
+	NodeInfoVersion = 1
+	// AnnounceVersion is the current (max) announce version we emit. v2 adds the optional trailing
+	// `bridges` section (§8.3). A node emits v1 (byte-identical to the original layout) when it has
+	// no bridges, and v2 only when it bridges one or more networks. Verifiers accept any version in
+	// [MinAnnounceVersion]..[AnnounceVersion] and reconstruct the signed bytes per that version.
+	AnnounceVersion    = 2
+	MinAnnounceVersion = 1
+	NodeIDBytes        = 10
+	DatagramIDBytes    = 16
+	TransferIDBytes    = 16
+	PublicKeyBytes     = 32
+	SignatureBytes     = 64
+	SeedSize           = 32
+	MaxTTL             = 16
+	DefaultFloodTTL    = 5
+	MaxRouteHops       = 16
+	AnnounceTTL        = 5
+	MaxNeighbors       = 255
+	MaxNameBytes       = 64
+	MaxDescBytes       = 255
+	MaxPlatformBytes   = 64
+
+	// Announce v2 `bridges` limits (§8.3): a gateway advertises the external networks it bridges.
+	MaxBridges          = 8
+	MaxNetworkCodeBytes = 5
 )
 
 type NodeID [NodeIDBytes]byte
@@ -74,7 +83,7 @@ type PayloadProtocol uint16
 
 const (
 	ProtocolSidepathControl PayloadProtocol = 0x0000
-	ProtocolMeshCorePacket PayloadProtocol = 0x0001
+	ProtocolMeshCorePacket  PayloadProtocol = 0x0001
 	ProtocolSidepathChat    PayloadProtocol = 0x0100
 )
 

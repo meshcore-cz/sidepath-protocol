@@ -52,8 +52,13 @@ type NodeConfig struct {
 	Name        string // primary display label; empty = deterministic default from pubkey
 	Platform    string // OS/device string; empty = core.PlatformDescription()
 	Description string // free-form bio advertised in ANNOUNCE/NODE_INFO; default empty
-	Verbose     bool
-	JSONLog     bool
+	// Bridges lists the external networks this gateway bridges, advertised in the v2 ANNOUNCE
+	// `bridges` section (§8.3). Each entry carries a network code (e.g. "CZ") and, only when the
+	// radio params differ from that code's canonical definition, explicit params. When non-empty the
+	// node emits v2 announces; empty keeps it on v1.
+	Bridges []core.BridgeAd
+	Verbose bool
+	JSONLog bool
 }
 
 // NewNode creates and initializes a Linux BLE node.
@@ -91,6 +96,8 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	router.Description = description
 	router.Name = name
 	router.Platform = platform
+	// A configured bridge advertises the networks it bridges (gateway cap is already in LinuxCapabilities).
+	router.Bridges = cfg.Bridges
 	for _, id := range cfg.Allowlist {
 		router.Allowlist[id] = true
 	}

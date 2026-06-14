@@ -1,0 +1,33 @@
+[
+  {
+    "code": "CZ",
+    "name": "Czech Republic",
+    "freqHz": 869432000,
+    "bandwidthHz": 62500,
+    "sf": 7,
+    "cr": 5,
+    "analyzerUrls": ["https://analyzer.meshcore.cz/#/packets/"],
+    "mqtt": [],
+    "description": "Czech regional MeshCore network on the EU868 band. Default preset for new devices.",
+    "geoJson": {
+      "type": "Polygon",
+      "coordinates": [
+        [
+          [12.10, 50.30],
+          [12.55, 49.60],
+          [13.50, 48.90],
+          [14.50, 48.58],
+          [15.20, 48.95],
+          [16.95, 48.62],
+          [18.85, 49.52],
+          [18.05, 50.20],
+          [16.20, 50.65],
+          [15.00, 50.95],
+          [14.20, 51.05],
+          [12.95, 50.40],
+          [12.10, 50.30]
+        ]
+      ]
+    }
+  }
+]

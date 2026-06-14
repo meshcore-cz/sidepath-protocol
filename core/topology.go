@@ -17,7 +17,10 @@ type TopoNode struct {
 	Name        string // primary display label from the node's ANNOUNCE (key 9)
 	Platform    string // OS/device string from the node's ANNOUNCE (key 10)
 	PublicKey   []byte // 32-byte Ed25519 key from ANNOUNCE (key 6); used for chat encryption
-	LastSeen    time.Time
+	// Bridges lists the external networks this node bridges (v2 ANNOUNCE key 12, §8.3); empty for
+	// non-gateway nodes and v1 announces.
+	Bridges  []BridgeAd
+	LastSeen time.Time
 }
 
 // Topology maintains the global mesh graph learned via ANNOUNCE packets.

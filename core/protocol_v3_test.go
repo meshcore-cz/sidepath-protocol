@@ -84,7 +84,7 @@ func TestSignedAnnounceUpdatesTopologyAndRejectsTamper(t *testing.T) {
 	alice := testIdentity(1)
 	bob := testIdentity(30)
 	r := NewRouterForIdentity(alice)
-	body := NewAnnounceBody(bob, 2, 7, 1_700_000_000, Capabilities(CapRelay|CapCodedPHY), []NodeID{alice.NodeID()}, "Bob", "", "linux/arm64")
+	body := NewAnnounceBody(bob, 2, 7, 1_700_000_000, Capabilities(CapRelay|CapCodedPHY), []NodeID{alice.NodeID()}, "Bob", "", "linux/arm64", nil)
 	payload, err := body.ToControl()
 	if err != nil {
 		t.Fatal(err)

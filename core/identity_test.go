@@ -23,14 +23,14 @@ func TestIdentityVectorAndV3AnnounceSignature(t *testing.T) {
 		t.Fatalf("node id = %s want %s", got, vectorPubHex[:NodeIDBytes*2])
 	}
 	neighbors := []NodeID{testNodeID(1), testNodeID(2)}
-	sig := id.SignAnnounce(3, 7, 1_700_000_000, Capabilities(CapReceiver|CapRelay|CapCodedPHY), neighbors, "name", "desc", "platform")
-	if !VerifyAnnounce(id.Pub, sig, 3, 7, 1_700_000_000, Capabilities(CapReceiver|CapRelay|CapCodedPHY), neighbors, "name", "desc", "platform") {
+	sig := id.SignAnnounce(3, 7, 1_700_000_000, Capabilities(CapReceiver|CapRelay|CapCodedPHY), neighbors, "name", "desc", "platform", MinAnnounceVersion, nil)
+	if !VerifyAnnounce(id.Pub, sig, 3, 7, 1_700_000_000, Capabilities(CapReceiver|CapRelay|CapCodedPHY), neighbors, "name", "desc", "platform", MinAnnounceVersion, nil) {
 		t.Fatal("self verify failed")
 	}
-	if VerifyAnnounce(id.Pub, sig, 3, 7, 1_700_000_000, Capabilities(CapReceiver), neighbors, "name", "desc", "platform") {
+	if VerifyAnnounce(id.Pub, sig, 3, 7, 1_700_000_000, Capabilities(CapReceiver), neighbors, "name", "desc", "platform", MinAnnounceVersion, nil) {
 		t.Fatal("tampered caps verified")
 	}
-	if VerifyAnnounce(id.Pub, sig, 3, 7, 1_700_000_000, Capabilities(CapReceiver|CapRelay|CapCodedPHY), neighbors, "other", "desc", "platform") {
+	if VerifyAnnounce(id.Pub, sig, 3, 7, 1_700_000_000, Capabilities(CapReceiver|CapRelay|CapCodedPHY), neighbors, "other", "desc", "platform", MinAnnounceVersion, nil) {
 		t.Fatal("tampered metadata verified")
 	}
 }

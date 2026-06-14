@@ -82,6 +82,89 @@ class ProtocolTest {
         assertFalse(decoded.copy(name = "mallory").isValid())
     }
 
+    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
+
+    // Mirror of core/bridge_announce_test.go's sharedBridgeVector. Both impls MUST produce these
+    // exact signed bytes (and signature) for the same identity/fields/bridges, or the v2 ANNOUNCE
+    // wire format has drifted between Go and Kotlin.
+    private val sharedBridgeSignedMsgHex =
+        "53494445504154482d414e4e4f554e43452d5631000200d05a1d1ea251396d557afbd4588b3c6d99dbeb972fed10a32562ea26dcdcfa03000000000000000400000064000000000000001f0002004bddee550ef734cae04e677edd9c7a6fbaa5d6090500616c6963650000040074657374020002435a000245550108e6d33390d003000b05"
+    private val sharedBridgeSigHex =
+        "a6c31fbf37746375910f5677ca0e4084214f92f391281301322a648a5e0210e408d5af6a8aff381a1359f8cee05943b7fabe411f8083169f069aa99e28f9fe0b"
+
+    @Test fun bridgeAnnounceCrossImplVector() {
+        val id = Identity.fromSeed(seed(7))
+        val nb = listOf(Identity.fromSeed(seed(8)).nodeId, Identity.fromSeed(seed(9)).nodeId)
+        val bridges = listOf(
+            BridgeAd("CZ"),
+            BridgeAd("EU", freqHz = 869_525_000L, bandwidthHz = 250_000L, sf = 11, cr = 5),
+        )
+        val body = AnnounceBody.create(
+            id, epoch = 3, seq = 4, timestamp = 100, caps = Capabilities(0x1F),
+            neighbors = nb, name = "alice", description = "", platform = "test", bridges = bridges,
+        )
+        // A body with bridges is emitted as v2.
+        assertEquals(2, body.announceVersion)
+        // Signed bytes + signature match the Go vector byte-for-byte.
+        val msg = Identity.announceSignedMessage(
+            id.publicKey, 3, 4, 100, Capabilities(0x1F), body.neighbors, "alice", "", "test", 2, bridges,
+        )
+        assertEquals(sharedBridgeSignedMsgHex, msg.hex())
+        assertEquals(sharedBridgeSigHex, body.signature.hex())
+        assertTrue(body.isValid())
+
+        // CBOR round-trip via the control envelope preserves the bridges (k12).
+        val decoded = AnnounceBody.decode(ControlMessage.decode(body.toControl().encode()).body)
+        assertEquals(listOf("CZ", "EU"), decoded.bridges.map { it.code })
+        assertFalse(decoded.bridges[0].isCustom)
+        assertTrue(decoded.bridges[1].isCustom)
+        assertEquals(869_525_000L, decoded.bridges[1].freqHz)
+        assertTrue(decoded.isValid())
+        // Tampering a signed bridge code breaks verification.
+        assertFalse(decoded.copy(bridges = listOf(BridgeAd("XX"), decoded.bridges[1])).isValid())
+    }
+
+    @Test fun networkDefsBundledResourceLoads() {
+        val defs = NetworkDefs.builtins()
+        val cz = defs.firstOrNull { it.code == "CZ" }
+        assertNotNull(cz)
+        assertEquals("Czech Republic", cz!!.name)
+        // Canonical radio params are integer Hz (matching the wire format).
+        assertEquals(869_432_000L, cz.freqHz)
+        assertEquals(62_500L, cz.bandwidthHz)
+        assertEquals(7, cz.sf)
+        assertEquals(5, cz.cr)
+        assertTrue(cz.analyzerUrls.isNotEmpty())
+        // The geometry round-trips as a JSON string consumers can parse offline.
+        assertTrue(cz.geoJson.contains("Polygon"))
+    }
+
+    @Test fun networkDefsParseSkipsInvalidEntries() {
+        val json = """
+            [
+              {"code":"CZ","name":"Czech","freqHz":869432000,"bandwidthHz":62500,"sf":7,"cr":5},
+              {"code":"","name":"no code"},
+              {"code":"TOOLONG","name":"over 5 bytes"}
+            ]
+        """.trimIndent()
+        val defs = NetworkDefs.parse(json)
+        assertEquals(listOf("CZ"), defs.map { it.code })
+    }
+
+    @Test fun announceV1BackCompat() {
+        val id = Identity.fromSeed(seed(7))
+        val nb = listOf(Identity.fromSeed(seed(8)).nodeId)
+        // No bridges -> v1, byte-identical to the original layout.
+        val v1 = AnnounceBody.create(
+            id, epoch = 1, seq = 1, timestamp = 50, caps = Capabilities(0x02),
+            neighbors = nb, name = "n", description = "", platform = "p",
+        )
+        assertEquals(Sidepath.MIN_ANNOUNCE_VERSION, v1.announceVersion)
+        assertTrue(v1.isValid())
+        // A v1 body carrying bridges is rejected (bridges only exist from v2).
+        assertFalse(v1.copy(bridges = listOf(BridgeAd("CZ"))).isValid())
+    }
+
     @Test fun topologyEpochSeqFreshness() {
         val topo = Topology()
         val id = Identity.fromSeed(seed(11))
