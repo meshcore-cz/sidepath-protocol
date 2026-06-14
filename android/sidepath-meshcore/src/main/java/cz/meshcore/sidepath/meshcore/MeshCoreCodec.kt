@@ -50,7 +50,7 @@ object MeshCoreType {
  *
  * [networkCode] is not part of the MeshCore advert itself — it's attached by the receiving service
  * from the signed `bridges` of the Sidepath carrier that bridged this advert (§8.3), so each bridged
- * advert carries which Meshcore network it came through. Blank when the carrier advertises no network.
+ * advert carries which MeshCore network it came through. Blank when the carrier advertises no network.
  */
 data class MeshCoreAdvert(
     val publicKeyHex: String,

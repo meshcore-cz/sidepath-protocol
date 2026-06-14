@@ -13,7 +13,11 @@ java {
 
 sourceSets {
     main {
-        resources.srcDir("${rootDir}/../res")
+        // Bundle res/networks.json onto the classpath so NetworkDefs.builtins() can read it at runtime.
+        // Anchored to this module's own dir (projectDir), not rootDir — rootDir points at the *consuming*
+        // build when this library is included into another project (e.g. the Meshward app), which would
+        // resolve to a non-existent path and silently drop the resource from the APK.
+        resources.srcDir("${projectDir}/../../res")
     }
 }
 

@@ -485,6 +485,23 @@ class SidepathService : Service() {
         _neighborTable.value = emptyList()
         _knownTopology.value = emptyList()
 
+        // Re-initialize switches the active identity (a profile switch reuses this service instance).
+        // Every piece of in-flight or observed state below belongs to the *previous* identity and must
+        // not bleed into the new one. Critically, cancel pending DM retries: their job runs on the
+        // service-lifetime scope, and transmitDirect() stamps the outer datagram source with the
+        // *current* identity — so a leftover retry would re-emit the old identity's message as the new
+        // node and invite the peer's reply onto the wrong identity. The observed logs/counters are
+        // cleared too so the new identity's UI never shows the old one's packets.
+        pendingDms.values.forEach { it.job?.cancel() }
+        pendingDms.clear()
+        pendingMeshCoreAck.clear()
+        originatedFloodIds.clear()
+        _floodRepeats.value = emptyMap()
+        _dmDeliveries.value = emptyMap()
+        _rxPackets.value = emptyList(); _rxTotal.value = 0
+        _meshCorePackets.value = emptyList(); _meshCoreTotal.value = 0
+        _stats.value = MeshStats()
+
         _nodeId.value = localId
         this.allowlist = allowlist.toMutableSet()
 
@@ -502,6 +519,9 @@ class SidepathService : Service() {
         router.allowlist.addAll(allowlist)
         reassembler = Reassembler()
 
+        // Stop the previous identity's radio before standing up the new one, so a profile switch
+        // doesn't leave the old node advertising/scanning (its GATT server exposes the old pubkey).
+        if (::bleManager.isInitialized) bleManager.stopAll()
         bleManager = BLEManager(this, requestedPhyMode)
         bleManager.logCapabilities()
         _codedPhySupported.value = bleManager.isLeCodedPhySupported
@@ -871,7 +891,7 @@ class SidepathService : Service() {
      * receive count, while side effects are deduped on the inner MeshCore packet bytes.
      */
     /**
-     * The Meshcore network code a Sidepath [carrier] node bridges, from its signed v2 ANNOUNCE
+     * The MeshCore network code a Sidepath [carrier] node bridges, from its signed v2 ANNOUNCE
      * `bridges` (§8.3). A carrier bridging exactly one network resolves unambiguously; with several
      * (or none, or no announce heard yet) returns blank so callers don't mis-attribute.
      */

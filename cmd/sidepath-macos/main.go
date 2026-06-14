@@ -104,7 +104,7 @@ Usage:
   sidepath-macos [--seed-hex <hex>] [--description <str>] [--allow-peer <id,...>] [--verbose]
   sidepath-macos --bot <script.ts> [--bun <path>] [--channels <name,...>]   # run as a bot driven by a Bun script
   sidepath-macos --meshcore-bridge [--meshcore-socket <path>]               # bridge MeshCore packets into the Sidepath mesh
-  sidepath-macos --bridge CZ [--bridge EU:869525000,250000,11,5]            # advertise the Meshcore Network(s) this node bridges (v2 ANNOUNCE)
+  sidepath-macos --bridge CZ [--bridge EU:869525000,250000,11,5]            # advertise the MeshCore Network(s) this node bridges (v2 ANNOUNCE)
 
 Interactive commands (type and press Enter):
   <text>             broadcast a message on the public channel

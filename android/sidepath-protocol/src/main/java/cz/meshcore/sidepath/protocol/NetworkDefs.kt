@@ -3,7 +3,7 @@ package cz.meshcore.sidepath.protocol
 import com.upokecenter.cbor.CBORObject
 
 /**
- * The canonical definition of a Meshcore Network, owned by `sidepath-protocol`. A network is keyed by
+ * The canonical definition of a MeshCore Network, owned by `sidepath-protocol`. A network is keyed by
  * its short [code] (e.g. "CZ", the same code carried in a v2 ANNOUNCE [BridgeAd]) and bundles the
  * canonical LoRa radio params plus presentation metadata. Radio params are integer Hz to match the
  * wire format and avoid float drift. [geoJson] is the raw GeoJSON geometry (Polygon / MultiPolygon)
