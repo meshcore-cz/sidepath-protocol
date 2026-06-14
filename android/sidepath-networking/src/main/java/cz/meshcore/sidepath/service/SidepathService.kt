@@ -601,6 +601,26 @@ class SidepathService : Service() {
         val localId = _nodeId.value
         if (advNodeId == localId) return
 
+        // Identity is the NodeID, but the connection manager keys on MAC address — and modern peers
+        // rotate their MAC for privacy. When a known NodeID reappears on a *different* address, the
+        // node has restarted / rotated: evict any dead-but-not-removed link bound to the old address so
+        // the NodeID-dedup eligibility check (which keys links by MAC) doesn't block the reconnect.
+        // Only evict an unusable link — a still-usable one means the node is genuinely connected and
+        // merely advertising a fresh address, which we must not tear down.
+        if (advNodeId != null) {
+            val stale = peers.entries.firstOrNull { (hex, link) ->
+                hex != peerHex && link.peerId == advNodeId && !link.isUsable
+            }
+            if (stale != null) {
+                log("node=${advNodeId.toHex()} reappeared on new addr=${device.address} (was ${stale.key}) — evicting stale link", LogTag.PEER)
+                removePeerLink(stale.key, stale.value, "node returned on new MAC")
+                reconnectAfterMs.remove(stale.key)
+                connectionFailures.remove(stale.key)
+            }
+            // A fresh address starts clean — don't inherit a stale backoff under the new MAC.
+            reconnectAfterMs.remove(peerHex)
+        }
+
         val wasNew = synchronized(connectionLock) {
             val previous = connectionCandidates.put(
                 peerHex,

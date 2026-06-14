@@ -599,6 +599,7 @@ func (n *Node) deliverLocal(dg core.Datagram) {
 }
 
 func (n *Node) returnTrace(req core.Datagram, body []byte) error {
+	recvAt := time.Now()
 	var tr core.TraceRequestBody
 	if err := cbor.Unmarshal(body, &tr); err != nil {
 		return err
@@ -611,13 +612,16 @@ func (n *Node) returnTrace(req core.Datagram, body []byte) error {
 	route := reverseTraceRoute(req.Path, req.Source)
 	dg := core.Datagram{Version: core.DatagramVersion, ID: core.NewDatagramID(), Source: n.nodeID, Destination: req.Source, TTL: uint8(len(route)), Route: route, Protocol: core.ProtocolSidepathControl, Payload: payload}
 	n.router.MarkOriginated(dg.ID)
+	n.logf("trace request tag=0x%08x from=%s fwd-path=%v return-route=%v — replying", tr.Tag, req.Source, nodeIDs(req.Path), nodeIDs(route))
 	// returnTrace runs inside the inbound PACKET_IN write callback (a CoreBluetooth
 	// delegate callback); notifying the central from there re-enters CoreBluetooth and
 	// crashes. Send the response from a separate goroutine.
 	go func() {
 		if err := n.transmitToRoute(dg); err != nil {
-			n.logf("trace response send error: %v", err)
+			n.logf("trace response tag=0x%08x send error after %s: %v", tr.Tag, time.Since(recvAt), err)
+			return
 		}
+		n.logf("trace response tag=0x%08x sent to=%s in %s", tr.Tag, req.Source, time.Since(recvAt))
 	}()
 	return nil
 }

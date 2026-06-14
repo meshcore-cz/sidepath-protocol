@@ -22,6 +22,9 @@ import cz.meshcore.sidepath.transport.PHYMode
 private const val TAG = "SidepathGattClient"
 private const val KEEPALIVE_MS = 15_000L
 private const val WRITE_TIMEOUT_MS = 8_000L
+// A write request can be momentarily rejected when the stack is busy (e.g. an op slipped in just
+// ahead of it). That's transient, so requeue and retry a few times before giving up on the link.
+private const val MAX_WRITE_RETRIES = 5
 
 enum class LinkHealth { CONNECTING, READY, DEGRADED, CLOSED }
 
@@ -56,8 +59,12 @@ class SidepathGattClient(
 
     // Write queue — only touched on mainHandler thread.
     private val writeQueue = ArrayDeque<ByteArray>()
-    private var writeInProgress = false
+    // Android permits only ONE outstanding GATT operation per connection, so writes and the RSSI
+    // keepalive read share a single in-flight gate. Without this they collide: a read in flight makes
+    // a write request fail (and vice versa), which used to tear the whole link down.
+    private var opInProgress = false
     private var writeGeneration = 0L
+    private var writeRetries = 0
 
     var peerNodeId: NodeId? = null; private set
     var peerPublicKey: ByteArray = ByteArray(0); private set
@@ -110,12 +117,12 @@ class SidepathGattClient(
     // ---- write queue ---------------------------------------------------------
 
     private fun drainWriteQueue() {
-        if (closing || !isUsable || writeInProgress) return
+        if (closing || !isUsable || opInProgress) return
         val frame = writeQueue.removeFirstOrNull() ?: return
         val char = packetInChar ?: run { failLink("PACKET_IN unavailable while writing"); return }
         val g = gatt ?: run { failLink("GATT unavailable while writing"); return }
 
-        writeInProgress = true
+        opInProgress = true
         val generation = ++writeGeneration
 
         // Use Write Request (WRITE_TYPE_DEFAULT) for reliable serialisation via onCharacteristicWrite.
@@ -131,13 +138,23 @@ class SidepathGattClient(
             g.writeCharacteristic(char)
         }
         if (!accepted) {
-            failLink("write request rejected")
+            // Transient stack-busy (not a dead peer): requeue this frame and retry shortly rather than
+            // dropping the whole link. Give up only after repeated failures.
+            opInProgress = false
+            writeQueue.addFirst(frame)
+            writeRetries += 1
+            if (writeRetries >= MAX_WRITE_RETRIES) {
+                failLink("write request rejected after $writeRetries retries")
+                return
+            }
+            mainHandler.postDelayed(::drainWriteQueue, 50L * writeRetries)
             return
         }
+        writeRetries = 0
 
         // Missing write callbacks usually mean the controller has lost the peer.
         mainHandler.postDelayed({
-            if (writeInProgress && writeGeneration == generation) failLink("write callback timeout")
+            if (opInProgress && writeGeneration == generation) failLink("write callback timeout")
         }, WRITE_TIMEOUT_MS)
     }
 
@@ -153,9 +170,24 @@ class SidepathGattClient(
 
     private fun keepaliveTick() {
         if (closing || health == LinkHealth.CLOSED) return
-        val accepted = gatt?.readRemoteRssi() == true
-        if (!accepted) {
-            onLog?.invoke(peerNodeId?.toHex() ?: "unknown", "RSSI keepalive request skipped")
+        // The RSSI read is just a keepalive — never contend with a pending write. If the single GATT
+        // op slot is busy, skip this tick; the next one (15 s later) will catch up.
+        if (!opInProgress) {
+            opInProgress = true
+            val generation = ++writeGeneration
+            val accepted = gatt?.readRemoteRssi() == true
+            if (!accepted) {
+                opInProgress = false
+                onLog?.invoke(peerNodeId?.toHex() ?: "unknown", "RSSI keepalive request skipped")
+            } else {
+                // Watchdog: if the read callback never lands, release the op slot so writes aren't wedged.
+                mainHandler.postDelayed({
+                    if (opInProgress && writeGeneration == generation) {
+                        opInProgress = false
+                        drainWriteQueue()
+                    }
+                }, WRITE_TIMEOUT_MS)
+            }
         }
         mainHandler.postDelayed(::keepaliveTick, KEEPALIVE_MS)
     }
@@ -179,7 +211,8 @@ class SidepathGattClient(
         health = LinkHealth.CLOSED
         stopKeepalive()
         writeQueue.clear()
-        writeInProgress = false
+        opInProgress = false
+        writeRetries = 0
         writeGeneration += 1
     }
 
@@ -336,7 +369,7 @@ class SidepathGattClient(
                 return
             }
             mainHandler.post {
-                writeInProgress = false
+                opInProgress = false
                 drainWriteQueue()
             }
         }
@@ -357,6 +390,11 @@ class SidepathGattClient(
             onLog?.invoke(addr, "subscribed to PACKET_OUT, requesting PHY")
             health = LinkHealth.READY
             closing = false
+            // Ask for a fast connection interval. Low-power peers default to a relaxed interval (0.5–2 s),
+            // which makes request/response exchanges (e.g. trace) take seconds and vary wildly; HIGH
+            // priority pulls the interval down to ~15 ms for snappy, consistent round-trips.
+            val priorityAccepted = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+            onLog?.invoke(addr, "requestConnectionPriority(HIGH) accepted=$priorityAccepted")
             startKeepalive()
             val phyMask = when (phyMode) {
                 PHYMode.ONE_M           -> BluetoothDevice.PHY_LE_1M_MASK
@@ -379,6 +417,11 @@ class SidepathGattClient(
                 rssi = rssiValue
             } else {
                 onLog?.invoke(gatt.device.address, "RSSI read failed status=$status")
+            }
+            // Release the shared GATT-op slot and let any queued writes proceed.
+            mainHandler.post {
+                opInProgress = false
+                drainWriteQueue()
             }
         }
     }
