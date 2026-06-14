@@ -265,7 +265,7 @@ order is irrelevant. Keys are authoritative.
 |   5 | `ttl`          | uint8              | yes      | Remaining Sidepath hop budget                      |
 |   6 | `route`        | array of bytes(10) | no       | Explicit source route, including destination      |
 |   7 | `route_cursor` | uint8              | no       | Index of the next expected route hop; default `0` |
-|   8 | `path`         | array of bytes(10) | no       | Nodes visited so far; default empty               |
+|   8 | `path`         | array of bytes(10) | no       | Intermediate relays only (excl. source & destination); empty = direct |
 |   9 | `protocol`     | uint16             | yes      | Payload protocol registry value                   |
 |  10 | `flags`        | uint16             | no       | Routing flags; default `0`                        |
 |  11 | `payload`      | bytes              | yes      | Opaque protocol-specific payload                  |
@@ -610,7 +610,7 @@ an ACK datagram:
 ```text
 source      = local NodeID
 destination = original.source
-route       = reverse(original.path excluding local destination) + [original.source]
+route       = reverse(original.path) + [original.source]
 route_cursor = 0
 ttl         = len(route)
 protocol    = SIDEPATH_CONTROL
@@ -693,14 +693,18 @@ Flood routing applies when `route` is absent or empty.
 
 After common checks:
 
-1. append local NodeID to `path`;
-2. deliver locally if `destination` is broadcast or equals local NodeID;
-3. generate an ACK if local delivery is unicast and `ACK_REQUESTED` is set;
-4. if relay is needed, decrement `ttl`;
-5. relay only if the remaining TTL is greater than zero and the datagram is
+1. deliver locally if `destination` is broadcast or equals local NodeID, keeping
+   `path` exactly as received (a node never records itself as a hop on delivery);
+2. generate an ACK if local delivery is unicast and `ACK_REQUESTED` is set;
+3. if relay is needed, append local NodeID to `path` and decrement `ttl`;
+4. relay only if the remaining TTL is greater than zero and the datagram is
    broadcast or not addressed to the local node;
-6. exclude the incoming peer link when relaying; and
-7. apply random flood jitter of 10–100 ms.
+5. exclude the incoming peer link when relaying; and
+6. apply random flood jitter of 10–100 ms.
+
+`path` therefore accumulates only the intermediate relays — never the source
+(which originates it) nor the destination (which delivers it). An empty `path`
+on delivery means the datagram travelled directly with no relays.
 
 ### 10.3 Source routing
 
@@ -712,12 +716,11 @@ A receiver MUST:
 2. require `route[route_cursor] == local NodeID`;
 3. require `route[len(route)-1] == destination`;
 4. require `ttl == len(route) - route_cursor`;
-5. append local NodeID to `path`;
-6. decrement `ttl`;
-7. increment `route_cursor`;
-8. locally deliver when `route_cursor == len(route)` and generate an ACK when
-   `ACK_REQUESTED` is set; otherwise
-9. relay only to `route[route_cursor]`.
+5. decrement `ttl`;
+6. increment `route_cursor`;
+7. locally deliver when `route_cursor == len(route)`, keeping `path` exactly as
+   received, and generate an ACK when `ACK_REQUESTED` is set; otherwise
+8. append local NodeID to `path` and relay only to `route[route_cursor]`.
 
 A source-routed datagram MUST NOT be flood-relayed if its next hop is unavailable.
 
@@ -779,11 +782,12 @@ responding. If the requested metric is unavailable, append `-32768`.
 
 At the trace destination:
 
-* `forward_path` is copied from the completed request `path`;
+* `forward_path` is copied from the completed request `path` — the intermediate
+  relays only, so it is **empty for a direct (single-hop) trace**;
 * `forward_samples` is copied from the request;
 * `return_samples` starts empty; and
-* the response route is the reverse observed path excluding the destination,
-  followed by the original source.
+* the response route is the reversed observed `path` followed by the original
+  source (`reverse(path) + [source]`).
 
 Each receiving hop appends one inbound-link sample to `return_samples`.
 

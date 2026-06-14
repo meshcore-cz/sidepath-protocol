@@ -199,10 +199,13 @@ class ProtocolTest {
         val dg = Datagram(source = a.nodeId, destination = NodeId.BROADCAST, ttl = 5,
             protocol = PayloadProtocol.SIDEPATH_CHAT, payload = byteArrayOf(9))
         val actions = relay.handle(dg, incomingPeer = a.nodeId)
-        assertTrue(actions.any { it.type == ActionType.DELIVER_LOCAL })
+        // Local delivery records no hop for itself: `path` holds relays only (here, empty).
+        val delivered = actions.first { it.type == ActionType.DELIVER_LOCAL }.datagram
+        assertEquals(emptyList<NodeId>(), delivered.path)
         val flood = actions.first { it.type == ActionType.RELAY_FLOOD }
         assertEquals(4, flood.datagram.ttl)
         assertEquals(a.nodeId, flood.excludePeer)
+        // The relay copy DOES append this node, since it is forwarding.
         assertTrue(flood.datagram.path.contains(relay.localId))
         // a duplicate is dropped
         assertEquals(ActionType.DROP, relay.handle(dg, a.nodeId).single().type)
@@ -236,6 +239,19 @@ class ProtocolTest {
         assertEquals(dst, action.nextHop)
         assertEquals(1, action.datagram.ttl)
         assertEquals(1, action.datagram.routeCursor)
+        // Forwarding records this relay as an intermediate hop.
+        assertEquals(listOf(mid.localId), action.datagram.path)
+    }
+
+    @Test fun sourceRouteDirectDeliveryHasEmptyPath() {
+        val src = Identity.fromSeed(seed(43)).nodeId
+        val dst = Router(Identity.fromSeed(seed(44)))
+        val route = listOf(dst.localId)
+        val dg = Datagram(source = src, destination = dst.localId, ttl = route.size, route = route, routeCursor = 0,
+            protocol = PayloadProtocol.SIDEPATH_CHAT, payload = byteArrayOf(7))
+        val delivered = dst.handle(dg, incomingPeer = src).single { it.type == ActionType.DELIVER_LOCAL }.datagram
+        // Direct (single-hop) delivery has no relays, so `path` is empty.
+        assertEquals(emptyList<NodeId>(), delivered.path)
     }
 
     @Test fun ttlAndVersionGuards() {

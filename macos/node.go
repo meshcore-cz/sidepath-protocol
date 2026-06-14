@@ -630,10 +630,11 @@ func reverseTraceRoute(trace []core.NodeID, dst core.NodeID) []core.NodeID {
 	if len(trace) == 0 {
 		return []core.NodeID{dst}
 	}
-	hops := trace[:len(trace)-1]
-	route := make([]core.NodeID, len(hops), len(hops)+1)
-	for i, hop := range hops {
-		route[len(hops)-1-i] = hop
+	// `trace` is the forward path of intermediate relays only (the destination is never recorded),
+	// so the return route is the reversed relay list followed by the trace originator.
+	route := make([]core.NodeID, len(trace), len(trace)+1)
+	for i, hop := range trace {
+		route[len(trace)-1-i] = hop
 	}
 	if len(route) == 0 || route[len(route)-1] != dst {
 		route = append(route, dst)

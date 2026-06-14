@@ -163,6 +163,44 @@ func TestRouterBuildsAckOnlyWhenRequested(t *testing.T) {
 	}
 }
 
+// `path` records only the intermediate relays: a node appends itself when it forwards a datagram
+// but never when it is the destination, so a direct delivery has an empty path.
+func TestPathRecordsRelaysOnly(t *testing.T) {
+	src := testNodeID(0x01)
+	relay := testNodeID(0x02)
+	dst := testNodeID(0x03)
+
+	// At the relay: a source-routed datagram forwarded onward records the relay in `path`.
+	rRelay := NewRouter(relay)
+	fwd := Datagram{
+		Version: DatagramVersion, ID: NewDatagramID(), Source: src, Destination: dst,
+		TTL: 2, Route: []NodeID{relay, dst}, RouteCursor: 0,
+		Protocol: ProtocolSidepathChat, Payload: []byte("x"),
+	}
+	acts := rRelay.HandleDatagram(fwd, &src)
+	if len(acts) != 1 || acts[0].Type != ActionRelayNextHop {
+		t.Fatalf("relay actions = %+v", acts)
+	}
+	if got := acts[0].Datagram.Path; len(got) != 1 || got[0] != relay {
+		t.Fatalf("relayed path = %v, want [relay]", got)
+	}
+
+	// At the destination of a direct (single-hop) source route: delivered path is empty.
+	rDst := NewRouter(dst)
+	direct := Datagram{
+		Version: DatagramVersion, ID: NewDatagramID(), Source: src, Destination: dst,
+		TTL: 1, Route: []NodeID{dst}, RouteCursor: 0,
+		Protocol: ProtocolSidepathChat, Payload: []byte("x"),
+	}
+	acts = rDst.HandleDatagram(direct, &src)
+	if len(acts) != 1 || acts[0].Type != ActionDeliverLocal {
+		t.Fatalf("direct actions = %+v", acts)
+	}
+	if got := acts[0].Datagram.Path; len(got) != 0 {
+		t.Fatalf("direct delivered path = %v, want empty", got)
+	}
+}
+
 func TestBridgedBodyRoundTrip(t *testing.T) {
 	id := NewDatagramID()
 	bridge := NodeID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}

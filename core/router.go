@@ -128,9 +128,10 @@ func (r *Router) verifyControlIfAnnounce(dg Datagram) *bool {
 }
 
 func (r *Router) handleFlood(dg Datagram, incomingPeer *NodeID) []Action {
-	dg.Path = append(append([]NodeID(nil), dg.Path...), r.LocalID)
 	var actions []Action
 
+	// Local delivery keeps `path` exactly as received: a node never records itself as a hop
+	// when it is the recipient, so `path` holds only the intermediate relays (empty = direct).
 	if dg.IsBroadcast() || dg.Destination == r.LocalID {
 		actions = append(actions, Action{Type: ActionDeliverLocal, Datagram: dg})
 		if !dg.IsBroadcast() && dg.AckRequested() {
@@ -139,7 +140,9 @@ func (r *Router) handleFlood(dg Datagram, incomingPeer *NodeID) []Action {
 	}
 
 	if dg.TTL > 1 && (dg.IsBroadcast() || dg.Destination != r.LocalID) {
+		// Relaying onward: append ourselves as an intermediate hop.
 		relay := dg
+		relay.Path = append(append([]NodeID(nil), dg.Path...), r.LocalID)
 		relay.TTL--
 		actions = append(actions, Action{Type: ActionRelayFlood, Datagram: relay, ExcludePeer: incomingPeer})
 	}
@@ -160,22 +163,26 @@ func (r *Router) handleSourceRoute(dg Datagram) []Action {
 	if int(dg.TTL) != len(dg.Route)-cursor {
 		return r.drop(dg, DropBadTTL)
 	}
-	dg.Path = append(append([]NodeID(nil), dg.Path...), r.LocalID)
 	dg.TTL--
 	dg.RouteCursor++
 	if int(dg.RouteCursor) >= len(dg.Route) {
+		// We are the destination: deliver with `path` as received (we do not append ourselves).
 		actions := []Action{{Type: ActionDeliverLocal, Datagram: dg}}
 		if dg.AckRequested() {
 			actions = append(actions, r.buildAck(dg))
 		}
 		return actions
 	}
+	// Relaying onward: record ourselves as an intermediate hop.
+	dg.Path = append(append([]NodeID(nil), dg.Path...), r.LocalID)
 	next := dg.Route[dg.RouteCursor]
 	return []Action{{Type: ActionRelayNextHop, Datagram: dg, NextHop: &next}}
 }
 
 func (r *Router) buildAck(delivered Datagram) Action {
-	route := append([]NodeID(nil), delivered.Path[:len(delivered.Path)-1]...)
+	// `path` holds only the intermediate relays (we never appended ourselves on delivery), so the
+	// return route is simply the reversed relay list followed by the original source.
+	route := append([]NodeID(nil), delivered.Path...)
 	for i, j := 0, len(route)-1; i < j; i, j = i+1, j-1 {
 		route[i], route[j] = route[j], route[i]
 	}

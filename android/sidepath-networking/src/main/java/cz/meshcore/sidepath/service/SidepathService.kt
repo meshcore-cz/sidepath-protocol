@@ -1235,10 +1235,10 @@ class SidepathService : Service() {
 
     private fun respondToTrace(req: Datagram, ctrl: ControlMessage) {
         val body = runCatching { TraceRequestBody.decode(ctrl.body) }.getOrNull() ?: return
-        // The request's path is the forward path; build a reverse source route to the origin.
+        // The request's path is the forward path of intermediate relays only (empty = direct, since
+        // the destination is never recorded). The return route is the reversed relays + the origin.
         val forwardPath = req.path
-        val hopsBack = forwardPath.dropLast(1).reversed() // exclude us (last path entry)
-        val route = hopsBack + req.source
+        val route = forwardPath.reversed() + req.source
         val resp = TraceResponseBody(
             tag = body.tag, metric = body.metric, forwardPath = forwardPath,
             forwardSamples = body.forwardSamples, returnSamples = emptyList(),

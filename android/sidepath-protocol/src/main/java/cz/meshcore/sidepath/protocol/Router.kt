@@ -90,21 +90,23 @@ class Router(val identity: Identity) {
     }
 
     private fun handleFlood(dg: Datagram, incomingPeer: NodeId?): List<Action> {
-        val withPath = dg.copy(path = dg.path + localId)
         val actions = mutableListOf<Action>()
 
-        val deliverLocally = withPath.isBroadcast || withPath.destination == localId
+        // Local delivery keeps `path` exactly as received: a node never records itself as a hop when
+        // it is the recipient, so `path` holds only the intermediate relays (empty = direct).
+        val deliverLocally = dg.isBroadcast || dg.destination == localId
         if (deliverLocally) {
-            actions += Action(ActionType.DELIVER_LOCAL, withPath)
-            if (!withPath.isBroadcast && withPath.ackRequested()) actions += buildAck(withPath)
+            actions += Action(ActionType.DELIVER_LOCAL, dg)
+            if (!dg.isBroadcast && dg.ackRequested()) actions += buildAck(dg)
         }
 
         // §10.2.5 relay if datagram is broadcast or not addressed to local, and TTL allows.
-        val relayNeeded = withPath.isBroadcast || withPath.destination != localId
-        if (relayNeeded && withPath.ttl > 1) {
+        val relayNeeded = dg.isBroadcast || dg.destination != localId
+        if (relayNeeded && dg.ttl > 1) {
+            // Relaying onward: append ourselves as an intermediate hop.
             actions += Action(
                 ActionType.RELAY_FLOOD,
-                withPath.copy(ttl = withPath.ttl - 1),
+                dg.copy(path = dg.path + localId, ttl = dg.ttl - 1),
                 excludePeer = incomingPeer,
             )
         }
@@ -118,23 +120,27 @@ class Router(val identity: Identity) {
         if (dg.route.last() != dg.destination) return drop(dg, DropReason.BAD_ROUTE)
         if (dg.ttl != dg.route.size - cursor) return drop(dg, DropReason.BAD_TTL)
 
-        val updated = dg.copy(path = dg.path + localId, ttl = dg.ttl - 1, routeCursor = cursor + 1)
+        val updated = dg.copy(ttl = dg.ttl - 1, routeCursor = cursor + 1)
         if (updated.routeCursor >= updated.route.size) {
+            // We are the destination: deliver with `path` as received (we do not append ourselves).
             val actions = mutableListOf(Action(ActionType.DELIVER_LOCAL, updated))
             if (updated.ackRequested()) actions += buildAck(updated)
             return actions
         }
-        val nextHop = updated.route[updated.routeCursor]
-        return listOf(Action(ActionType.RELAY_NEXT_HOP, updated, nextHop = nextHop))
+        // Relaying onward: record ourselves as an intermediate hop.
+        val relayed = updated.copy(path = updated.path + localId)
+        val nextHop = relayed.route[relayed.routeCursor]
+        return listOf(Action(ActionType.RELAY_NEXT_HOP, relayed, nextHop = nextHop))
     }
 
     /**
      * Builds a source-routed Sidepath ACK for a locally delivered unicast datagram
-     * (§9.2). Route = reverse(delivered.path excluding local) + [original.source].
+     * (§9.2). Route = reverse(delivered.path) + [original.source]; `path` is relays-only.
      */
     private fun buildAck(delivered: Datagram): Action {
-        val hopsBack = delivered.path.dropLast(1).reversed() // exclude local (final path entry)
-        val route = hopsBack + delivered.source
+        // `path` holds only the intermediate relays (we never appended ourselves on delivery), so the
+        // return route is the reversed relay list followed by the original source.
+        val route = delivered.path.reversed() + delivered.source
         val ack = Datagram(
             id = Datagram.newDatagramId(),
             source = localId,
