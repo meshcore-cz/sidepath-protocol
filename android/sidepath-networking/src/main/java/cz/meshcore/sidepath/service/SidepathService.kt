@@ -141,6 +141,9 @@ data class ReceivedMessage(
     val meshCoreRoute: String? = null,
     val meshCoreHops: Int = 0,
     val meshCorePacketId: String? = null,
+    // The external network this bridged message crossed on: the carrier's embedded SPMC code (§13.1),
+    // or the bridge's resolved network. Blank when unknown / native Sidepath.
+    val meshCoreNetworkCode: String = "",
     val sentAtMs: Long = 0L,
     val timestampMs: Long = System.currentTimeMillis(),
     // RSSI (dBm) of the direct link this datagram arrived on, or RSSI_UNKNOWN. Persisted on the
@@ -885,6 +888,10 @@ class SidepathService : Service() {
         // decode, persisted raw — operates on [mcRaw] so framed and legacy-raw copies of the same
         // packet dedup identically across a mixed bridge fleet.
         val (embeddedCode, mcRaw) = MeshCoreCarrier.unframe(dg.payload)
+        // The network this packet crossed on: prefer the carrier's embedded SPMC code, else resolve
+        // from the bridging carrier's signed v2 ANNOUNCE bridges (§8.3). Used to tag adverts and the
+        // chat messages decoded below.
+        val bridgedNetworkCode = embeddedCode.ifBlank { carrierNetworkCode(dg.source) }
         val hash = sha256(mcRaw)
         val contentId = hash.copyOf(6).toHex()
         val rssi = peers[addrHex]?.rssi ?: RSSI_UNKNOWN
@@ -902,10 +909,7 @@ class SidepathService : Service() {
         // its network. A carrier bridging one network resolves unambiguously; otherwise blank.
         if (firstSight && env != null && env.type == MeshCoreType.ADVERT && env.payload.isNotEmpty()) {
             MeshCoreCodec.decodeAdvert(env.payload)?.let { adv ->
-                // Prefer the network the bridge embedded in the carrier frame; fall back to resolving
-                // it from the carrier's signed v2 ANNOUNCE bridges (§8.3) when untagged.
-                val carrierNet = embeddedCode.ifBlank { carrierNetworkCode(dg.source) }
-                _meshCoreAdverts.update { (listOf(adv.copy(networkCode = carrierNet)) + it).take(maxRxPackets) }
+                _meshCoreAdverts.update { (listOf(adv.copy(networkCode = bridgedNetworkCode)) + it).take(maxRxPackets) }
             }
         }
 
@@ -943,6 +947,7 @@ class SidepathService : Service() {
                         meshCoreRoute = env.route + transport,
                         meshCoreHops = env.hopCount,
                         meshCorePacketId = contentId,
+                        meshCoreNetworkCode = bridgedNetworkCode,
                         meshCorePacketRaw = mcRaw,
                         // The local Sidepath datagram that carried this MeshCore packet — persisted so
                         // the (Sidepath-first) packet detail + its datagram id survive a restart.
@@ -1011,6 +1016,7 @@ class SidepathService : Service() {
                         meshCoreRoute = env.route + transport,
                         meshCoreHops = env.hopCount,
                         meshCorePacketId = contentId,
+                        meshCoreNetworkCode = bridgedNetworkCode,
                         meshCorePacketRaw = mcRaw,
                         raw = dg.encode(),
                         rssi = rssi,
