@@ -29,8 +29,16 @@ enum : uint8_t { PHY_UNKNOWN = 0, PHY_1M = 1, PHY_2M = 2, PHY_CODED = 3 };
 // Which side opened a neighbor link, for a v3 ANNOUNCE neighbor_info entry (§8.8, §4.4).
 enum : uint8_t { CONN_DIR_OUT = 1, CONN_DIR_IN = 2, CONN_DIR_BOTH = 3 };
 
+// Link transport for a v3 ANNOUNCE neighbor_info entry (§8.8). This node's links are all BLE.
+enum : uint8_t { TRANSPORT_UNKNOWN = 0, TRANSPORT_BLE = 1, TRANSPORT_MESHCORE = 2,
+                 TRANSPORT_TCP = 3, TRANSPORT_USB = 4 };
+
 // One directly-linked peer's per-link details, advertised in a v3 ANNOUNCE neighbor_info entry.
-// [rssi] is dBm (0 = no sample); [ageS] is seconds since the last packet (0 = unknown).
+// The first group is the original §8.8 fields: [rssi] dBm (0 = no sample), PHY each way, which side
+// opened the link, [ageS] seconds since the last packet (0 = unknown). The second group is the
+// extended quality hints (also §8.8); each 0 = unknown: [transport] link tech, [rssiEwma] smoothed
+// RSSI dBm, [qualityQ8] recent reliability 0..255, [latencyMs] representative RTT, [queueQ8]
+// congestion 0..255. A constrained relay may leave the extended hints at 0.
 struct AnnounceNeighborInfo {
   uint8_t  id[NODE_ID_LEN];
   int8_t   rssi;
@@ -38,6 +46,11 @@ struct AnnounceNeighborInfo {
   uint8_t  rxPhy;
   uint8_t  dir;
   uint32_t ageS;
+  uint8_t  transport;
+  int8_t   rssiEwma;
+  uint8_t  qualityQ8;
+  uint16_t latencyMs;
+  uint8_t  queueQ8;
 };
 
 constexpr uint8_t MAX_TTL        = 16;

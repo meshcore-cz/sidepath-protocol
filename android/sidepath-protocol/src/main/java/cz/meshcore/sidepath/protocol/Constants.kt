@@ -101,6 +101,16 @@ object ConnDirection {
     const val BOTH: Int = 3
 }
 
+/** Link transport technology carried in a v3 ANNOUNCE `neighbor_info` entry (§8.8). 0 = unknown. */
+object Transport {
+    const val UNKNOWN: Int = 0
+    const val BLE: Int = 1
+    const val MESHCORE: Int = 2
+    const val TCP: Int = 3
+    const val USB: Int = 4
+    const val MAX: Int = USB
+}
+
 /** Payload protocol registry values (§6.4). */
 object PayloadProtocol {
     const val SIDEPATH_CONTROL: Int = 0x0000

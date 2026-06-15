@@ -524,10 +524,11 @@ static void sendAnnounce() {
     }
     infos.reserve(byId.size());
     for (auto& kv : byId) {
-      mesh::AnnounceNeighborInfo ni{};
+      mesh::AnnounceNeighborInfo ni{};   // extended quality hints (transport aside) stay 0 = unknown
       std::copy(kv.first.begin(), kv.first.end(), ni.id);
       ni.txPhy = mesh::PHY_1M;   // 1M-only radio
       ni.rxPhy = mesh::PHY_1M;
+      ni.transport = mesh::TRANSPORT_BLE;
       ni.dir = (kv.second.out && kv.second.in) ? mesh::CONN_DIR_BOTH
              : (kv.second.out ? mesh::CONN_DIR_OUT : mesh::CONN_DIR_IN);
       ni.rssi = 0;   // 0 = no sample

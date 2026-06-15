@@ -91,18 +91,28 @@ data class NeighborInfo(
     val rxPhy: Int = Phy.UNKNOWN,
     val direction: Int = ConnDirection.OUTGOING,
     val ageS: Long = 0L,
+    // Extended v3 link hints (§8.8); each 0 = unknown. [transport] is the link technology
+    // ([Transport]); [rssiEwma] a smoothed RSSI in dBm; [qualityQ8] a 0..255 recent-reliability score;
+    // [latencyMs] a representative round-trip latency; [queueQ8] a 0..255 congestion estimate.
+    val transport: Int = Transport.UNKNOWN,
+    val rssiEwma: Int = 0,
+    val qualityQ8: Int = 0,
+    val latencyMs: Int = 0,
+    val queueQ8: Int = 0,
 ) {
-    /** Checks the PHY and direction enums are in range. */
+    /** Checks the PHY, direction, and transport enums are in range. */
     fun isValid(): Boolean {
         if (txPhy < 0 || txPhy > Phy.CODED || rxPhy < 0 || rxPhy > Phy.CODED) return false
         if (direction < 0 || direction > ConnDirection.BOTH) return false
+        if (transport < 0 || transport > Transport.MAX) return false
         return true
     }
 }
 
 /**
  * Encodes the v3 announce `neighbor_info` array (§8.8): each entry a map {1:id, [2:rssi, 3:txPhy,
- * 4:rxPhy, 5:dir, 6:ageS]}. Keys 2-6 are omitted when zero, matching the Go encoder's omitempty.
+ * 4:rxPhy, 5:dir, 6:ageS, 7:transport, 8:rssiEwma, 9:qualityQ8, 10:latencyMs, 11:queueQ8]}. Keys
+ * 2-11 are omitted when zero, matching the Go encoder's omitempty.
  */
 private fun neighborInfoArray(infos: List<NeighborInfo>): CBORObject {
     val arr = CBORObject.NewArray()
@@ -114,6 +124,11 @@ private fun neighborInfoArray(infos: List<NeighborInfo>): CBORObject {
         if (n.rxPhy != 0) m[k(4)] = CBORObject.FromObject(n.rxPhy)
         if (n.direction != 0) m[k(5)] = CBORObject.FromObject(n.direction)
         if (n.ageS != 0L) m[k(6)] = CBORObject.FromObject(n.ageS)
+        if (n.transport != 0) m[k(7)] = CBORObject.FromObject(n.transport)
+        if (n.rssiEwma != 0) m[k(8)] = CBORObject.FromObject(n.rssiEwma)
+        if (n.qualityQ8 != 0) m[k(9)] = CBORObject.FromObject(n.qualityQ8)
+        if (n.latencyMs != 0) m[k(10)] = CBORObject.FromObject(n.latencyMs)
+        if (n.queueQ8 != 0) m[k(11)] = CBORObject.FromObject(n.queueQ8)
         arr.Add(m)
     }
     return arr
@@ -130,6 +145,11 @@ private fun neighborInfoList(obj: CBORObject?): List<NeighborInfo> {
             rxPhy = m[k(4)]?.AsInt32() ?: 0,
             direction = m[k(5)]?.AsInt32() ?: 0,
             ageS = m[k(6)]?.AsInt64Value() ?: 0L,
+            transport = m[k(7)]?.AsInt32() ?: 0,
+            rssiEwma = m[k(8)]?.AsInt32() ?: 0,
+            qualityQ8 = m[k(9)]?.AsInt32() ?: 0,
+            latencyMs = m[k(10)]?.AsInt32() ?: 0,
+            queueQ8 = m[k(11)]?.AsInt32() ?: 0,
         )
     }
 }

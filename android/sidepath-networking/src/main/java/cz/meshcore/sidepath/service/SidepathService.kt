@@ -449,6 +449,7 @@ class SidepathService : Service() {
         val floodTtl: Int,
         var attemptsSent: Int,
         var job: Job? = null,
+        val startedAtMs: Long = System.currentTimeMillis(),
     )
 
     private val _receivedMessages = MutableStateFlow<List<ReceivedMessage>>(emptyList())
@@ -1651,6 +1652,7 @@ class SidepathService : Service() {
             if (p.attemptsSent >= dmMaxTries) {
                 log("DM ${p.idHex.take(8)} unacked after ${p.attemptsSent} tries — giving up", LogTag.MSG)
                 pendingDms.remove(p.idHex)
+                recordLinkDelivery(p.dest, false)
                 updateDelivery(p.idHex) { it.copy(failed = true) }
                 return@launch
             }
@@ -1665,9 +1667,25 @@ class SidepathService : Service() {
 
     private fun resolveDmAck(ackedRaw: ByteArray?): ByteArray? {
         if (ackedRaw == null) return null
-        pendingDms.remove(ackedRaw.toHex())?.job?.cancel()
+        val pending = pendingDms.remove(ackedRaw.toHex())
+        pending?.job?.cancel()
+        if (pending != null) {
+            recordLinkDelivery(pending.dest, true)
+            recordLinkRtt(pending.dest, (System.currentTimeMillis() - pending.startedAtMs).toInt())
+        }
         updateDelivery(ackedRaw.toHex()) { it.copy(acked = true) }
         return ackedRaw
+    }
+
+    // Direct-link delivery/RTT feedback feeds the neighbor table's live link stats, which seed the
+    // quality hints in our v3 ANNOUNCE (§8.8). Only attribute it when dest is a direct neighbor —
+    // a multi-hop ACK round-trip is end-to-end, not a single link, and would mis-attribute.
+    private fun recordLinkDelivery(dest: NodeId, ok: Boolean) {
+        if (router.neighbors.get(dest) != null) router.neighbors.recordDelivery(dest, ok)
+    }
+
+    private fun recordLinkRtt(dest: NodeId, ms: Int) {
+        if (ms in 1..65535 && router.neighbors.get(dest) != null) router.neighbors.recordRtt(dest, ms)
     }
 
     fun setDescription(description: String) {

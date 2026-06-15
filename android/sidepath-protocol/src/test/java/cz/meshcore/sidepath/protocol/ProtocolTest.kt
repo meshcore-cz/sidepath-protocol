@@ -127,19 +127,21 @@ class ProtocolTest {
     // Mirror of core/announce_v3_test.go's sharedV3Vector. Both impls MUST produce these exact signed
     // bytes (and signature) for the same identity/fields/neighbor_info, or the v3 ANNOUNCE wire format
     // (§8.8) has drifted between Go and Kotlin. Inputs: identity seed offset 7; epoch 3, seq 4,
-    // timestamp 100, caps 0x1F; name "alice", desc "", platform "test"; no bridges; neighbor_info
-    // [{seed8, rssi -50, tx 1M, rx 2M, dir out, age 12}, {seed9, rssi -70, tx coded, rx coded, dir in,
-    // age 300}] (sorted by ID).
+    // timestamp 100, caps 0x1F; name "alice", desc "", platform "test"; no bridges; neighbor_info two
+    // entries (sorted by ID), each carrying the original six fields plus the extended v3 hints
+    // (transport, rssi_ewma, quality_q8, latency_ms, queue_q8).
     private val sharedV3SignedMsgHex =
-        "53494445504154482d414e4e4f554e43452d5631000300d05a1d1ea251396d557afbd4588b3c6d99dbeb972fed10a32562ea26dcdcfa03000000000000000400000064000000000000001f0000000500616c6963650000040074657374000002004bddee550ef734cae04ece0102010c000000677edd9c7a6fbaa5d609ba0303022c010000"
+        "53494445504154482d414e4e4f554e43452d5631000300d05a1d1ea251396d557afbd4588b3c6d99dbeb972fed10a32562ea26dcdcfa03000000000000000400000064000000000000001f0000000500616c6963650000040074657374000002004bddee550ef734cae04ece0102010c00000001cd4b080006677edd9c7a6fbaa5d609ba0303022c01000002b996120020"
     private val sharedV3SigHex =
-        "fd9ad6da0b001f66bf57bc234a5f19294d53de57e4c422732218691138bde5f45bdddfe0671f5f8ffcec9323f89a335b2480ddd872e491ca48444d16ee166a0b"
+        "cdc3a6b00664e763d0341888de329175748f17af606a5897ef98d86607a90224f6c0c07a13d6243a1faf59388f1a2a3f4fb3318e0ed733c074438933a855bb0d"
 
     @Test fun announceV3CrossImplVector() {
         val id = Identity.fromSeed(seed(7))
         // Pass unsorted to confirm createV3 sorts by ID.
-        val n8 = NeighborInfo(Identity.fromSeed(seed(8)).nodeId, rssi = -50, txPhy = Phy.LE_1M, rxPhy = Phy.LE_2M, direction = ConnDirection.OUTGOING, ageS = 12L)
-        val n9 = NeighborInfo(Identity.fromSeed(seed(9)).nodeId, rssi = -70, txPhy = Phy.CODED, rxPhy = Phy.CODED, direction = ConnDirection.INCOMING, ageS = 300L)
+        val n8 = NeighborInfo(Identity.fromSeed(seed(8)).nodeId, rssi = -50, txPhy = Phy.LE_1M, rxPhy = Phy.LE_2M, direction = ConnDirection.OUTGOING, ageS = 12L,
+            transport = Transport.BLE, rssiEwma = -51, qualityQ8 = 75, latencyMs = 8, queueQ8 = 6)
+        val n9 = NeighborInfo(Identity.fromSeed(seed(9)).nodeId, rssi = -70, txPhy = Phy.CODED, rxPhy = Phy.CODED, direction = ConnDirection.INCOMING, ageS = 300L,
+            transport = Transport.MESHCORE, rssiEwma = -71, qualityQ8 = 150, latencyMs = 18, queueQ8 = 32)
         val body = AnnounceBody.createV3(
             id, epoch = 3, seq = 4, timestamp = 100, caps = Capabilities(0x1F),
             neighborInfo = listOf(n9, n8), name = "alice", description = "", platform = "test",
@@ -165,6 +167,12 @@ class ProtocolTest {
         assertEquals(listOf(Phy.LE_2M, Phy.CODED), decoded.neighborInfo.map { it.rxPhy })
         assertEquals(listOf(ConnDirection.OUTGOING, ConnDirection.INCOMING), decoded.neighborInfo.map { it.direction })
         assertEquals(listOf(12L, 300L), decoded.neighborInfo.map { it.ageS })
+        // Extended v3 hints survive the round-trip too.
+        assertEquals(listOf(Transport.BLE, Transport.MESHCORE), decoded.neighborInfo.map { it.transport })
+        assertEquals(listOf(-51, -71), decoded.neighborInfo.map { it.rssiEwma })
+        assertEquals(listOf(75, 150), decoded.neighborInfo.map { it.qualityQ8 })
+        assertEquals(listOf(8, 18), decoded.neighborInfo.map { it.latencyMs })
+        assertEquals(listOf(6, 32), decoded.neighborInfo.map { it.queueQ8 })
         assertTrue(decoded.neighborInfo.zipWithNext().all { (x, y) -> x.id < y.id })
         assertTrue(decoded.isValid())
         // neighborIds reads through to the v3 info list.

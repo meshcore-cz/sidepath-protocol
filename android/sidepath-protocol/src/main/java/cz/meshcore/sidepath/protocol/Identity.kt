@@ -144,6 +144,12 @@ class Identity private constructor(
                     out.write(n.rxPhy)
                     out.write(n.direction)
                     out.write(Wire.le32(n.ageS))
+                    // Extended v3 link hints (§8.8), in fixed field order after the original six.
+                    out.write(n.transport)
+                    out.write(n.rssiEwma and 0xFF) // int8 dBm
+                    out.write(n.qualityQ8)
+                    out.write(Wire.le16(n.latencyMs))
+                    out.write(n.queueQ8)
                 }
             }
             return out.toByteArray()

@@ -452,8 +452,9 @@ void announceSignedMessage(const uint8_t pubKey[PUBKEY_LEN], uint64_t epoch, uin
   appendString16(out, platform ? platform : "");
   // v2 appends a bridges section before neighbor_info; this node bridges nothing, so count is 0.
   if (version >= 2) appendLE16(out, 0);
-  // v3 appends the neighbor_info section (§8.8): nbrinfo_count[2 LE] then per entry
-  // id[10] | rssi[1 int8] | tx_phy[1] | rx_phy[1] | dir[1] | age_s[4 LE]. Entries are sorted, unique.
+  // v3 appends the neighbor_info section (§8.8): nbrinfo_count[2 LE] then per entry (23 bytes)
+  // id[10] | rssi[1 int8] | tx_phy[1] | rx_phy[1] | dir[1] | age_s[4 LE] | transport[1] |
+  // rssi_ewma[1 int8] | quality_q8[1] | latency_ms[2 LE] | queue_q8[1]. Entries are sorted, unique.
   if (version >= 3) {
     appendLE16(out, (uint16_t)infoCount);
     for (size_t i = 0; i < infoCount; i++) {
@@ -463,12 +464,18 @@ void announceSignedMessage(const uint8_t pubKey[PUBKEY_LEN], uint64_t epoch, uin
       out.push_back(infos[i].rxPhy);
       out.push_back(infos[i].dir);
       appendLE32(out, infos[i].ageS);
+      out.push_back(infos[i].transport);
+      out.push_back((uint8_t)infos[i].rssiEwma);
+      out.push_back(infos[i].qualityQ8);
+      appendLE16(out, infos[i].latencyMs);
+      out.push_back(infos[i].queueQ8);
     }
   }
 }
 
-// Emits one CBOR neighbor_info entry {1:id, [2:rssi,3:txPhy,4:rxPhy,5:dir,6:ageS]} into [o]. Keys
-// 2-6 are omitted when zero, matching the Go encoder's omitempty (decoders default missing keys to 0).
+// Emits one CBOR neighbor_info entry {1:id, [2:rssi,3:txPhy,4:rxPhy,5:dir,6:ageS, 7:transport,
+// 8:rssiEwma,9:qualityQ8,10:latencyMs,11:queueQ8]} into [o]. Keys 2-11 are omitted when zero,
+// matching the Go encoder's omitempty (decoders default missing keys to 0).
 static void emitNeighborInfo(std::vector<uint8_t>& o, const AnnounceNeighborInfo& n) {
   uint8_t fields = 1;  // key 1 (id) is always present
   if (n.rssi != 0) fields++;
@@ -476,6 +483,11 @@ static void emitNeighborInfo(std::vector<uint8_t>& o, const AnnounceNeighborInfo
   if (n.rxPhy != 0) fields++;
   if (n.dir != 0) fields++;
   if (n.ageS != 0) fields++;
+  if (n.transport != 0) fields++;
+  if (n.rssiEwma != 0) fields++;
+  if (n.qualityQ8 != 0) fields++;
+  if (n.latencyMs != 0) fields++;
+  if (n.queueQ8 != 0) fields++;
   emitMapHeader(o, fields);
   emitUint(o, 1); emitBstr(o, n.id, NODE_ID_LEN);
   if (n.rssi != 0) { emitUint(o, 2); emitInt(o, n.rssi); }
@@ -483,6 +495,11 @@ static void emitNeighborInfo(std::vector<uint8_t>& o, const AnnounceNeighborInfo
   if (n.rxPhy != 0) { emitUint(o, 4); emitUint(o, n.rxPhy); }
   if (n.dir != 0) { emitUint(o, 5); emitUint(o, n.dir); }
   if (n.ageS != 0) { emitUint(o, 6); emitUint(o, n.ageS); }
+  if (n.transport != 0) { emitUint(o, 7); emitUint(o, n.transport); }
+  if (n.rssiEwma != 0) { emitUint(o, 8); emitInt(o, n.rssiEwma); }
+  if (n.qualityQ8 != 0) { emitUint(o, 9); emitUint(o, n.qualityQ8); }
+  if (n.latencyMs != 0) { emitUint(o, 10); emitUint(o, n.latencyMs); }
+  if (n.queueQ8 != 0) { emitUint(o, 11); emitUint(o, n.queueQ8); }
 }
 
 void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint16_t caps, uint64_t epoch,

@@ -74,8 +74,14 @@ int main(int argc, char** argv) {
       ni.txPhy = mesh::PHY_1M;
       ni.rxPhy = mesh::PHY_1M;
       ni.dir = mesh::CONN_DIR_OUT;
+      ni.transport = mesh::TRANSPORT_BLE;
       ni.rssi = (int8_t)(-50 - (int)i);  // exercise negative-RSSI CBOR + signed-byte encoding
       ni.ageS = 12 + (uint32_t)i;        // exercise the age field
+      // Exercise the extended v3 quality hints too (§8.8).
+      ni.rssiEwma = (int8_t)(-52 - (int)i);
+      ni.qualityQ8 = (uint8_t)(200 - i);
+      ni.latencyMs = (uint16_t)(20 + i);
+      ni.queueQ8 = (uint8_t)(i + 1);
       infos.push_back(ni);
     }
     uint8_t version = nCount ? mesh::ANNOUNCE_VERSION : 1;
