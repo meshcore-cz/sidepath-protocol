@@ -480,20 +480,40 @@ func (n *Node) handleIncomingFrame(raw []byte, fromPeer *core.NodeID, fromAddr s
 	// connected inbound to us.
 	n.learnNeighbor(dg, fromAddr)
 
-	// Count this received Sidepath packet against the link peer it arrived over
-	// (resolved post-learnNeighbor for inbound links), and stamp the receive time.
-	linkPeer := core.NodeID{}
-	if fromPeer != nil {
-		linkPeer = *fromPeer
-	} else if fromAddr != "" {
-		n.mu.Lock()
-		linkPeer = n.serverPeerIDs[fromAddr]
-		n.mu.Unlock()
-	}
+	// Attribute this received packet to the directly-connected link peer. Prefer the
+	// BLE callback's peer, then the learned inbound central mapping, then the
+	// datagram's direct-hop shape (last path hop, or source for a direct packet).
+	linkPeer := n.directPeerForDatagram(dg, fromPeer, fromAddr)
 	n.recordRX(linkPeer)
 
-	actions := n.router.HandleDatagram(dg, fromPeer)
+	var incomingPeer *core.NodeID
+	var zero core.NodeID
+	if linkPeer != zero {
+		incomingPeer = &linkPeer
+	}
+	actions := n.router.HandleDatagram(dg, incomingPeer)
 	n.executeActions(actions)
+}
+
+func (n *Node) directPeerForDatagram(dg core.Datagram, fromPeer *core.NodeID, fromAddr string) core.NodeID {
+	if fromPeer != nil {
+		return *fromPeer
+	}
+	if fromAddr != "" {
+		n.mu.Lock()
+		linkPeer := n.serverPeerIDs[fromAddr]
+		n.mu.Unlock()
+		if linkPeer != (core.NodeID{}) {
+			return linkPeer
+		}
+	}
+	if len(dg.Path) > 0 {
+		return dg.Path[len(dg.Path)-1]
+	}
+	if dg.Source != n.nodeID {
+		return dg.Source
+	}
+	return core.NodeID{}
 }
 
 // isDuplicateDrop reports whether the router dropped the packet as an already-seen duplicate.

@@ -75,7 +75,7 @@ routes it found through the known topology and the best one's hop count and cost
 			return err
 		}
 		if usedPathrank {
-			fmt.Fprintln(out, "\nROUTE: 'direct'/'Nh' = node's selected route; 'Np Hh cC' = pathrank found N candidate(s), best is H hop(s) at cost C")
+			fmt.Fprintln(out, "\nROUTE: 'direct'/'Nh' = node's selected route; 'Np Hh cC' = pathrank found N candidate(s), best uses H relay hop(s) at cost C")
 		}
 		return nil
 	},
@@ -180,7 +180,7 @@ func peerRoute(p api.Peer, routesByDest map[core.NodeID][]pathrank.Route) (strin
 		return "no-route", false
 	}
 	best := routes[0]
-	return fmt.Sprintf("%dp %dh c%.1f", len(routes), len(best.Hops), best.Total), true
+	return fmt.Sprintf("%dp %dh c%.1f", len(routes), relayHopCount(best), best.Total), true
 }
 
 // capsString renders the relay/gateway capability flags compactly.

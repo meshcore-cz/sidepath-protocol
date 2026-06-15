@@ -245,12 +245,12 @@ func printPaths(out io.Writer, self, dest core.NodeID, routes []pathrank.Route, 
 	}
 
 	for i, r := range routes {
-		nodeSeq := append([]core.NodeID{self}, r.Path()...)
+		nodeSeq := r.Path()
 		parts := make([]string, len(nodeSeq))
 		for j, id := range nodeSeq {
 			parts[j] = label(id)
 		}
-		fmt.Fprintf(out, "#%d  cost %.1f  %d hop(s): %s\n", i+1, r.Total, len(r.Hops), strings.Join(parts, " → "))
+		fmt.Fprintf(out, "#%d  cost %.1f  %s: %s\n", i+1, r.Total, relayHopLabel(r), strings.Join(parts, " → "))
 		for _, h := range r.Hops {
 			fmt.Fprintf(out, "      %s → %s   %s   cost %.1f  [%s]\n",
 				label(h.From), label(h.To), linkMetrics(h.Link, h.Cost), h.Cost.Total, costBreakdown(h.Cost))
@@ -273,14 +273,25 @@ func printPathOverview(out io.Writer, self, dest core.NodeID, routes []pathrank.
 		return
 	}
 	for i, r := range routes {
-		seq := append([]core.NodeID{self}, r.Path()...)
+		seq := r.Path()
 		parts := make([]string, len(seq))
 		for j, id := range seq {
 			parts[j] = label(id)
 		}
-		fmt.Fprintf(out, "  #%d  cost %.1f  %d hop(s)  %s\n", i+1, r.Total, len(r.Hops), strings.Join(parts, " → "))
+		fmt.Fprintf(out, "  #%d  cost %.1f  %s  %s\n", i+1, r.Total, relayHopLabel(r), strings.Join(parts, " → "))
 	}
 	fmt.Fprintf(out, "  (run 'sp path %s' for the per-hop cost breakdown)\n", shortID(dest.String()))
+}
+
+func relayHopCount(r pathrank.Route) int {
+	if len(r.Hops) == 0 {
+		return 0
+	}
+	return len(r.Hops) - 1
+}
+
+func relayHopLabel(r pathrank.Route) string {
+	return fmt.Sprintf("%d hop(s)", relayHopCount(r))
 }
 
 // linkMetrics renders the raw link facts a hop's cost was derived from: the
