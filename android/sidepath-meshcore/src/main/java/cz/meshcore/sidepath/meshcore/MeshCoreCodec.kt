@@ -155,6 +155,33 @@ object MeshCoreCodec {
     }.getOrNull()
 
     /**
+     * Builds MeshCore's compatibility reply for a FLOOD-routed TXT_MSG: a PATH return packet with an
+     * embedded ACK extra. [path] is the inbound flood path copied from the packet we received.
+     */
+    fun encodePathTextAck(
+        seed: ByteArray,
+        senderPub: ByteArray,
+        timestampSec: Long,
+        attempt: Int,
+        text: String,
+        path: ByteArray,
+        pathHashSize: Int,
+    ): ByteArray? = runCatching {
+        val args = JSONArray()
+            .put(seed.toHex())
+            .put(senderPub.toHex())
+            .put(timestampSec)
+            .put(attempt)
+            .put(text)
+            .put(path.toHex())
+            .put(pathHashSize)
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("encodePathTextAckIdentity", args.toString())
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        o.optString("hex", "").takeIf { it.isNotEmpty() }?.hexToBytes()
+    }.getOrNull()
+
+    /**
      * Builds a MeshCore TXT_MSG (direct message) OTA packet addressed to [peerPub], encrypted with
      * the firmware-compatible shared secret derived from our identity [seed] (meshpkt op
      * `encodeDirectTextIdentity`). Returns the raw OTA packet bytes, or null on error.

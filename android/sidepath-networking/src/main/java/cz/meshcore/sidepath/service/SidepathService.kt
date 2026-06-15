@@ -1115,11 +1115,27 @@ class SidepathService : Service() {
                         sentAtMs = dm.timestampSec * 1000,
                     )
                 )
-                // ACK the message back onto MeshCore (built once, deterministic — the bridge dedups
-                // the inject; multiple Sidepath paths arriving here are harmless).
-                MeshCoreCodec.encodeTextAck(dm.timestampSec, dm.attempt, dm.text, senderPub)?.let { ack ->
-                    sendMeshCoreRaw(ack)
-                    log("meshcore DM rx from=${senderPub.copyOf(2).toHex()} content=$contentId acked", LogTag.MSG)
+                // MeshCore compatibility: a FLOOD-routed TXT_MSG is ACKed as a returned PATH packet
+                // with the ACK embedded as extra payload. Once the sender learns that path,
+                // subsequent ACKs/messages can be direct. Fall back to a standalone ACK if the local
+                // AAR is stale or the PATH builder rejects the packet shape.
+                val floodReply = env.route.contains("FLOOD")
+                val pathAck = if (floodReply) {
+                    MeshCoreCodec.encodePathTextAck(
+                        seed = self.seed,
+                        senderPub = senderPub,
+                        timestampSec = dm.timestampSec,
+                        attempt = dm.attempt,
+                        text = dm.text,
+                        path = meshCorePathBytes(env),
+                        pathHashSize = env.pathHashSize.takeIf { it in 1..3 } ?: 2,
+                    )
+                } else null
+                val ack = pathAck ?: MeshCoreCodec.encodeTextAck(dm.timestampSec, dm.attempt, dm.text, senderPub)
+                ack?.let {
+                    sendMeshCoreRaw(it)
+                    val ackKind = if (pathAck != null) "path-ack" else "ack"
+                    log("meshcore DM rx from=${senderPub.copyOf(2).toHex()} content=$contentId $ackKind", LogTag.MSG)
                 }
                 break
             }
@@ -1209,6 +1225,16 @@ class SidepathService : Service() {
 
     private fun sha256(bytes: ByteArray): ByteArray =
         java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+
+    private fun meshCorePathBytes(env: cz.meshcore.sidepath.meshcore.MeshCoreEnvelope): ByteArray {
+        val out = ByteArray(env.hops.sumOf { it.size })
+        var offset = 0
+        for (hop in env.hops) {
+            hop.copyInto(out, offset)
+            offset += hop.size
+        }
+        return out
+    }
 
     /** Chat-app pushes the joined-channel PSKs so the MeshCore Rx Log can render GRP_TXT plaintext. */
     fun setMeshCoreChannelSecrets(secrets: List<ByteArray>) {
