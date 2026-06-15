@@ -22,15 +22,17 @@ type NodeConfig struct {
 	MeshcoreSocket string   `toml:"meshcore_socket"` // meshcore-go backend socket (empty = default)
 	Bridges        []string `toml:"bridges"`         // external networks this gateway advertises, e.g. ["CZ"]
 	AllowPeers     []string `toml:"allow_peers"`     // NodeID allowlist (empty = allow all)
+	Modem          string   `toml:"modem"`           // serial port for an attached ESP32-C6 BLE modem
+	ModemRelay     bool     `toml:"modem_relay"`     // enable scan + connectionless relay on the attached modem
 }
 
 // ConfigPath is the node config file in the state directory.
 func (c *Config) ConfigPath() string { return filepath.Join(c.Dir, "config.toml") }
 
-// LoadNodeConfig reads config.toml from path. A missing file is not an error: it
-// returns a zero NodeConfig so callers can layer CLI flags on top.
+// LoadNodeConfig reads config.toml from path. A missing file is not an error:
+// callers get the conventional defaults so CLI flags can be layered on top.
 func LoadNodeConfig(path string) (NodeConfig, error) {
-	var nc NodeConfig
+	nc := defaultNodeConfig()
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nc, nil
@@ -65,13 +67,22 @@ func (nc NodeConfig) Save(path string) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// Defaulted returns a copy with the conventional defaults applied (Bun, Channels).
+// Defaulted returns a copy with the conventional defaults applied.
 func (nc NodeConfig) Defaulted() NodeConfig {
+	defaults := defaultNodeConfig()
 	if nc.Bun == "" {
-		nc.Bun = "bun"
+		nc.Bun = defaults.Bun
 	}
 	if len(nc.Channels) == 0 {
-		nc.Channels = []string{"Public"}
+		nc.Channels = defaults.Channels
 	}
 	return nc
+}
+
+func defaultNodeConfig() NodeConfig {
+	return NodeConfig{
+		Bun:        "bun",
+		Channels:   []string{"Public"},
+		ModemRelay: true,
+	}
 }

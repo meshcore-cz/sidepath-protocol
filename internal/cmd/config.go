@@ -40,6 +40,12 @@ bridges = []
 
 # NodeID allowlist (empty = allow all peers).
 allow_peers = []
+
+# ESP32-C6 BLE modem serial port; empty disables the daemon-owned modem.
+# On macOS use /dev/cu.usbmodem*; Linux usually uses /dev/ttyACM*.
+modem = ""
+# Enable scan + connectionless relay when a modem is attached.
+modem_relay = true
 `
 
 var configCmd = &cobra.Command{

@@ -431,14 +431,15 @@ bool buildSourceRouteForward(const uint8_t* dg, size_t len, const uint8_t selfId
 }
 
 void announceSignedMessage(const uint8_t pubKey[PUBKEY_LEN], uint64_t epoch, uint32_t seq,
-                           int64_t timestamp, uint16_t caps,
+                           int64_t timestamp, uint16_t caps, uint8_t version,
                            const uint8_t* neighbors, size_t neighborCount,
+                           const AnnounceNeighborInfo* infos, size_t infoCount,
                            const char* name, const char* description, const char* platform,
                            std::vector<uint8_t>& out) {
   out.clear();
   const char prefix[] = "SIDEPATH-ANNOUNCE-V1";
   out.insert(out.end(), prefix, prefix + sizeof(prefix));  // includes trailing NUL.
-  out.push_back(ANNOUNCE_VERSION);
+  out.push_back(version);
   out.insert(out.end(), pubKey, pubKey + PUBKEY_LEN);
   appendLE64(out, epoch);
   appendLE32(out, seq);
@@ -449,17 +450,53 @@ void announceSignedMessage(const uint8_t pubKey[PUBKEY_LEN], uint64_t epoch, uin
   appendString16(out, name ? name : "");
   appendString16(out, description ? description : "");
   appendString16(out, platform ? platform : "");
+  // v2 appends a bridges section before neighbor_info; this node bridges nothing, so count is 0.
+  if (version >= 2) appendLE16(out, 0);
+  // v3 appends the neighbor_info section (§8.8): nbrinfo_count[2 LE] then per entry
+  // id[10] | rssi[1 int8] | tx_phy[1] | rx_phy[1] | dir[1] | age_s[4 LE]. Entries are sorted, unique.
+  if (version >= 3) {
+    appendLE16(out, (uint16_t)infoCount);
+    for (size_t i = 0; i < infoCount; i++) {
+      out.insert(out.end(), infos[i].id, infos[i].id + NODE_ID_LEN);
+      out.push_back((uint8_t)infos[i].rssi);
+      out.push_back(infos[i].txPhy);
+      out.push_back(infos[i].rxPhy);
+      out.push_back(infos[i].dir);
+      appendLE32(out, infos[i].ageS);
+    }
+  }
+}
+
+// Emits one CBOR neighbor_info entry {1:id, [2:rssi,3:txPhy,4:rxPhy,5:dir,6:ageS]} into [o]. Keys
+// 2-6 are omitted when zero, matching the Go encoder's omitempty (decoders default missing keys to 0).
+static void emitNeighborInfo(std::vector<uint8_t>& o, const AnnounceNeighborInfo& n) {
+  uint8_t fields = 1;  // key 1 (id) is always present
+  if (n.rssi != 0) fields++;
+  if (n.txPhy != 0) fields++;
+  if (n.rxPhy != 0) fields++;
+  if (n.dir != 0) fields++;
+  if (n.ageS != 0) fields++;
+  emitMapHeader(o, fields);
+  emitUint(o, 1); emitBstr(o, n.id, NODE_ID_LEN);
+  if (n.rssi != 0) { emitUint(o, 2); emitInt(o, n.rssi); }
+  if (n.txPhy != 0) { emitUint(o, 3); emitUint(o, n.txPhy); }
+  if (n.rxPhy != 0) { emitUint(o, 4); emitUint(o, n.rxPhy); }
+  if (n.dir != 0) { emitUint(o, 5); emitUint(o, n.dir); }
+  if (n.ageS != 0) { emitUint(o, 6); emitUint(o, n.ageS); }
 }
 
 void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint16_t caps, uint64_t epoch,
                    uint32_t seq, int64_t unixSeconds, const uint8_t datagramId[DATAGRAM_ID_LEN],
-                   const uint8_t* neighbors, size_t neighborCount,
+                   uint8_t version, const uint8_t* neighbors, size_t neighborCount,
+                   const AnnounceNeighborInfo* infos, size_t infoCount,
                    const uint8_t pubKey[PUBKEY_LEN], const uint8_t signature[SIG_LEN],
                    const char* name, const char* description, const char* platform,
                    std::vector<uint8_t>& out) {
   std::vector<uint8_t> body;
-  emitMapHeader(body, 11);
-  emitUint(body, 1); emitUint(body, ANNOUNCE_VERSION);
+  // v3 adds key 13 (neighbor_info); v1/v2 keep the 11-key body. The bare list (key 7) stays present
+  // but empty on v3. This node bridges nothing, so key 12 is omitted on every version (omitempty).
+  emitMapHeader(body, version >= 3 ? 12 : 11);
+  emitUint(body, 1); emitUint(body, version);
   emitUint(body, 2); emitBstr(body, pubKey, PUBKEY_LEN);
   emitUint(body, 3); emitUint(body, epoch);
   emitUint(body, 4); emitUint(body, seq);
@@ -471,6 +508,10 @@ void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint16_t caps, uint64_t ep
   emitUint(body, 9); emitTstr(body, description ? description : "");
   emitUint(body, 10); emitTstr(body, platform ? platform : "");
   emitUint(body, 11); emitBstr(body, signature, SIG_LEN);
+  if (version >= 3) {
+    emitUint(body, 13); emitArrayHeader(body, infoCount);
+    for (size_t i = 0; i < infoCount; i++) emitNeighborInfo(body, infos[i]);
+  }
 
   std::vector<uint8_t> ctrl;
   emitMapHeader(ctrl, 2);

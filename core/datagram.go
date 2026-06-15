@@ -143,6 +143,30 @@ func (b BridgeAd) Valid() bool {
 	return true
 }
 
+// NeighborInfo is one directly-linked peer as advertised in a v3 ANNOUNCE `neighbor_info` section.
+// It is the announcing node's own view of the link: RSSI in dBm (always negative in practice; 0 means
+// "no sample"), the BLE PHY in each direction, which side opened the link, and how long ago the last
+// packet was received. CBOR is transport; the signed binary (§8.3) is the authenticated form.
+type NeighborInfo struct {
+	ID    NodeID        `cbor:"1,keyasint"`
+	RSSI  int8          `cbor:"2,keyasint,omitempty"`
+	TxPHY PHY           `cbor:"3,keyasint,omitempty"`
+	RxPHY PHY           `cbor:"4,keyasint,omitempty"`
+	Dir   ConnDirection `cbor:"5,keyasint,omitempty"`
+	AgeS  uint32        `cbor:"6,keyasint,omitempty"`
+}
+
+// Valid checks the PHY and direction enums are in range.
+func (n NeighborInfo) Valid() bool {
+	if n.TxPHY > PHYCoded || n.RxPHY > PHYCoded {
+		return false
+	}
+	if n.Dir > DirectionBoth {
+		return false
+	}
+	return true
+}
+
 type AnnounceBody struct {
 	AnnounceVersion uint8        `cbor:"1,keyasint"`
 	PublicKey       []byte       `cbor:"2,keyasint"`
@@ -150,14 +174,31 @@ type AnnounceBody struct {
 	Seq             uint32       `cbor:"4,keyasint"`
 	Timestamp       int64        `cbor:"5,keyasint"`
 	Caps            Capabilities `cbor:"6,keyasint"`
-	Neighbors       []NodeID     `cbor:"7,keyasint"`
-	Name            string       `cbor:"8,keyasint"`
-	Description     string       `cbor:"9,keyasint"`
-	Platform        string       `cbor:"10,keyasint"`
-	Signature       []byte       `cbor:"11,keyasint"`
-	// Bridges is present (CBOR k12) only on v2 gateway announces; omitempty keeps v1 bodies
+	// Neighbors is the bare neighbor-ID list carried by v1/v2 announces. v3 leaves it empty and
+	// carries neighbors via NeighborInfo instead (use NeighborIDs to read either uniformly).
+	Neighbors   []NodeID `cbor:"7,keyasint"`
+	Name        string   `cbor:"8,keyasint"`
+	Description string   `cbor:"9,keyasint"`
+	Platform    string   `cbor:"10,keyasint"`
+	Signature   []byte   `cbor:"11,keyasint"`
+	// Bridges is present (CBOR k12) only on v2+ gateway announces; omitempty keeps v1 bodies
 	// byte-for-byte unchanged. CBOR is transport; the signed binary (§8.3) is the authenticated form.
 	Bridges []BridgeAd `cbor:"12,keyasint,omitempty"`
+	// NeighborInfo is present (CBOR k13) only on v3 announces; it replaces the bare Neighbors list.
+	NeighborInfo []NeighborInfo `cbor:"13,keyasint,omitempty"`
+}
+
+// NeighborIDs returns the announcing node's neighbor IDs regardless of announce version: the bare
+// Neighbors list on v1/v2, or the IDs from NeighborInfo on v3.
+func (a AnnounceBody) NeighborIDs() []NodeID {
+	if len(a.NeighborInfo) == 0 {
+		return a.Neighbors
+	}
+	ids := make([]NodeID, len(a.NeighborInfo))
+	for i, n := range a.NeighborInfo {
+		ids[i] = n.ID
+	}
+	return ids
 }
 
 func (a AnnounceBody) EncodeBody() ([]byte, error) { return cbor.Marshal(a) }
@@ -206,7 +247,25 @@ func (a AnnounceBody) Valid() bool {
 			return false
 		}
 	}
-	return VerifyAnnounce(a.PublicKey, a.Signature, a.Epoch, a.Seq, a.Timestamp, a.Caps, a.Neighbors, a.Name, a.Description, a.Platform, a.AnnounceVersion, a.Bridges)
+	// NeighborInfo only exists from v3; v3 carries its neighbors there and leaves the bare list empty.
+	if a.AnnounceVersion < 3 && len(a.NeighborInfo) > 0 {
+		return false
+	}
+	if len(a.NeighborInfo) > 0 && len(a.Neighbors) > 0 {
+		return false
+	}
+	if len(a.NeighborInfo) > MaxNeighbors {
+		return false
+	}
+	for i, n := range a.NeighborInfo {
+		if !n.Valid() {
+			return false
+		}
+		if i > 0 && CompareNodeID(a.NeighborInfo[i-1].ID, n.ID) >= 0 {
+			return false
+		}
+	}
+	return VerifyAnnounce(a.PublicKey, a.Signature, a.Epoch, a.Seq, a.Timestamp, a.Caps, a.Neighbors, a.Name, a.Description, a.Platform, a.AnnounceVersion, a.Bridges, a.NeighborInfo)
 }
 
 // NewAnnounceBody builds and signs an announce body. It emits v1 (byte-identical to the original
@@ -222,9 +281,9 @@ func NewAnnounceBody(id *Identity, epoch uint64, seq uint32, timestamp int64, ca
 	}
 	version := uint8(MinAnnounceVersion)
 	if len(bridges) > 0 {
-		version = AnnounceVersion
+		version = 2
 	}
-	sig := id.SignAnnounce(epoch, seq, timestamp, caps, uniq, name, desc, platform, version, bridges)
+	sig := id.SignAnnounce(epoch, seq, timestamp, caps, uniq, name, desc, platform, version, bridges, nil)
 	return AnnounceBody{
 		AnnounceVersion: version,
 		PublicKey:       append([]byte(nil), id.Pub...),
@@ -238,6 +297,35 @@ func NewAnnounceBody(id *Identity, epoch uint64, seq uint32, timestamp int64, ca
 		Platform:        platform,
 		Signature:       sig,
 		Bridges:         bridges,
+	}
+}
+
+// NewAnnounceBodyV3 builds and signs a v3 announce. Neighbors are carried as NeighborInfo (with
+// per-link RSSI/PHY/direction/age) rather than the bare v1/v2 ID list, which v3 leaves empty. The
+// info entries are sorted by ID and de-duplicated; bridges, when present, ride along in the v2 section.
+func NewAnnounceBodyV3(id *Identity, epoch uint64, seq uint32, timestamp int64, caps Capabilities, infos []NeighborInfo, name, desc, platform string, bridges []BridgeAd) AnnounceBody {
+	nbs := append([]NeighborInfo(nil), infos...)
+	sort.Slice(nbs, func(i, j int) bool { return nbs[i].ID.Less(nbs[j].ID) })
+	uniq := nbs[:0]
+	for _, nb := range nbs {
+		if len(uniq) == 0 || uniq[len(uniq)-1].ID != nb.ID {
+			uniq = append(uniq, nb)
+		}
+	}
+	sig := id.SignAnnounce(epoch, seq, timestamp, caps, nil, name, desc, platform, 3, bridges, uniq)
+	return AnnounceBody{
+		AnnounceVersion: 3,
+		PublicKey:       append([]byte(nil), id.Pub...),
+		Epoch:           epoch,
+		Seq:             seq,
+		Timestamp:       timestamp,
+		Caps:            caps,
+		Name:            name,
+		Description:     desc,
+		Platform:        platform,
+		Signature:       sig,
+		Bridges:         bridges,
+		NeighborInfo:    uniq,
 	}
 }
 

@@ -1,0 +1,36 @@
+# Sidepath BLE modem defaults. Applied on a fresh build; edit via `idf.py menuconfig`.
+
+# --- Console / serial over native USB Serial/JTAG ---------------------------
+# The C6 exposes a USB Serial/JTAG port; route the console there so the same USB
+# cable carries our line protocol and (optionally) logs.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- Bluetooth: NimBLE host, BLE 5 features ---------------------------------
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+
+# Extended advertising + scanning (BLE 5). Required for the connectionless
+# flood and for LE Coded PHY / Long Range.
+CONFIG_BT_NIMBLE_EXT_ADV=y
+CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES=1
+CONFIG_BT_NIMBLE_EXT_ADV_MAX_SIZE=251
+
+# We are advertiser + observer only — no connections, no GATT server/client.
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=0
+
+# Controller: enable BLE 5.0 features (ext adv + coded phy) in the C6 controller.
+CONFIG_BT_LE_50_FEATURE_SUPPORT=y
+CONFIG_BT_LE_LL_CFG_FEAT_LE_CODED_PHY=y
+CONFIG_BT_LE_EXT_ADV=y
+
+# Bigger log level off the data path keeps the serial protocol clean.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+
+# Single-core C6: nothing to pin, but keep main task stack comfortable.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

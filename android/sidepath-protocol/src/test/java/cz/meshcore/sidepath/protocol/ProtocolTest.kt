@@ -124,6 +124,110 @@ class ProtocolTest {
         assertFalse(decoded.copy(bridges = listOf(BridgeAd("XX"), decoded.bridges[1])).isValid())
     }
 
+    // Mirror of core/announce_v3_test.go's sharedV3Vector. Both impls MUST produce these exact signed
+    // bytes (and signature) for the same identity/fields/neighbor_info, or the v3 ANNOUNCE wire format
+    // (§8.8) has drifted between Go and Kotlin. Inputs: identity seed offset 7; epoch 3, seq 4,
+    // timestamp 100, caps 0x1F; name "alice", desc "", platform "test"; no bridges; neighbor_info
+    // [{seed8, rssi -50, tx 1M, rx 2M, dir out, age 12}, {seed9, rssi -70, tx coded, rx coded, dir in,
+    // age 300}] (sorted by ID).
+    private val sharedV3SignedMsgHex =
+        "53494445504154482d414e4e4f554e43452d5631000300d05a1d1ea251396d557afbd4588b3c6d99dbeb972fed10a32562ea26dcdcfa03000000000000000400000064000000000000001f0000000500616c6963650000040074657374000002004bddee550ef734cae04ece0102010c000000677edd9c7a6fbaa5d609ba0303022c010000"
+    private val sharedV3SigHex =
+        "fd9ad6da0b001f66bf57bc234a5f19294d53de57e4c422732218691138bde5f45bdddfe0671f5f8ffcec9323f89a335b2480ddd872e491ca48444d16ee166a0b"
+
+    @Test fun announceV3CrossImplVector() {
+        val id = Identity.fromSeed(seed(7))
+        // Pass unsorted to confirm createV3 sorts by ID.
+        val n8 = NeighborInfo(Identity.fromSeed(seed(8)).nodeId, rssi = -50, txPhy = Phy.LE_1M, rxPhy = Phy.LE_2M, direction = ConnDirection.OUTGOING, ageS = 12L)
+        val n9 = NeighborInfo(Identity.fromSeed(seed(9)).nodeId, rssi = -70, txPhy = Phy.CODED, rxPhy = Phy.CODED, direction = ConnDirection.INCOMING, ageS = 300L)
+        val body = AnnounceBody.createV3(
+            id, epoch = 3, seq = 4, timestamp = 100, caps = Capabilities(0x1F),
+            neighborInfo = listOf(n9, n8), name = "alice", description = "", platform = "test",
+        )
+        // A body with neighbor info is v3 and leaves the bare neighbor list empty.
+        assertEquals(3, body.announceVersion)
+        assertTrue(body.neighbors.isEmpty())
+        assertEquals(2, body.neighborInfo.size)
+
+        // Signed bytes + signature match the Go vector byte-for-byte.
+        val msg = Identity.announceSignedMessage(
+            id.publicKey, 3, 4, 100, Capabilities(0x1F), emptyList(), "alice", "", "test", 3, emptyList(), body.neighborInfo,
+        )
+        assertEquals(sharedV3SignedMsgHex, msg.hex())
+        assertEquals(sharedV3SigHex, body.signature.hex())
+        assertTrue(body.isValid())
+
+        // CBOR round-trip via the control envelope preserves neighbor_info (k13), sorted by ID.
+        val decoded = AnnounceBody.decode(ControlMessage.decode(body.toControl().encode()).body)
+        assertTrue(decoded.neighbors.isEmpty())
+        assertEquals(listOf(-50, -70), decoded.neighborInfo.map { it.rssi })
+        assertEquals(listOf(Phy.LE_1M, Phy.CODED), decoded.neighborInfo.map { it.txPhy })
+        assertEquals(listOf(Phy.LE_2M, Phy.CODED), decoded.neighborInfo.map { it.rxPhy })
+        assertEquals(listOf(ConnDirection.OUTGOING, ConnDirection.INCOMING), decoded.neighborInfo.map { it.direction })
+        assertEquals(listOf(12L, 300L), decoded.neighborInfo.map { it.ageS })
+        assertTrue(decoded.neighborInfo.zipWithNext().all { (x, y) -> x.id < y.id })
+        assertTrue(decoded.isValid())
+        // neighborIds reads through to the v3 info list.
+        assertEquals(decoded.neighborInfo.map { it.id }, decoded.neighborIds())
+
+        // Tampering any signed neighbor field breaks the signature.
+        val tampered = decoded.neighborInfo.toMutableList()
+        tampered[0] = tampered[0].copy(rssi = -51)
+        assertFalse(decoded.copy(neighborInfo = tampered).isValid())
+        // neighbor_info on a sub-v3 body is rejected.
+        assertFalse(decoded.copy(announceVersion = 2).isValid())
+        // Carrying both the bare list and neighbor_info is rejected.
+        assertFalse(decoded.copy(neighbors = listOf(Identity.fromSeed(seed(8)).nodeId)).isValid())
+    }
+
+    @Test fun routerBuildAnnounceEmitsV3FromNeighborTable() {
+        val id = Identity.fromSeed(seed(7))
+        val r = Router(id)
+        // With no neighbors, the router falls back to the bare-ID v1 layout.
+        val v1 = r.buildAnnounceBody(caps = Capabilities(Capability.RELAY), epoch = 1, seq = 1,
+            name = "n", description = "", platform = "p")
+        assertEquals(Sidepath.MIN_ANNOUNCE_VERSION, v1.announceVersion)
+        assertTrue(v1.isValid())
+
+        // A live neighbor makes the router announce v3, populating neighbor_info from the table.
+        r.neighbors.upsert(NeighborEntry(
+            id = Identity.fromSeed(seed(8)).nodeId, rssi = -42,
+            txPhy = Phy.LE_1M, rxPhy = Phy.LE_1M, direction = ConnDirection.OUTGOING,
+        ))
+        val v3 = r.buildAnnounceBody(caps = Capabilities(Capability.RELAY), epoch = 1, seq = 2,
+            name = "n", description = "", platform = "p")
+        assertEquals(3, v3.announceVersion)
+        assertEquals(1, v3.neighborInfo.size)
+        assertEquals(-42, v3.neighborInfo[0].rssi)
+        assertEquals(Phy.LE_1M, v3.neighborInfo[0].txPhy)
+        assertEquals(ConnDirection.OUTGOING, v3.neighborInfo[0].direction)
+        assertTrue(v3.isValid())
+    }
+
+    @Test fun neighborTableAnnounceInfoCarriesDirectionAndDropsUnknownRssi() {
+        val table = NeighborTable()
+        val outId = Identity.fromSeed(seed(8)).nodeId
+        val bothId = Identity.fromSeed(seed(9)).nodeId
+        table.upsert(NeighborEntry(id = outId, rssi = -50, txPhy = Phy.LE_1M, rxPhy = Phy.LE_1M, direction = ConnDirection.OUTGOING))
+        // Inbound-only links have no RSSI sample; the unknown sentinel must not leak onto the wire.
+        table.upsert(NeighborEntry(id = bothId, rssi = NeighborEntry.RSSI_UNKNOWN, direction = ConnDirection.BOTH))
+
+        val infos = table.announceInfo().associateBy { it.id.toHex() }
+        val out = infos.getValue(outId.toHex())
+        assertEquals(-50, out.rssi)
+        assertEquals(ConnDirection.OUTGOING, out.direction)
+        val both = infos.getValue(bothId.toHex())
+        assertEquals(ConnDirection.BOTH, both.direction)
+        assertEquals(0, both.rssi) // unknown sentinel → "no sample"
+
+        // A neighbor advertised as in+out still yields a valid, verifiable v3 announce.
+        val id = Identity.fromSeed(seed(7))
+        val body = AnnounceBody.createV3(id, epoch = 5, seq = 6, timestamp = 100, caps = Capabilities(0x1F),
+            neighborInfo = table.announceInfo(), name = "n", description = "", platform = "p")
+        assertTrue(body.isValid())
+        assertTrue(body.neighborInfo.any { it.direction == ConnDirection.BOTH })
+    }
+
     @Test fun networkDefsBundledResourceLoads() {
         val defs = NetworkDefs.builtins()
         val cz = defs.firstOrNull { it.code == "CZ" }

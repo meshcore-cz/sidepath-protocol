@@ -48,9 +48,10 @@ class Identity private constructor(
         platform: String,
         version: Int = Sidepath.ANNOUNCE_VERSION,
         bridges: List<BridgeAd> = emptyList(),
+        infos: List<NeighborInfo> = emptyList(),
     ): ByteArray {
         val msg = announceSignedMessage(
-            publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform, version, bridges,
+            publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform, version, bridges, infos,
         )
         val sig = ByteArray(Ed25519.SIGNATURE_SIZE)
         Ed25519.sign(seed, 0, msg, 0, msg.size, sig, 0)
@@ -81,6 +82,11 @@ class Identity private constructor(
          *   bridge_count[2 LE] | per bridge: code_len[1] | code | flags[1]
          *   | if custom: freq_hz[4 LE] | bandwidth_hz[4 LE] | sf[1] | cr[1]
          *
+         * When [version] >= 3 a trailing `neighbor_info` section follows the bridges (§8.8). v3 leaves
+         * the bare neighbor list above empty and carries neighbors here instead:
+         *
+         *   nbrinfo_count[2 LE] | per entry: id[10] | rssi[1, int8] | tx_phy[1] | rx_phy[1] | dir[1] | age_s[4 LE]
+         *
          * The magic stays "SIDEPATH-ANNOUNCE-V1" (a domain-separation tag); the layout is selected
          * by the [version] field, so v1 announces sign byte-identically to the original layout.
          */
@@ -96,6 +102,7 @@ class Identity private constructor(
             platform: String,
             version: Int = Sidepath.ANNOUNCE_VERSION,
             bridges: List<BridgeAd> = emptyList(),
+            infos: List<NeighborInfo> = emptyList(),
         ): ByteArray {
             val nameB = name.toByteArray(Charsets.UTF_8)
             val descB = description.toByteArray(Charsets.UTF_8)
@@ -128,6 +135,17 @@ class Identity private constructor(
                     }
                 }
             }
+            if (version >= 3) {
+                out.write(Wire.le16(infos.size))
+                infos.forEach { n ->
+                    out.write(n.id.bytes)
+                    out.write(n.rssi and 0xFF) // int8 dBm
+                    out.write(n.txPhy)
+                    out.write(n.rxPhy)
+                    out.write(n.direction)
+                    out.write(Wire.le32(n.ageS))
+                }
+            }
             return out.toByteArray()
         }
 
@@ -145,10 +163,11 @@ class Identity private constructor(
             platform: String,
             version: Int = Sidepath.ANNOUNCE_VERSION,
             bridges: List<BridgeAd> = emptyList(),
+            infos: List<NeighborInfo> = emptyList(),
         ): Boolean {
             if (publicKey.size != Ed25519.PUBLIC_KEY_SIZE || signature.size != Ed25519.SIGNATURE_SIZE) return false
             val msg = announceSignedMessage(
-                publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform, version, bridges,
+                publicKey, epoch, seq, timestamp, caps, neighbors, name, description, platform, version, bridges, infos,
             )
             return runCatching { Ed25519.verify(signature, 0, publicKey, 0, msg, 0, msg.size) }.getOrDefault(false)
         }

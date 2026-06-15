@@ -37,7 +37,6 @@ import cz.meshcore.sidepath.protocol.AckBody
 import cz.meshcore.sidepath.protocol.BridgedBody
 import cz.meshcore.sidepath.protocol.Action
 import cz.meshcore.sidepath.protocol.ActionType
-import cz.meshcore.sidepath.protocol.AnnounceBody
 import cz.meshcore.sidepath.protocol.BridgeAd
 import cz.meshcore.sidepath.protocol.Sidepath
 import cz.meshcore.sidepath.protocol.Capabilities
@@ -48,6 +47,7 @@ import cz.meshcore.sidepath.protocol.DatagramFlags
 import cz.meshcore.sidepath.protocol.DropReason
 import cz.meshcore.sidepath.protocol.Frame
 import cz.meshcore.sidepath.protocol.Identity
+import cz.meshcore.sidepath.protocol.ConnDirection
 import cz.meshcore.sidepath.protocol.NeighborEntry as ProtoNeighbor
 import cz.meshcore.sidepath.protocol.NodeId
 import cz.meshcore.sidepath.protocol.PayloadProtocol
@@ -103,6 +103,7 @@ data class PeerInfo(
     val name: String = "",
     val publicKey: ByteArray = ByteArray(0),
     val connectedSinceMs: Long = 0L,  // when this peer first appeared connected (for an uptime label)
+    val lastRecvMs: Long = 0L,        // wall-clock ms of the last datagram received over this peer's link (0 = none)
     // §4.4 multi-link: a peer may be reached over both an inbound link (it dialed us) and an outbound
     // link (we dialed it) at once. These flags expose each direction independently, and [linkCount] is
     // the number of usable physical links — so a redundant in+out pair can be surfaced as "in+out".
@@ -308,6 +309,10 @@ class SidepathService : Service() {
     // First time each peer (by node-id hex) was seen connected, for the "connected for N" label.
     // Entries are pruned in updatePeersState once a peer is no longer present.
     private val connectedSince = ConcurrentHashMap<String, Long>()
+    // Wall-clock ms of the last datagram received directly over each peer's link (by node-id hex), for
+    // the "last received N ago" label. The neighbor table's lastSeen can't serve this — updatePeersState
+    // re-upserts neighbors each refresh, resetting it.
+    private val lastRecvFromPeer = ConcurrentHashMap<String, Long>()
     // Incoming connections (peer is client to our server): BLE MAC hex -> direct peer NodeId (or null).
     private val serverPeers = ConcurrentHashMap<String, NodeId?>()
     private val serverPeerDevices = ConcurrentHashMap<String, BluetoothDevice>()
@@ -835,6 +840,7 @@ class SidepathService : Service() {
         // The directly connected peer that relayed this to us is the last path hop, or the
         // source when the originator is our direct neighbor (originators don't append themselves).
         val directPeer = dg.path.lastOrNull() ?: dg.source.takeIf { !it.isBroadcast() && it != _nodeId.value }
+        directPeer?.let { lastRecvFromPeer[it.toHex()] = System.currentTimeMillis() }
         learnNeighbor(directPeer, addrHex, device)
 
         // A reception of one of our own flooded messages is a repeat (a relay rebroadcast it).
@@ -906,7 +912,7 @@ class SidepathService : Service() {
             }
             val existing = router.neighbors.get(directPeer)
             if (existing == null) {
-                router.neighbors.upsert(ProtoNeighbor(id = directPeer, rssi = RSSI_UNKNOWN))
+                router.neighbors.upsert(ProtoNeighbor(id = directPeer, rssi = RSSI_UNKNOWN, direction = ConnDirection.INCOMING))
             } else {
                 router.neighbors.touch(directPeer)
             }
@@ -1476,9 +1482,9 @@ class SidepathService : Service() {
         val id = identity ?: return
         if (!::router.isInitialized) return
         announceSeq++
-        val body = AnnounceBody.create(
-            identity = id, epoch = epoch, seq = announceSeq, timestamp = System.currentTimeMillis() / 1000,
-            caps = ANDROID_CAPABILITIES, neighbors = router.neighbors.ids(),
+        // Emit v3 with per-neighbor link details when we have live neighbors, else v1/v2 (§8.8).
+        val body = router.buildAnnounceBody(
+            caps = ANDROID_CAPABILITIES, epoch = epoch, seq = announceSeq,
             name = nodeName, description = nodeDescription, platform = nodePlatform,
         )
         val dg = router.newBroadcast(PayloadProtocol.SIDEPATH_CONTROL, body.toControl().encode(), Sidepath.ANNOUNCE_TTL)
@@ -1782,11 +1788,22 @@ class SidepathService : Service() {
         }
 
         val list = agg.map { (pid, a) ->
-            // Keep the neighbor table in sync: a peer reachable over any usable link is a routable
-            // neighbor; one left with only a dead outbound (no inbound) is pruned.
+            // Keep the neighbor table in sync with the live link set so the v3 ANNOUNCE neighbor_info
+            // (direction/PHY/RSSI) matches what the UI shows. A peer reachable over any usable link —
+            // inbound, outbound, or both (§4.4) — is a routable neighbor; one left with only a dead
+            // outbound (no inbound) is pruned.
             val degraded = !a.outboundUsable && !a.inbound
-            if (a.outboundUsable) {
-                router.neighbors.upsert(ProtoNeighbor(id = pid, publicKey = a.publicKey, rssi = a.rssi, provisionalCaps = a.caps))
+            val direction = when {
+                a.outboundUsable && a.inbound -> ConnDirection.BOTH
+                a.inbound -> ConnDirection.INCOMING
+                else -> ConnDirection.OUTGOING
+            }
+            if (a.outboundUsable || a.inbound) {
+                router.neighbors.upsert(ProtoNeighbor(
+                    id = pid, publicKey = a.publicKey, rssi = a.rssi,
+                    txPhy = a.txPhy.ordinal, rxPhy = a.rxPhy.ordinal,
+                    direction = direction, provisionalCaps = a.caps,
+                ))
             } else if (degraded) {
                 router.neighbors.remove(pid)
             }
@@ -1795,9 +1812,12 @@ class SidepathService : Service() {
                 incoming = a.inbound && !a.outboundUsable, degraded = degraded,
                 name = router.nameFor(pid), publicKey = a.publicKey, connectedSinceMs = since(pid.toHex()),
                 outbound = a.outboundUsable, inbound = a.inbound, linkCount = a.usableLinks.coerceAtLeast(1),
+                lastRecvMs = lastRecvFromPeer[pid.toHex()] ?: 0L,
             )
         }
-        connectedSince.keys.retainAll(agg.keys.mapTo(mutableSetOf()) { it.toHex() })
+        val liveHexes = agg.keys.mapTo(mutableSetOf()) { it.toHex() }
+        connectedSince.keys.retainAll(liveHexes)
+        lastRecvFromPeer.keys.retainAll(liveHexes)
         _connectedPeers.value = list
         logMultiLinkPeers()
     }

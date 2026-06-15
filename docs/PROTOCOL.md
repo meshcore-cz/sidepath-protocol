@@ -466,18 +466,19 @@ kind        = ANNOUNCE
 
 | Key | Field              | Type               | Required | Notes                                                                            |
 | --: | ------------------ | ------------------ | -------- | -------------------------------------------------------------------------------- |
-|   1 | `announce_version` | uint8              | yes      | `1`, or `2` when `bridges` is present (see §8.7)                                  |
+|   1 | `announce_version` | uint8              | yes      | `1`; `2` when `bridges` is present (§8.7); `3` when `neighbor_info` is present (§8.8) |
 |   2 | `public_key`       | bytes(32)          | yes      | Ed25519 public key                                                               |
 |   3 | `epoch`            | uint64             | yes      | Persisted generation counter incremented before the first announce after startup |
 |   4 | `seq`              | uint32             | yes      | Monotonically increasing within one `epoch`                                      |
 |   5 | `timestamp`        | int64              | yes      | Unix seconds; use `0` when no reliable clock exists                              |
 |   6 | `caps`             | uint16             | yes      | Capability bitmask                                                               |
-|   7 | `neighbors`        | array of bytes(10) | yes      | Directly connected NodeIDs, sorted and unique                                    |
+|   7 | `neighbors`        | array of bytes(10) | yes      | Directly connected NodeIDs, sorted and unique; empty on `announce_version == 3` (carried in `neighbor_info` instead) |
 |   8 | `name`             | text               | yes      | User-configured display name or empty string                                     |
 |   9 | `description`      | text               | yes      | Free-form description or empty string                                            |
 |  10 | `platform`         | text               | yes      | Platform string or empty string                                                  |
 |  11 | `signature`        | bytes(64)          | yes      | Ed25519 signature                                                                |
 |  12 | `bridges`          | array of map       | no       | External networks this gateway bridges; present only on `announce_version >= 2` (§8.7) |
+|  13 | `neighbor_info`    | array of map       | no       | Per-link details for each neighbor; present only on `announce_version == 3` (§8.8)     |
 
 Constraints:
 
@@ -497,6 +498,12 @@ derived from `public_key`.
 `bridges` MUST be absent on a `announce_version == 1` body. A node emits
 `announce_version == 2` only when it advertises one or more bridges; otherwise it
 emits `announce_version == 1`, which is byte-identical to the original layout.
+
+`neighbor_info` MUST be absent on a body with `announce_version < 3`. A node emits
+`announce_version == 3` only when it has neighbors to advertise; a v3 body carries
+its neighbors via `neighbor_info` and MUST leave the bare `neighbors` list empty.
+A body MUST NOT carry both a non-empty `neighbors` list and `neighbor_info`. See
+§8.8 for the entry layout and constraints.
 
 ### 8.3 Announce signature message
 
@@ -538,6 +545,24 @@ bridge_count           [2]   uint16 little-endian
       spreading_factor [1]   uint8
       coding_rate      [1]   uint8 (the N in 4/N)
 ```
+
+When `announce_version >= 3`, the `neighbor_info` section (§8.8) is appended to the
+signed bytes immediately after the `bridges` section (which is present, possibly
+with `bridge_count == 0`, because v3 implies v2's layout):
+
+```text
+neighbor_info_count    [2]   uint16 little-endian
+  per entry:
+    node_id            [10]
+    rssi               [1]   int8 (dBm; 0 means "no sample")
+    tx_phy             [1]   uint8 (0 unknown, 1 = 1M, 2 = 2M, 3 = LE Coded)
+    rx_phy             [1]   uint8 (same encoding as tx_phy)
+    direction          [1]   uint8 (1 = outgoing, 2 = incoming)
+    age_s              [4]   uint32 little-endian (seconds since last packet received)
+```
+
+Entries MUST be sorted by `node_id` and MUST NOT contain duplicate IDs. On a v3
+body the bare `neighbor_count` above is `0`.
 
 The magic stays `SIDEPATH-ANNOUNCE-V1\0` (it is a domain-separation tag, not a
 version selector); the layout is chosen by the `announce_version` field, so a v1
@@ -649,6 +674,31 @@ to reconfigure a receiver's radio. The mapping from `code` to a full network
 definition (display name, canonical radio parameters, territory, links) is **not**
 part of this wire protocol — it is owned by the application's network-definitions
 dataset.
+
+### 8.8 Neighbor link details (`neighbor_info`, announce v3)
+
+A node MAY advertise per-link details for each of its directly connected
+neighbors. When it does, it emits `announce_version == 3`, carries the neighbors in
+`neighbor_info` (CBOR key 13), and leaves the bare `neighbors` list (key 7) empty.
+
+Each `neighbor_info` entry is a CBOR map:
+
+| Key | Field       | Type      | Notes                                                  |
+| --: | ----------- | --------- | ------------------------------------------------------ |
+|   1 | `id`        | bytes(10) | Neighbor NodeID                                        |
+|   2 | `rssi`      | int8      | Last measured RSSI in dBm; `0` means "no sample"       |
+|   3 | `tx_phy`    | uint8     | BLE PHY for transmit: 0 unknown, 1 = 1M, 2 = 2M, 3 = LE Coded |
+|   4 | `rx_phy`    | uint8     | BLE PHY for receive; same encoding as `tx_phy`         |
+|   5 | `direction` | uint8     | Which side opened the link: 1 = outgoing, 2 = incoming |
+|   6 | `age_s`     | uint32    | Seconds since the last packet was received from this neighbor |
+
+Keys 2–6 use `omitempty`: a zero value is omitted from the CBOR map but is still
+covered (as a zero) by the fixed signed layout in §8.3.
+
+Constraints: at most `255` entries; entries MUST be sorted by `id` and MUST NOT
+contain duplicate IDs; `tx_phy` and `rx_phy` MUST be `<= 3`; `direction` MUST be
+`1` or `2`. The values describe the announcing node's own view of each link and
+are advisory link-quality/topology metadata.
 
 ---
 

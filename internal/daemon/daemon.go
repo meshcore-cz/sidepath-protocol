@@ -22,6 +22,7 @@ import (
 	"github.com/meshcore-cz/sidepath-protocol/core"
 	"github.com/meshcore-cz/sidepath-protocol/internal/api"
 	"github.com/meshcore-cz/sidepath-protocol/internal/config"
+	"github.com/meshcore-cz/sidepath-protocol/internal/modem"
 )
 
 // Version is the daemon protocol/build version reported over the control API.
@@ -35,8 +36,9 @@ type Daemon struct {
 	logf      func(format string, args ...any)
 
 	mu      sync.RWMutex
-	peers   []api.Peer // fallback registry when no live node is attached
-	peerSrc PeerSource // the running node, when one is attached
+	peers   []api.Peer    // fallback registry when no live node is attached
+	peerSrc PeerSource    // the running node, when one is attached
+	modem   *modem.Client // attached BLE modem, when one is configured
 }
 
 // PeerSource is anything that can report the current peer set — in practice the
@@ -50,6 +52,19 @@ type PeerSource interface {
 // peer source usually also implements this (it is the same running node).
 type Tracer interface {
 	Trace(ctx context.Context, dest string, route []string) (api.TraceResult, error)
+}
+
+// PeerDetailer is an attached node that can report the full detail of a single
+// node by NodeID (hex), including its advertised neighbor list. The peer source
+// usually also implements this (it is the same running node).
+type PeerDetailer interface {
+	Peer(id string) (*api.PeerDetail, error)
+}
+
+// Topologer is an attached node that can report the mesh graph it has learned.
+// The peer source usually also implements this (it is the same running node).
+type Topologer interface {
+	Topology() api.TopologyResult
 }
 
 // Sender is an attached node that can send chat messages. SendDirect waits for
@@ -134,10 +149,16 @@ func (d *Daemon) handle(conn net.Conn) {
 		resp = api.Response{OK: true, Status: &s}
 	case api.MethodPeers:
 		resp = api.Response{OK: true, Peers: d.Peers()}
+	case api.MethodPeer:
+		resp = d.peer(req)
+	case api.MethodTopology:
+		resp = d.topology()
 	case api.MethodTrace:
 		resp = d.trace(conn, req)
 	case api.MethodSend:
 		resp = d.send(conn, req)
+	case api.MethodModem:
+		resp = d.modemCmd(conn, req)
 	default:
 		resp = api.Response{OK: false, Error: "unknown method: " + req.Method}
 	}
@@ -203,6 +224,41 @@ func (d *Daemon) send(conn net.Conn, req api.Request) api.Response {
 	return api.Response{OK: true, Send: &res}
 }
 
+// modemCmd runs a raw command line on the daemon's attached modem and returns
+// every reply line. A modem ERR reply is returned as lines with OK true (the
+// caller inspects the lines); only "no modem" / transport faults set OK false.
+func (d *Daemon) modemCmd(conn net.Conn, req api.Request) api.Response {
+	d.mu.RLock()
+	m := d.modem
+	d.mu.RUnlock()
+	if m == nil {
+		return api.Response{OK: false, Error: "no modem attached to daemon (start with --modem <port>)"}
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	lines, err := m.CommandRaw(req.Line, 5*time.Second)
+	if err != nil && len(lines) == 0 {
+		return api.Response{OK: false, Error: err.Error()}
+	}
+	return api.Response{OK: true, Modem: &api.ModemResult{Lines: lines}}
+}
+
+// SetModem attaches a BLE modem and starts logging its asynchronous events to
+// the daemon log. Pass nil to detach.
+func (d *Daemon) SetModem(m *modem.Client) {
+	d.mu.Lock()
+	d.modem = m
+	d.mu.Unlock()
+	if m == nil {
+		return
+	}
+	go func() {
+		for ev := range m.Events() {
+			d.logf("modem %s", ev.Raw)
+		}
+		d.logf("modem event stream closed")
+	}()
+}
+
 func (d *Daemon) status() api.StatusResult {
 	return api.StatusResult{
 		PID:       os.Getpid(),
@@ -228,6 +284,35 @@ func (d *Daemon) Peers() []api.Peer {
 	out := make([]api.Peer, len(d.peers))
 	copy(out, d.peers)
 	return out
+}
+
+// peer returns the full detail for a single node, delegating to the attached
+// node (which alone knows the topology and neighbor link details).
+func (d *Daemon) peer(req api.Request) api.Response {
+	d.mu.RLock()
+	pd, ok := d.peerSrc.(PeerDetailer)
+	d.mu.RUnlock()
+	if !ok || pd == nil {
+		return api.Response{OK: false, Error: "no node attached to daemon"}
+	}
+	detail, err := pd.Peer(req.Dest)
+	if err != nil {
+		return api.Response{OK: false, Error: err.Error()}
+	}
+	return api.Response{OK: true, Peer: detail}
+}
+
+// topology returns the mesh graph, delegating to the attached node (which holds
+// the learned topology).
+func (d *Daemon) topology() api.Response {
+	d.mu.RLock()
+	tp, ok := d.peerSrc.(Topologer)
+	d.mu.RUnlock()
+	if !ok || tp == nil {
+		return api.Response{OK: false, Error: "no node attached to daemon"}
+	}
+	res := tp.Topology()
+	return api.Response{OK: true, Topology: &res}
 }
 
 // SetPeerSource attaches the running node as the authoritative peer source.

@@ -16,6 +16,7 @@ import (
 	"github.com/meshcore-cz/sidepath-protocol/internal/api"
 	"github.com/meshcore-cz/sidepath-protocol/internal/config"
 	"github.com/meshcore-cz/sidepath-protocol/internal/daemon"
+	"github.com/meshcore-cz/sidepath-protocol/internal/modem"
 	"github.com/meshcore-cz/sidepath-protocol/internal/node"
 	"github.com/spf13/cobra"
 )
@@ -70,6 +71,28 @@ var daemonRunCmd = &cobra.Command{
 		d := daemon.New(cfg, id, logf)
 		d.SetPeerSource(rt)
 
+		// Optionally attach an ESP32-C6 BLE modem on a serial port. When
+		// attached it can act as a connectionless relay (scan + reflood) and is
+		// controllable via 'sp modem'.
+		if port := nodeCfg.Modem; port != "" {
+			mc, err := modem.Open(port, 0)
+			if err != nil {
+				return fmt.Errorf("open modem %s: %w", port, err)
+			}
+			defer mc.Close()
+			d.SetModem(mc)
+			logf("modem attached on %s", port)
+			if nodeCfg.ModemRelay {
+				if err := mc.RelayOn(); err != nil {
+					logf("modem relay enable failed: %v", err)
+				}
+				if err := mc.StartScan(); err != nil {
+					logf("modem scan start failed: %v", err)
+				}
+				logf("modem relay+scan enabled")
+			}
+		}
+
 		// If the node exits on its own, take the daemon down with it.
 		go func() {
 			if e := <-nodeErrCh; e != nil {
@@ -97,7 +120,7 @@ func addNodeFlags(cmd *cobra.Command) {
 	f.StringArray("allow-peer", nil, "allowed peer NodeID (hex); repeatable; empty = allow all")
 }
 
-// resolveNodeConfig layers the CLI flags on top of node.json: the file provides
+// resolveNodeConfig layers the CLI flags on top of config.toml: the file provides
 // defaults, an explicitly-set flag overrides.
 func resolveNodeConfig(cmd *cobra.Command) config.NodeConfig {
 	nc, err := config.LoadNodeConfig(cfg.ConfigPath())
@@ -132,6 +155,12 @@ func resolveNodeConfig(cmd *cobra.Command) config.NodeConfig {
 	}
 	if f.Changed("allow-peer") {
 		nc.AllowPeers, _ = f.GetStringArray("allow-peer")
+	}
+	if f.Changed("modem") {
+		nc.Modem, _ = f.GetString("modem")
+	}
+	if f.Changed("modem-relay") {
+		nc.ModemRelay, _ = f.GetBool("modem-relay")
 	}
 	if cfg.Verbose {
 		nc.Verbose = true
@@ -171,6 +200,12 @@ func forwardNodeFlags(cmd *cobra.Command) []string {
 	}
 	arr("bridge")
 	arr("allow-peer")
+	str("modem")
+	if f.Changed("modem-relay") {
+		if v, _ := f.GetBool("modem-relay"); !v {
+			out = append(out, "--modem-relay=false")
+		}
+	}
 	return out
 }
 
@@ -370,9 +405,11 @@ func readPID(path string) (int, error) {
 func init() {
 	daemonRunCmd.Flags().Bool("foreground", false, "mirror logs to stderr (implied by --verbose)")
 	daemonLogsCmd.Flags().BoolP("follow", "f", false, "stream new log lines until interrupted")
-	addNodeFlags(daemonRunCmd)
-	addNodeFlags(daemonStartCmd)
-	addNodeFlags(daemonRestartCmd)
+	for _, c := range []*cobra.Command{daemonRunCmd, daemonStartCmd, daemonRestartCmd} {
+		addNodeFlags(c)
+		c.Flags().String("modem", "", "attach a Sidepath BLE modem on this serial port (e.g. /dev/ttyACM0 or /dev/cu.usbmodem*)")
+		c.Flags().Bool("modem-relay", true, "enable scan + connectionless relay on the attached modem")
+	}
 
 	daemonCmd.AddCommand(daemonRunCmd, daemonStartCmd, daemonRestartCmd, daemonStopCmd, daemonStatusCmd, daemonLogsCmd)
 	rootCmd.AddCommand(daemonCmd)

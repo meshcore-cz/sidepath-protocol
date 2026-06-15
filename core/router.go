@@ -111,17 +111,18 @@ func (r *Router) verifyControlIfAnnounce(dg Datagram) *bool {
 		return &v
 	}
 	r.Topology.Update(TopoNode{
-		ID:          dg.Source,
-		Caps:        body.Caps,
-		Neighbors:   body.Neighbors,
-		Epoch:       body.Epoch,
-		Seq:         body.Seq,
-		Timestamp:   body.Timestamp,
-		Description: body.Description,
-		Name:        body.Name,
-		Platform:    body.Platform,
-		PublicKey:   body.PublicKey,
-		Bridges:     body.Bridges,
+		ID:           dg.Source,
+		Caps:         body.Caps,
+		Neighbors:    body.NeighborIDs(),
+		Epoch:        body.Epoch,
+		Seq:          body.Seq,
+		Timestamp:    body.Timestamp,
+		Description:  body.Description,
+		Name:         body.Name,
+		Platform:     body.Platform,
+		PublicKey:    body.PublicKey,
+		Bridges:      body.Bridges,
+		NeighborInfo: body.NeighborInfo,
 	})
 	v := true
 	return &v
@@ -217,7 +218,14 @@ func (r *Router) BuildAnnounce(caps Capabilities, epoch uint64, seq uint32) (Dat
 	if r.Identity == nil {
 		return Datagram{}, fmt.Errorf("router has no signing identity")
 	}
-	body := NewAnnounceBody(r.Identity, epoch, seq, time.Now().Unix(), caps, r.Neighbors.IDs(), r.Name, r.Description, r.Platform, r.Bridges)
+	// Advertise neighbors with their per-link details (v3) once we have any; otherwise fall back to
+	// the bare-ID v1/v2 layout so a node with no live links still emits the smallest announce.
+	var body AnnounceBody
+	if infos := r.Neighbors.AnnounceInfo(); len(infos) > 0 {
+		body = NewAnnounceBodyV3(r.Identity, epoch, seq, time.Now().Unix(), caps, infos, r.Name, r.Description, r.Platform, r.Bridges)
+	} else {
+		body = NewAnnounceBody(r.Identity, epoch, seq, time.Now().Unix(), caps, nil, r.Name, r.Description, r.Platform, r.Bridges)
+	}
 	payload, err := body.ToControl()
 	if err != nil {
 		return Datagram{}, err

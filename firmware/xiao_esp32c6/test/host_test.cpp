@@ -65,15 +65,32 @@ int main(int argc, char** argv) {
     uint8_t pub[32], priv[64];
     ed25519_create_keypair(pub, priv, seed.data());
     size_t nCount = neighbors.size() / mesh::NODE_ID_LEN;
+    // Mirror sendAnnounce: emit v3 with a neighbor_info section when neighbors are given (each tagged
+    // outbound, 1M PHY, no RSSI/age sample), else v1 with the bare list. Verifiers accept both.
+    std::vector<mesh::AnnounceNeighborInfo> infos;
+    for (size_t i = 0; i < nCount; i++) {
+      mesh::AnnounceNeighborInfo ni{};
+      for (size_t k = 0; k < mesh::NODE_ID_LEN; k++) ni.id[k] = neighbors[i * mesh::NODE_ID_LEN + k];
+      ni.txPhy = mesh::PHY_1M;
+      ni.rxPhy = mesh::PHY_1M;
+      ni.dir = mesh::CONN_DIR_OUT;
+      ni.rssi = (int8_t)(-50 - (int)i);  // exercise negative-RSSI CBOR + signed-byte encoding
+      ni.ageS = 12 + (uint32_t)i;        // exercise the age field
+      infos.push_back(ni);
+    }
+    uint8_t version = nCount ? mesh::ANNOUNCE_VERSION : 1;
+    const uint8_t* bare = version >= 3 ? nullptr : neighbors.data();
+    size_t bareCount = version >= 3 ? 0 : nCount;
     std::vector<uint8_t> msg;
-    mesh::announceSignedMessage(pub, epoch, seq, 1700000000, mesh::CAP_RECEIVER | mesh::CAP_RELAY,
-                                neighbors.data(), nCount, "", "", "esp32-c6", msg);
+    mesh::announceSignedMessage(pub, epoch, seq, 1700000000, mesh::CAP_RECEIVER | mesh::CAP_RELAY, version,
+                                bare, bareCount, infos.data(), infos.size(), "", "", "esp32-c6", msg);
     uint8_t sig[64];
     ed25519_sign(sig, msg.data(), msg.size(), pub, priv);
     uint8_t id[mesh::DATAGRAM_ID_LEN] = {0};
     std::vector<uint8_t> out;
     mesh::buildAnnounce(pub, mesh::CAP_RECEIVER | mesh::CAP_RELAY, epoch, seq, 1700000000,
-                        id, neighbors.data(), nCount, pub, sig, "", "", "esp32-c6", out);
+                        id, version, bare, bareCount, infos.data(), infos.size(),
+                        pub, sig, "", "", "esp32-c6", out);
     printHex(out);
     return 0;
   }

@@ -508,36 +508,63 @@ static void sendAnnounce() {
   uint8_t id[mesh::DATAGRAM_ID_LEN];
   esp_fill_random(id, sizeof(id));
 
-  std::vector<std::array<uint8_t, mesh::NODE_ID_LEN>> unique;
+  // Aggregate live links by NodeID, tagging each with its direction(s). A NodeID reached over both an
+  // inbound and an outbound link (§4.4) is advertised as in+out. std::map keeps them sorted & unique,
+  // which is exactly what the v3 neighbor_info section requires. RSSI/age come from the scan
+  // observations (g_neighborObs) — our own measured view of each link.
+  struct DirAgg { bool out = false; bool in = false; };
+  std::map<std::array<uint8_t, mesh::NODE_ID_LEN>, DirAgg> byId;
+  std::vector<mesh::AnnounceNeighborInfo> infos;
+  uint32_t nowMs = millis();
   {
     std::lock_guard<std::mutex> lk(g_peersMu);
-    for (auto& kv : g_connNode) unique.push_back(kv.second);
+    for (auto& kv : g_connNode) {
+      auto& d = byId[kv.second];
+      if (g_clientPacketIn.count(kv.first)) d.out = true; else d.in = true;
+    }
+    infos.reserve(byId.size());
+    for (auto& kv : byId) {
+      mesh::AnnounceNeighborInfo ni{};
+      std::copy(kv.first.begin(), kv.first.end(), ni.id);
+      ni.txPhy = mesh::PHY_1M;   // 1M-only radio
+      ni.rxPhy = mesh::PHY_1M;
+      ni.dir = (kv.second.out && kv.second.in) ? mesh::CONN_DIR_BOTH
+             : (kv.second.out ? mesh::CONN_DIR_OUT : mesh::CONN_DIR_IN);
+      ni.rssi = 0;   // 0 = no sample
+      ni.ageS = 0;
+      auto obs = g_neighborObs.find(kv.first);
+      if (obs != g_neighborObs.end()) {
+        ni.rssi = obs->second.rssi;
+        if (nowMs >= obs->second.lastMs) ni.ageS = (nowMs - obs->second.lastMs) / 1000;
+      }
+      infos.push_back(ni);
+    }
+    // Drop observations we haven't refreshed in 5 minutes so the table can't grow without bound.
+    for (auto it = g_neighborObs.begin(); it != g_neighborObs.end();) {
+      if (nowMs - it->second.lastMs > 300000UL) it = g_neighborObs.erase(it);
+      else ++it;
+    }
   }
-  std::sort(unique.begin(), unique.end(), [](const auto& a, const auto& b) {
-    return memcmp(a.data(), b.data(), mesh::NODE_ID_LEN) < 0;
-  });
-  unique.erase(std::unique(unique.begin(), unique.end(), [](const auto& a, const auto& b) {
-    return memcmp(a.data(), b.data(), mesh::NODE_ID_LEN) == 0;
-  }), unique.end());
 
-  std::vector<uint8_t> neighbors;
-  for (auto& nb : unique) neighbors.insert(neighbors.end(), nb.begin(), nb.end());
+  // Emit v3 with the neighbor_info section once we have neighbors; otherwise v1 (smallest, bare list).
+  uint8_t version = infos.empty() ? 1 : mesh::ANNOUNCE_VERSION;
 
   uint32_t seq = ++g_announceSeq;
   int64_t ts = internalUnixTime();
   std::vector<uint8_t> signedMsg;
-  mesh::announceSignedMessage(g_pubKey, g_epoch, seq, ts, RELAY_CAPS,
-                              neighbors.data(), unique.size(), NODE_NAME, NODE_DESCRIPTION,
-                              NODE_PLATFORM, signedMsg);
+  mesh::announceSignedMessage(g_pubKey, g_epoch, seq, ts, RELAY_CAPS, version,
+                              nullptr, 0, infos.data(), infos.size(),
+                              NODE_NAME, NODE_DESCRIPTION, NODE_PLATFORM, signedMsg);
   uint8_t sig[mesh::SIG_LEN];
   ed25519_sign(sig, signedMsg.data(), signedMsg.size(), g_pubKey, g_privKey);
 
   std::vector<uint8_t> dg;
-  mesh::buildAnnounce(g_nodeId, RELAY_CAPS, g_epoch, seq, ts, id, neighbors.data(), unique.size(),
+  mesh::buildAnnounce(g_nodeId, RELAY_CAPS, g_epoch, seq, ts, id, version,
+                      nullptr, 0, infos.data(), infos.size(),
                       g_pubKey, sig, NODE_NAME, NODE_DESCRIPTION, NODE_PLATFORM, dg);
   g_dedup.seenOrAdd(id);
-  Serial.printf("[relay] ANNOUNCE epoch=%llu seq=%u neighbors=%u\n",
-                (unsigned long long)g_epoch, seq, (unsigned)unique.size());
+  Serial.printf("[relay] ANNOUNCE v%u epoch=%llu seq=%u neighbors=%u\n",
+                version, (unsigned long long)g_epoch, seq, (unsigned)infos.size());
   floodToPeers(dg, 0xFFFF);
 }
 

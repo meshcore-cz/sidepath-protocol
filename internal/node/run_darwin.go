@@ -315,6 +315,291 @@ func (r *darwinRuntime) Peers() []api.Peer {
 	return out
 }
 
+// Topology returns the mesh graph as this node sees it: every node learned via
+// ANNOUNCE with its advertised neighbors, plus the local node itself with its
+// live direct links. Node labels are resolved to friendly names; nodes are
+// sorted with the local node first, then connected nodes, then by ID.
+func (r *darwinRuntime) Topology() api.TopologyResult {
+	self := r.node.NodeID()
+	connected := make(map[core.NodeID]bool)
+	for _, p := range r.node.PeerLinks() {
+		connected[p.ID] = true
+	}
+
+	nodes := make([]api.TopologyNode, 0)
+
+	// The local node never processes its own ANNOUNCE, so it is absent from the
+	// topology; add it explicitly with its current direct neighbors.
+	selfNbrs := make([]string, 0)
+	for _, nb := range r.node.Neighbors() {
+		selfNbrs = append(selfNbrs, nb.ID.String())
+	}
+	sort.Strings(selfNbrs)
+	nodes = append(nodes, api.TopologyNode{
+		NodeID:        self.String(),
+		Name:          r.node.Name(),
+		Self:          true,
+		Neighbors:     selfNbrs,
+		LastAnnounceS: -1,
+	})
+
+	for _, tn := range r.node.Topology() {
+		if tn.ID == self {
+			continue
+		}
+		nbrs := make([]string, 0, len(tn.Neighbors))
+		for _, nid := range tn.Neighbors {
+			nbrs = append(nbrs, nid.String())
+		}
+		sort.Strings(nbrs)
+		last := int64(-1)
+		if !tn.LastSeen.IsZero() {
+			last = int64(time.Since(tn.LastSeen).Seconds())
+		}
+		nodes = append(nodes, api.TopologyNode{
+			NodeID:        tn.ID.String(),
+			Name:          r.node.NameFor(tn.ID),
+			Connected:     connected[tn.ID],
+			Neighbors:     nbrs,
+			LastAnnounceS: last,
+		})
+	}
+
+	// Connected peers whose ANNOUNCE we haven't processed yet still belong in the
+	// graph (with an empty neighbor list until their announce arrives).
+	seen := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		seen[n.NodeID] = true
+	}
+	for _, p := range r.node.PeerLinks() {
+		if p.ID == self || seen[p.ID.String()] {
+			continue
+		}
+		nodes = append(nodes, api.TopologyNode{
+			NodeID:        p.ID.String(),
+			Name:          r.node.NameFor(p.ID),
+			Connected:     true,
+			Neighbors:     []string{},
+			LastAnnounceS: -1,
+		})
+	}
+
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].Self != nodes[j].Self {
+			return nodes[i].Self
+		}
+		if nodes[i].Connected != nodes[j].Connected {
+			return nodes[i].Connected
+		}
+		return nodes[i].NodeID < nodes[j].NodeID
+	})
+
+	return api.TopologyResult{Self: self.String(), Nodes: nodes}
+}
+
+// Peer returns the full detail for a single node by NodeID (hex): the same
+// summary fields the peer list shows, plus the public key, bridged networks, and
+// the node's own neighbor list with the per-link details (RSSI, PHY, direction,
+// age) it advertised in its latest v3 ANNOUNCE.
+func (r *darwinRuntime) Peer(idHex string) (*api.PeerDetail, error) {
+	id, err := core.ParseNodeID(idHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid node id %q: %w", idHex, err)
+	}
+
+	dir := ""
+	for _, p := range r.node.PeerLinks() {
+		if p.ID == id {
+			dir = p.Direction
+			break
+		}
+	}
+	var nb *core.Neighbor
+	for _, n := range r.node.Neighbors() {
+		if n.ID == id {
+			nn := n
+			nb = &nn
+			break
+		}
+	}
+	var tn *core.TopoNode
+	for _, t := range r.node.Topology() {
+		if t.ID == id {
+			tt := t
+			tn = &tt
+			break
+		}
+	}
+	if tn == nil && dir == "" {
+		return nil, fmt.Errorf("unknown node %s (no announce seen and not connected)", idHex)
+	}
+
+	p := api.Peer{NodeID: id.String(), Hops: -1, LastAnnounceS: -1}
+	if dir != "" {
+		p.Connected = true
+		p.Direction = dir
+		if nb != nil {
+			p.TxPHY = nb.TxPHY.String()
+			p.RxPHY = nb.RxPHY.String()
+		}
+	}
+	p.RSSI = r.node.RSSIFor(id)
+	if route, ok := r.node.RouteTo(id); ok {
+		p.Hops = len(route) - 1
+	}
+
+	detail := &api.PeerDetail{}
+	if tn != nil {
+		p.Name = tn.Name
+		p.Platform = tn.Platform
+		p.Description = tn.Description
+		p.Relay = tn.Caps.IsRelay()
+		p.Gateway = tn.Caps.IsGateway()
+		p.Neighbors = len(tn.Neighbors)
+		p.AnnounceEpoch = tn.Epoch
+		p.AnnounceSeq = tn.Seq
+		if !tn.LastSeen.IsZero() {
+			p.LastAnnounceS = int64(time.Since(tn.LastSeen).Seconds())
+		}
+		detail.Pubkey = hex.EncodeToString(tn.PublicKey)
+		for _, b := range tn.Bridges {
+			detail.Bridges = append(detail.Bridges, b.Code)
+		}
+		detail.NeighborList = r.neighborDetails(*tn)
+	}
+	detail.NeighborOfList = r.reverseNeighborDetails(id)
+	detail.Peer = p
+	return detail, nil
+}
+
+// reverseNeighborDetails is the inverse of neighborDetails: every node that lists
+// [id] in its own advertised neighbor set, with the per-link details that node
+// reported about the link. Sources are the local node's neighbor table (shown as
+// "(this node)") and every topology node's latest announce (v3 per-link info when
+// present, IDs only otherwise). Lets `sp peer` show a link from both ends.
+func (r *darwinRuntime) reverseNeighborDetails(id core.NodeID) []api.NeighborDetail {
+	self := r.node.NodeID()
+	names := make(map[core.NodeID]string)
+	for _, t := range r.node.Topology() {
+		if t.Name != "" {
+			names[t.ID] = t.Name
+		}
+	}
+
+	var out []api.NeighborDetail
+	// The local node advertises its own direct neighbors; surface our link to id.
+	for _, nb := range r.node.Neighbors() {
+		if nb.ID != id {
+			continue
+		}
+		var age uint32
+		if d := time.Since(nb.LastSeen); d > 0 {
+			age = uint32(d / time.Second)
+		}
+		out = append(out, api.NeighborDetail{
+			NodeID:    self.String(),
+			Name:      "(this node)",
+			HasInfo:   true,
+			RSSI:      nb.RSSI,
+			TxPHY:     nb.TxPHY.String(),
+			RxPHY:     nb.RxPHY.String(),
+			Direction: directionString(nb.Direction),
+			AgeS:      age,
+		})
+		break
+	}
+
+	// Every remote node whose latest announce lists id as a neighbor.
+	for _, tn := range r.node.Topology() {
+		if tn.ID == self || tn.ID == id {
+			continue
+		}
+		if len(tn.NeighborInfo) > 0 {
+			for _, ni := range tn.NeighborInfo {
+				if ni.ID != id {
+					continue
+				}
+				out = append(out, api.NeighborDetail{
+					NodeID:    tn.ID.String(),
+					Name:      names[tn.ID],
+					HasInfo:   true,
+					RSSI:      int(ni.RSSI),
+					TxPHY:     ni.TxPHY.String(),
+					RxPHY:     ni.RxPHY.String(),
+					Direction: directionString(ni.Dir),
+					AgeS:      ni.AgeS,
+				})
+				break
+			}
+			continue
+		}
+		for _, nid := range tn.Neighbors {
+			if nid == id {
+				out = append(out, api.NeighborDetail{NodeID: tn.ID.String(), Name: names[tn.ID]})
+				break
+			}
+		}
+	}
+	return out
+}
+
+// neighborDetails renders a peer's advertised neighbor list. v3 announces carry
+// per-link details (HasInfo true); v1/v2 announces yield IDs only. Neighbor names
+// are resolved from our own topology when that node is also known.
+func (r *darwinRuntime) neighborDetails(tn core.TopoNode) []api.NeighborDetail {
+	names := make(map[core.NodeID]string)
+	for _, t := range r.node.Topology() {
+		if t.Name != "" {
+			names[t.ID] = t.Name
+		}
+	}
+	self := r.node.NodeID()
+	nameOf := func(id core.NodeID) string {
+		if id == self {
+			return "(this node)"
+		}
+		return names[id]
+	}
+
+	if len(tn.NeighborInfo) > 0 {
+		out := make([]api.NeighborDetail, 0, len(tn.NeighborInfo))
+		for _, ni := range tn.NeighborInfo {
+			out = append(out, api.NeighborDetail{
+				NodeID:    ni.ID.String(),
+				Name:      nameOf(ni.ID),
+				HasInfo:   true,
+				RSSI:      int(ni.RSSI),
+				TxPHY:     ni.TxPHY.String(),
+				RxPHY:     ni.RxPHY.String(),
+				Direction: directionString(ni.Dir),
+				AgeS:      ni.AgeS,
+			})
+		}
+		return out
+	}
+
+	out := make([]api.NeighborDetail, 0, len(tn.Neighbors))
+	for _, nid := range tn.Neighbors {
+		out = append(out, api.NeighborDetail{NodeID: nid.String(), Name: nameOf(nid)})
+	}
+	return out
+}
+
+// directionString maps a wire connection direction to the same labels the peer
+// list uses for live links.
+func directionString(d core.ConnDirection) string {
+	switch d {
+	case core.DirectionOutgoing:
+		return "outbound"
+	case core.DirectionIncoming:
+		return "inbound"
+	case core.DirectionBoth:
+		return "in+out"
+	default:
+		return ""
+	}
+}
+
 // SendDirect sends an encrypted direct message to dest. The recipient's public
 // key is resolved from the topology (learned via signed ANNOUNCE). When wantAck
 // is set it waits for the ACK until ctx is cancelled, reporting the round-trip

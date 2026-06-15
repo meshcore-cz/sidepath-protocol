@@ -1,4 +1,4 @@
-.PHONY: help build test test-go build-macos build-macos-helper bot clean sp sp-install build-esp32 install-esp32
+.PHONY: help build test test-go build-macos build-macos-helper bot clean sp sp-install build-esp32 install-esp32 build-modem flash-modem monitor-modem test-modem
 
 .DEFAULT_GOAL := help
 
@@ -55,3 +55,38 @@ build-esp32: ## Compile the XIAO ESP32-C6 firmware
 
 install-esp32: build-esp32 ## Compile and flash the XIAO ESP32-C6 firmware
 	arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32C6 -p /dev/tty.usbmodem21101 firmware/xiao_esp32c6
+
+# ESP-IDF connectionless Sidepath BLE modem (firmware/sidepath_modem_c6).
+# Needs ESP-IDF v5.x. The recipes use idf.py if it is already on PATH; otherwise
+# they auto-source $IDF_PATH/export.sh when IDF_PATH points at an install. If
+# neither is available they print install guidance and stop.
+# Override the serial port, e.g.: make flash-modem MODEM_PORT=/dev/cu.usbmodem21101
+MODEM_DIR := firmware/sidepath_modem_c6
+MODEM_PORT ?= /dev/ttyACM0
+
+build-modem:
+	@bash -lc 'set -e; \
+		source "$$HOME/.espressif/tools/activate_idf_v6.0.1.sh"; \
+		eim select v6.0.1; \
+		cd firmware/sidepath_modem_c6; \
+		idf.py set-target esp32c6; \
+		idf.py build'
+
+flash-modem: ## Build and flash the BLE modem firmware (MODEM_PORT=...)
+	@bash -lc 'set -e; \
+		source "$$HOME/.espressif/tools/activate_idf_v6.0.1.sh"; \
+		eim select v6.0.1; \
+		cd firmware/sidepath_modem_c6; \
+		idf.py set-target esp32c6; \
+		idf.py flash'
+
+monitor-modem: ## Open the BLE modem serial monitor (MODEM_PORT=...)
+	@bash -lc 'set -e; \
+		source "$$HOME/.espressif/tools/activate_idf_v6.0.1.sh"; \
+		eim select v6.0.1; \
+		cd firmware/sidepath_modem_c6; \
+		idf.py set-target esp32c6; \
+		idf.py monitor'
+
+test-modem: ## Run the BLE modem host relay logic tests (no ESP-IDF needed)
+	$(MODEM_DIR)/test/run_tests.sh

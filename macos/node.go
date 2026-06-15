@@ -704,6 +704,7 @@ func (n *Node) sendAck(a core.Action) {
 func (n *Node) announceLoop(ctx context.Context) {
 	seq := uint32(0)
 	send := func() {
+		n.syncNeighborDirections()
 		dg, err := n.router.BuildAnnounce(n.caps, n.announceEpoch, seq)
 		if err != nil {
 			n.logf("announce build error: %v", err)
@@ -1170,6 +1171,23 @@ func (n *Node) ConnectedPeers() []core.NodeID {
 type PeerInfo struct {
 	ID        core.NodeID
 	Direction string // "outbound", "inbound", or "in+out"
+}
+
+// syncNeighborDirections refreshes each neighbor's stored link direction from the live link set so a
+// v3 ANNOUNCE reports out/in/both consistently with what PeerLinks shows the UI (§4.4). The stored
+// direction is set once at connect time and would otherwise go stale — e.g. an outbound established
+// first never upgrades to in+out when the peer later dials our GATT server.
+func (n *Node) syncNeighborDirections() {
+	for _, p := range n.PeerLinks() {
+		dir := core.DirectionOutgoing
+		switch p.Direction {
+		case "inbound":
+			dir = core.DirectionIncoming
+		case "in+out":
+			dir = core.DirectionBoth
+		}
+		n.router.Neighbors.SetDirection(p.ID, dir)
+	}
 }
 
 // PeerLinks returns every connected peer — outbound (we dialed them) and inbound (they dialed our

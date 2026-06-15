@@ -19,8 +19,12 @@ type TopoNode struct {
 	PublicKey   []byte // 32-byte Ed25519 key from ANNOUNCE (key 6); used for chat encryption
 	// Bridges lists the external networks this node bridges (v2 ANNOUNCE key 12, §8.3); empty for
 	// non-gateway nodes and v1 announces.
-	Bridges  []BridgeAd
-	LastSeen time.Time
+	Bridges []BridgeAd
+	// NeighborInfo carries the per-link details (RSSI, PHY, direction, age) this node advertised for
+	// each of its neighbors (v3 ANNOUNCE key 13, §8.8); empty for v1/v2 announces. The bare Neighbors
+	// list above always holds the same IDs regardless of version.
+	NeighborInfo []NeighborInfo
+	LastSeen     time.Time
 }
 
 // Topology maintains the global mesh graph learned via ANNOUNCE packets.

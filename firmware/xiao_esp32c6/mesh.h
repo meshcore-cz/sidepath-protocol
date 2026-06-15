@@ -18,7 +18,27 @@ constexpr size_t SIG_LEN         = 64;
 constexpr uint8_t FRAME_VERSION     = 2;
 constexpr uint8_t DATAGRAM_VERSION  = 3;
 constexpr uint8_t NODE_INFO_VERSION = 1;
-constexpr uint8_t ANNOUNCE_VERSION  = 1;
+// Max announce version we emit. v3 carries per-neighbor link details (§8.8). Like the Go/Kotlin
+// nodes we emit the lowest version that fits: v1 (bare neighbor IDs) when we have no link details,
+// v3 with a neighbor_info section once we have live neighbors. Verifiers accept v1..v3.
+constexpr uint8_t ANNOUNCE_VERSION  = 3;
+
+// BLE PHY identifiers for a v3 ANNOUNCE neighbor_info entry (§8.8). This node runs 1M only.
+enum : uint8_t { PHY_UNKNOWN = 0, PHY_1M = 1, PHY_2M = 2, PHY_CODED = 3 };
+
+// Which side opened a neighbor link, for a v3 ANNOUNCE neighbor_info entry (§8.8, §4.4).
+enum : uint8_t { CONN_DIR_OUT = 1, CONN_DIR_IN = 2, CONN_DIR_BOTH = 3 };
+
+// One directly-linked peer's per-link details, advertised in a v3 ANNOUNCE neighbor_info entry.
+// [rssi] is dBm (0 = no sample); [ageS] is seconds since the last packet (0 = unknown).
+struct AnnounceNeighborInfo {
+  uint8_t  id[NODE_ID_LEN];
+  int8_t   rssi;
+  uint8_t  txPhy;
+  uint8_t  rxPhy;
+  uint8_t  dir;
+  uint32_t ageS;
+};
 
 constexpr uint8_t MAX_TTL        = 16;
 constexpr uint8_t ANNOUNCE_TTL   = 5;
@@ -125,15 +145,20 @@ bool buildSourceRouteForward(const uint8_t* dg, size_t len, const uint8_t selfId
                              uint8_t newTtl, uint8_t newRouteCursor,
                              std::vector<uint8_t>& out);
 
+// Builds the fixed binary layout the ANNOUNCE signature covers (§8.3). [version] selects the layout:
+// v1 signs the bare neighbor list; v3 leaves that list empty ([neighborCount] == 0) and appends a
+// bridges section (count 0 here) then the neighbor_info section from [infos].
 void announceSignedMessage(const uint8_t pubKey[PUBKEY_LEN], uint64_t epoch, uint32_t seq,
-                           int64_t timestamp, uint16_t caps,
+                           int64_t timestamp, uint16_t caps, uint8_t version,
                            const uint8_t* neighbors, size_t neighborCount,
+                           const AnnounceNeighborInfo* infos, size_t infoCount,
                            const char* name, const char* description, const char* platform,
                            std::vector<uint8_t>& out);
 
 void buildAnnounce(const uint8_t selfId[NODE_ID_LEN], uint16_t caps, uint64_t epoch,
                    uint32_t seq, int64_t unixSeconds, const uint8_t datagramId[DATAGRAM_ID_LEN],
-                   const uint8_t* neighbors, size_t neighborCount,
+                   uint8_t version, const uint8_t* neighbors, size_t neighborCount,
+                   const AnnounceNeighborInfo* infos, size_t infoCount,
                    const uint8_t pubKey[PUBKEY_LEN], const uint8_t signature[SIG_LEN],
                    const char* name, const char* description, const char* platform,
                    std::vector<uint8_t>& out);

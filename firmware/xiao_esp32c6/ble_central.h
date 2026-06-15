@@ -21,8 +21,19 @@
 
 #pragma once
 
+#include <array>
+#include <map>
 #include <set>
 #include <string>
+
+// Per-neighbor signal observed from BLE scan advertisements, keyed by NodeID. The scan hears every
+// Sidepath advertiser in range — peers we dial and peers that dial us — so this is our own measured
+// view of each link, fed into the v3 ANNOUNCE neighbor_info (RSSI in dBm, age from last advert).
+struct ScanObs {
+  int8_t   rssi;    // dBm as we heard the peer's advertisement
+  uint32_t lastMs;  // millis() of that advert
+};
+static std::map<std::array<uint8_t, mesh::NODE_ID_LEN>, ScanObs> g_neighborObs;
 
 // Cap on simultaneous links this node dials. Keep inbound + outbound within the
 // NimBLE connection pool (see file note above).
@@ -135,6 +146,15 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     if (haveId && memcmp(advId, g_nodeId, mesh::NODE_ID_LEN) == 0) return;  // self
     std::string key = dev->getAddress().toString();
     std::lock_guard<std::mutex> lk(g_peersMu);
+    // Record the signal for any identifiable Sidepath peer, even one we're already linked to or can't
+    // dial right now — the next ANNOUNCE advertises this RSSI/age for the link.
+    if (haveId) {
+      std::array<uint8_t, mesh::NODE_ID_LEN> obsKey;
+      memcpy(obsKey.data(), advId, mesh::NODE_ID_LEN);
+      ScanObs& o = g_neighborObs[obsKey];
+      o.rssi = (int8_t)dev->getRSSI();
+      o.lastMs = millis();
+    }
     if (g_clientPacketIn.size() >= MAX_OUTBOUND_LINKS) return;
     if (g_knownAddr.count(key)) return;                       // already queued/dialing/linked
     if (haveId && haveLinkToNodeLocked(advId)) return;        // already linked to this NodeID

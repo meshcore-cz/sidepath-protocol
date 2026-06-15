@@ -80,13 +80,37 @@ class Router(val identity: Identity) {
         if (!body.isValid()) return false
         topology.update(
             TopoNode(
-                id = derived, publicKey = body.publicKey, caps = body.caps, neighbors = body.neighbors,
+                id = derived, publicKey = body.publicKey, caps = body.caps, neighbors = body.neighborIds(),
                 epoch = body.epoch, seq = body.seq, timestamp = body.timestamp,
                 name = body.name, description = body.description, platform = body.platform,
                 bridges = body.bridges,
             ),
         )
         return true
+    }
+
+    /**
+     * Builds a signed ANNOUNCE body for this node, mirroring Go's `Router.BuildAnnounce`. Emits v3 with
+     * a `neighbor_info` section (per-link RSSI/PHY/direction/age) once we have any live neighbors;
+     * otherwise falls back to the bare-ID v1/v2 layout so a node with no links still emits the smallest
+     * announce. [bridges], when present, force at least v2 (and ride along in v3).
+     */
+    fun buildAnnounceBody(
+        caps: Capabilities,
+        epoch: Long,
+        seq: Long,
+        name: String,
+        description: String,
+        platform: String,
+        bridges: List<BridgeAd> = emptyList(),
+        timestamp: Long = System.currentTimeMillis() / 1000,
+    ): AnnounceBody {
+        val infos = neighbors.announceInfo()
+        return if (infos.isNotEmpty()) {
+            AnnounceBody.createV3(identity, epoch, seq, timestamp, caps, infos, name, description, platform, bridges)
+        } else {
+            AnnounceBody.create(identity, epoch, seq, timestamp, caps, emptyList(), name, description, platform, bridges)
+        }
     }
 
     private fun handleFlood(dg: Datagram, incomingPeer: NodeId?): List<Action> {

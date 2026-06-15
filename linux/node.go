@@ -584,6 +584,7 @@ func (n *Node) connectDevice(ctx context.Context, result ScanResult) {
 
 	n.router.Neighbors.Upsert(core.Neighbor{
 		ID:        realID,
+		Direction: core.DirectionOutgoing,
 		TxPHY:     link.TxPHY(),
 		RxPHY:     link.RxPHY(),
 		RSSI:      link.RSSI(),

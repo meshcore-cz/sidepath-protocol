@@ -9,10 +9,12 @@ object Sidepath {
     const val DATAGRAM_VERSION: Int = 3
     const val NODE_INFO_VERSION: Int = 1
     // Current (max) announce version we emit. v2 adds the optional trailing `bridges` section
-    // (§8.3). A node emits v1 (byte-identical to the original layout) when it has no bridges, and
-    // v2 only when it bridges one or more networks. Verifiers accept any version in
+    // (§8.3); v3 replaces the bare neighbor-ID list with a trailing `neighbor_info` section carrying
+    // per-link RSSI, PHY, direction, and age (§8.8). A node emits the lowest version that fits its
+    // data: v1 (byte-identical to the original layout) with no bridges/neighbor-info, v2 when it only
+    // bridges networks, v3 once it advertises neighbor link details. Verifiers accept any version in
     // [MIN_ANNOUNCE_VERSION]..[ANNOUNCE_VERSION] and reconstruct the signed bytes per that version.
-    const val ANNOUNCE_VERSION: Int = 2
+    const val ANNOUNCE_VERSION: Int = 3
     const val MIN_ANNOUNCE_VERSION: Int = 1
 
     const val NODE_ID_BYTES: Int = 10
@@ -80,6 +82,23 @@ data class BridgeAd(
         }
         return true
     }
+}
+
+/** BLE PHY identifiers carried in a v3 ANNOUNCE `neighbor_info` entry (§8.8). */
+object Phy {
+    const val UNKNOWN: Int = 0
+    const val LE_1M: Int = 1
+    const val LE_2M: Int = 2
+    const val CODED: Int = 3
+}
+
+/** Which side opened a neighbor link, in a v3 ANNOUNCE `neighbor_info` entry (§8.8). */
+object ConnDirection {
+    const val OUTGOING: Int = 1
+    const val INCOMING: Int = 2
+
+    /** Held over both an inbound and an outbound link at once (§4.4 multi-link). */
+    const val BOTH: Int = 3
 }
 
 /** Payload protocol registry values (§6.4). */

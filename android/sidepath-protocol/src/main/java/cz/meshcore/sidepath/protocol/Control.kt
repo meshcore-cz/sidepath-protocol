@@ -78,6 +78,63 @@ private fun bridgeList(obj: CBORObject?): List<BridgeAd> {
 }
 
 /**
+ * One directly-linked peer as advertised in a v3 ANNOUNCE `neighbor_info` entry (§8.8): the
+ * announcing node's own view of the link. [rssi] is dBm clamped to a signed byte (0 = no sample),
+ * [txPhy]/[rxPhy] the BLE PHY in each direction ([Phy]), [direction] which side opened it
+ * ([ConnDirection]), [ageS] whole seconds since the last received packet. CBOR is transport; the
+ * signed binary (§8.3) is the authoritative form.
+ */
+data class NeighborInfo(
+    val id: NodeId,
+    val rssi: Int = 0,
+    val txPhy: Int = Phy.UNKNOWN,
+    val rxPhy: Int = Phy.UNKNOWN,
+    val direction: Int = ConnDirection.OUTGOING,
+    val ageS: Long = 0L,
+) {
+    /** Checks the PHY and direction enums are in range. */
+    fun isValid(): Boolean {
+        if (txPhy < 0 || txPhy > Phy.CODED || rxPhy < 0 || rxPhy > Phy.CODED) return false
+        if (direction < 0 || direction > ConnDirection.BOTH) return false
+        return true
+    }
+}
+
+/**
+ * Encodes the v3 announce `neighbor_info` array (§8.8): each entry a map {1:id, [2:rssi, 3:txPhy,
+ * 4:rxPhy, 5:dir, 6:ageS]}. Keys 2-6 are omitted when zero, matching the Go encoder's omitempty.
+ */
+private fun neighborInfoArray(infos: List<NeighborInfo>): CBORObject {
+    val arr = CBORObject.NewArray()
+    infos.forEach { n ->
+        val m = CBORObject.NewOrderedMap()
+        m[k(1)] = CBORObject.FromObject(n.id.bytes)
+        if (n.rssi != 0) m[k(2)] = CBORObject.FromObject(n.rssi)
+        if (n.txPhy != 0) m[k(3)] = CBORObject.FromObject(n.txPhy)
+        if (n.rxPhy != 0) m[k(4)] = CBORObject.FromObject(n.rxPhy)
+        if (n.direction != 0) m[k(5)] = CBORObject.FromObject(n.direction)
+        if (n.ageS != 0L) m[k(6)] = CBORObject.FromObject(n.ageS)
+        arr.Add(m)
+    }
+    return arr
+}
+
+private fun neighborInfoList(obj: CBORObject?): List<NeighborInfo> {
+    if (obj == null || obj.isNull || obj.isUndefined) return emptyList()
+    return (0 until obj.size()).map { i ->
+        val m = obj[k(i)]
+        NeighborInfo(
+            id = NodeId(m[k(1)].GetByteString()),
+            rssi = m[k(2)]?.AsInt32() ?: 0,
+            txPhy = m[k(3)]?.AsInt32() ?: 0,
+            rxPhy = m[k(4)]?.AsInt32() ?: 0,
+            direction = m[k(5)]?.AsInt32() ?: 0,
+            ageS = m[k(6)]?.AsInt64Value() ?: 0L,
+        )
+    }
+}
+
+/**
  * A signed ANNOUNCE body (§8.2). [neighbors] MUST be sorted lexicographically and
  * unique. The signature covers the fixed layout from [Identity.announceSignedMessage],
  * not this CBOR encoding.
@@ -96,6 +153,9 @@ data class AnnounceBody(
     val signature: ByteArray,
     // v2 ANNOUNCE: the external networks this (gateway) node bridges. Empty on v1 and on non-gateways.
     val bridges: List<BridgeAd> = emptyList(),
+    // v3 ANNOUNCE: per-neighbor link details (§8.8). Present only on v3, which leaves the bare
+    // [neighbors] list empty and carries its neighbors here instead (use [neighborIds] to read either).
+    val neighborInfo: List<NeighborInfo> = emptyList(),
 ) {
     /** Verifies field-length limits, sorted/unique neighbors, and the Ed25519 signature (§8.4). */
     fun isValid(): Boolean {
@@ -110,15 +170,35 @@ data class AnnounceBody(
         if (announceVersion < 2 && bridges.isNotEmpty()) return false
         if (bridges.size > Sidepath.MAX_BRIDGES) return false
         if (bridges.any { !it.isValid() }) return false
+        // NeighborInfo only exists from v3; v3 carries its neighbors there and leaves the bare list empty.
+        if (announceVersion < 3 && neighborInfo.isNotEmpty()) return false
+        if (neighborInfo.isNotEmpty() && neighbors.isNotEmpty()) return false
+        if (neighborInfo.size > Sidepath.MAX_NEIGHBORS) return false
+        if (neighborInfo.any { !it.isValid() }) return false
+        if (!neighborInfoSortedUnique()) return false
         return Identity.verifyAnnounce(
             publicKey, signature, epoch, seq, timestamp, caps, neighbors, name, description, platform,
-            announceVersion, bridges,
+            announceVersion, bridges, neighborInfo,
         )
     }
+
+    /**
+     * The announcing node's neighbor IDs regardless of version: the bare [neighbors] list on v1/v2,
+     * or the IDs from [neighborInfo] on v3.
+     */
+    fun neighborIds(): List<NodeId> =
+        if (neighborInfo.isEmpty()) neighbors else neighborInfo.map { it.id }
 
     private fun neighborsSortedUnique(): Boolean {
         for (i in 1 until neighbors.size) {
             if (neighbors[i - 1] >= neighbors[i]) return false
+        }
+        return true
+    }
+
+    private fun neighborInfoSortedUnique(): Boolean {
+        for (i in 1 until neighborInfo.size) {
+            if (neighborInfo[i - 1].id >= neighborInfo[i].id) return false
         }
         return true
     }
@@ -140,6 +220,8 @@ data class AnnounceBody(
         map[k(11)] = CBORObject.FromObject(signature)
         // Only present on v2 gateway announces; absent keeps v1 bodies byte-for-byte unchanged.
         if (bridges.isNotEmpty()) map[k(12)] = bridgeArray(bridges)
+        // Only present on v3 announces; replaces the bare neighbor list (which v3 leaves empty).
+        if (neighborInfo.isNotEmpty()) map[k(13)] = neighborInfoArray(neighborInfo)
         return map
     }
 
@@ -157,6 +239,7 @@ data class AnnounceBody(
             platform = body[k(10)].AsString(),
             signature = body[k(11)].GetByteString(),
             bridges = bridgeList(body[k(12)]),
+            neighborInfo = neighborInfoList(body[k(13)]),
         )
 
         /**
@@ -176,13 +259,43 @@ data class AnnounceBody(
             bridges: List<BridgeAd> = emptyList(),
         ): AnnounceBody {
             val sorted = neighbors.distinctBy { it.toHex() }.sortedWith { a, b -> a.compareTo(b) }
-            val version = if (bridges.isEmpty()) 1 else Sidepath.ANNOUNCE_VERSION
+            val version = if (bridges.isEmpty()) 1 else 2
             val sig = identity.signAnnounce(
                 epoch, seq, timestamp, caps, sorted, name, description, platform, version, bridges,
             )
             return AnnounceBody(
                 version, identity.publicKey, epoch, seq, timestamp, caps,
                 sorted, name, description, platform, sig, bridges,
+            )
+        }
+
+        /**
+         * Builds and signs a v3 announce. Neighbors are carried as [NeighborInfo] (with per-link
+         * RSSI/PHY/direction/age) rather than the bare v1/v2 ID list, which v3 leaves empty. The info
+         * entries are sorted by ID and de-duplicated; [bridges], when present, ride along in the v2
+         * section. Mirrors Go's `NewAnnounceBodyV3`.
+         */
+        fun createV3(
+            identity: Identity,
+            epoch: Long,
+            seq: Long,
+            timestamp: Long,
+            caps: Capabilities,
+            neighborInfo: List<NeighborInfo>,
+            name: String,
+            description: String,
+            platform: String,
+            bridges: List<BridgeAd> = emptyList(),
+        ): AnnounceBody {
+            val sorted = neighborInfo.sortedWith { a, b -> a.id.compareTo(b.id) }.distinctBy { it.id.toHex() }
+            val sig = identity.signAnnounce(
+                epoch, seq, timestamp, caps, emptyList(), name, description, platform, 3, bridges, sorted,
+            )
+            return AnnounceBody(
+                announceVersion = 3, publicKey = identity.publicKey, epoch = epoch, seq = seq,
+                timestamp = timestamp, caps = caps, neighbors = emptyList(),
+                name = name, description = description, platform = platform,
+                signature = sig, bridges = bridges, neighborInfo = sorted,
             )
         }
     }

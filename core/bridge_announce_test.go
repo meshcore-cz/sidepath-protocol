@@ -32,7 +32,7 @@ func TestBridgeAnnounceVectorLocksWireFormat(t *testing.T) {
 	if body.AnnounceVersion != 2 {
 		t.Fatalf("a body with bridges must be v2, got %d", body.AnnounceVersion)
 	}
-	msg := AnnounceSignedMessage(id.Pub, 3, 4, 100, Capabilities(0x1F), body.Neighbors, "alice", "", "test", 2, bridges)
+	msg := AnnounceSignedMessage(id.Pub, 3, 4, 100, Capabilities(0x1F), body.Neighbors, "alice", "", "test", 2, bridges, nil)
 	if got := hex.EncodeToString(msg); got != sharedBridgeSignedMsgHex {
 		t.Fatalf("signed-message bytes drifted:\n got  %s\n want %s", got, sharedBridgeSignedMsgHex)
 	}
