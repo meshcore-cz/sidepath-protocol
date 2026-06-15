@@ -224,7 +224,7 @@ private fun OverviewTab(
             Spacer(Modifier.height(8.dp))
 
             InfoRow("PHY policy", if (phyFallback) "auto (1M fallback)" else "auto ($phyMode)")
-            InfoRow("Link PHY preference", if (codedPhySupported) "prefer LE Coded, allow 1M fallback" else "1M")
+            InfoRow("Link PHY preference", if (phyMode == "1m") "1M" else if (codedPhySupported) "prefer LE Coded, allow 1M fallback" else "1M")
             Spacer(Modifier.height(8.dp))
         }
 

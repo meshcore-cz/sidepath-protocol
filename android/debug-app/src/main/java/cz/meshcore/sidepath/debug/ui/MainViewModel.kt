@@ -62,8 +62,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }.stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
     val phyMode: StateFlow<PHYMode> = _service.flatMapLatest {
-        it?.phyMode ?: flowOf(PHYMode.CODED_PREFERRED)
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, PHYMode.CODED_PREFERRED)
+        it?.phyMode ?: flowOf(PHYMode.ONE_M)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, PHYMode.ONE_M)
 
     val codedPhySupported: StateFlow<Boolean> = _service.flatMapLatest {
         it?.codedPhySupported ?: flowOf(false)
@@ -151,7 +151,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val seed = ByteArray(Sidepath.SEED_BYTES) { i -> seedHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
         val identity = Identity.fromSeed(seed)
-        service.initialize(identity, PHYMode.CODED_PREFERRED, allowlistSet)
+        service.initialize(identity, PHYMode.ONE_M, allowlistSet)
     }
 
     fun sendMessage(destination: String, message: String, ttl: Int) {

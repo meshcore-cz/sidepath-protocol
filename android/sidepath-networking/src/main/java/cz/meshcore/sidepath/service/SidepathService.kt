@@ -405,7 +405,7 @@ class SidepathService : Service() {
     private val _bleMacAddress = MutableStateFlow("")
     val bleMacAddress: StateFlow<String> = _bleMacAddress.asStateFlow()
 
-    private val _phyMode = MutableStateFlow(PHYMode.CODED_PREFERRED)
+    private val _phyMode = MutableStateFlow(PHYMode.ONE_M)
     val phyMode: StateFlow<PHYMode> = _phyMode.asStateFlow()
 
     private val _codedPhySupported = MutableStateFlow(false)
@@ -1141,6 +1141,17 @@ class SidepathService : Service() {
             deliverMeshCoreAck(leUint32(env.payload), dg, rssi)
         }
 
+        // MeshCore MULTIPART can wrap repeated ACK payloads on direct/routed links. Treat an inner
+        // ACK exactly like a standalone ACK so delayed/repeated delivery still satisfies the pending
+        // outgoing DM.
+        if (env != null && env.type == MeshCoreType.MULTIPART) {
+            MeshCoreCodec.decodeMultipartAckCrc(env.payload)?.let { crc ->
+                if (deliverMeshCoreAck(crc, dg, rssi)) {
+                    log("meshcore MULTIPART ACK content=$contentId", LogTag.MSG)
+                }
+            }
+        }
+
         // MeshCore PATH return: a FLOOD-routed TXT_MSG is acked by the recipient with a PATH return
         // that EMBEDS the ACK (firmware BaseChatMesh::onPeerDataRecv → createPathReturn), not a
         // standalone ACK packet. If it's addressed to us, decrypt it with each candidate contact key
@@ -1233,18 +1244,29 @@ class SidepathService : Service() {
      * flips the message to delivered. Returns the Sidepath carrier datagram id (used as the chat
      * Message id), or null on failure.
      */
-    fun sendMeshCoreDirect(recipientPub: ByteArray, text: String): ByteArray? {
+    fun sendMeshCoreDirect(
+        recipientPub: ByteArray,
+        text: String,
+        path: ByteArray? = null,
+        pathHashSize: Int = 0,
+    ): ByteArray? {
         val id = identity ?: return null
         if (recipientPub.size != 32) return null
         val ts = System.currentTimeMillis() / 1000
-        val raw = MeshCoreCodec.encodeDirectText(id.seed, recipientPub, text, ts, 0) ?: return null
+        val raw = if (path != null && pathHashSize in 1..3) {
+            MeshCoreCodec.encodeDirectTextPath(id.seed, recipientPub, text, ts, 0, path, pathHashSize)
+                ?: MeshCoreCodec.encodeDirectText(id.seed, recipientPub, text, ts, 0)
+        } else {
+            MeshCoreCodec.encodeDirectText(id.seed, recipientPub, text, ts, 0)
+        } ?: return null
         val dgId = sendMeshCoreRaw(raw) ?: return null
         // The recipient's ACK carries crc = SHA256(ts|attempt&3|text|OUR pubkey)[:4]; map it back to
         // this message so the inbound-ACK branch can mark it delivered.
         val crc = MeshCoreCodec.textAckCrc(ts, 0, text, id.publicKey) ?: return null
         if (pendingMeshCoreAck.size > 200) pendingMeshCoreAck.keys.take(80).forEach { pendingMeshCoreAck.remove(it) }
         pendingMeshCoreAck[crc] = dgId
-        log("meshcore DM tx to=${recipientPub.copyOf(2).toHex()} crc=%08x dg=${dgId.take(4).toHex()}".format(crc), LogTag.MSG)
+        val route = if (path != null && pathHashSize in 1..3) "direct-path" else "flood"
+        log("meshcore DM tx to=${recipientPub.copyOf(2).toHex()} route=$route crc=%08x dg=${dgId.take(4).toHex()}".format(crc), LogTag.MSG)
         return dgId
     }
 

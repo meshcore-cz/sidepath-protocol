@@ -60,8 +60,8 @@ enum class PHYMode(val value: String) {
     companion object {
         fun fromString(s: String): PHYMode = when (s) {
             "1m-debug" -> ONE_M
-            "1m" -> CODED_PREFERRED // migrate the old manual default to the automatic policy
-            else -> entries.firstOrNull { it.value == s } ?: CODED_PREFERRED
+            "1m" -> ONE_M
+            else -> entries.firstOrNull { it.value == s } ?: ONE_M
         }
     }
 }

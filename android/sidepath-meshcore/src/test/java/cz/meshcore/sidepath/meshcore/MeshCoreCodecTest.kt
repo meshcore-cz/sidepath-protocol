@@ -107,4 +107,32 @@ class MeshCoreCodecTest {
         assertNull(MeshCoreCodec.parsePathAckCrcJson("""{"error":"no ack"}"""))
         assertNull(MeshCoreCodec.parsePathAckCrcJson("nonsense"))
     }
+
+    @Test
+    fun parsesReturnedPath() {
+        val path = MeshCoreCodec.parsePathJson(
+            """{"destHash":"29","srcHash":"03","path":"aabbccdd","extraType":3,"extra":"ea9a77d8","ackCrc":3631717098}""",
+        )
+        assertNotNull(path)
+        path!!
+        assertEquals("29", path.destHash)
+        assertEquals("03", path.srcHash)
+        assertEquals("aabbccdd", path.pathHex)
+        assertEquals(3, path.extraType)
+        assertEquals("ea9a77d8", path.extraHex)
+        assertEquals(0xd8779aeaL, path.ackCrc)
+    }
+
+    @Test
+    fun parsesMultipartAckCrcOnlyForAckInnerType() {
+        assertEquals(
+            0xd8779aeaL,
+            MeshCoreCodec.parseMultipartAckCrcJson(
+                """{"ackCrc":3631717098,"ackCrcHex":"d8779aea","innerPayloadHex":"ea9a77d8","innerType":"ACK","innerTypeCode":3,"remaining":1}""",
+            ),
+        )
+        assertNull(MeshCoreCodec.parseMultipartAckCrcJson("""{"innerType":"TXT_MSG","innerTypeCode":2,"remaining":1}"""))
+        assertNull(MeshCoreCodec.parseMultipartAckCrcJson("""{"error":"too short"}"""))
+        assertNull(MeshCoreCodec.parseMultipartAckCrcJson("nonsense"))
+    }
 }

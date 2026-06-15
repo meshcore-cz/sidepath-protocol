@@ -71,6 +71,16 @@ data class MeshCoreDirectText(
     val text: String,
 )
 
+/** Decoded MeshCore returned PATH payload, as returned by meshpkt's PATH ops. */
+data class MeshCoreReturnedPath(
+    val destHash: String,
+    val srcHash: String,
+    val pathHex: String,
+    val extraType: Int,
+    val extraHex: String,
+    val ackCrc: Long,
+)
+
 /**
  * A MeshCore packet observed on the Sidepath mesh, captured for the MeshCore Rx Log.
  * Combines the decoded MeshCore [envelope] with the Sidepath carrier metadata (who
@@ -163,6 +173,33 @@ object MeshCoreCodec {
     }.getOrNull()
 
     /**
+     * Builds a DIRECT-routed MeshCore TXT_MSG using a previously returned PATH. Falls back should be
+     * done by callers: this returns null if [path] or [pathHashSize] cannot form a valid DIRECT packet.
+     */
+    fun encodeDirectTextPath(
+        seed: ByteArray,
+        peerPub: ByteArray,
+        text: String,
+        timestampSec: Long,
+        attempt: Int,
+        path: ByteArray,
+        pathHashSize: Int,
+    ): ByteArray? = runCatching {
+        val args = JSONArray()
+            .put(seed.toHex())
+            .put(peerPub.toHex())
+            .put(text)
+            .put(timestampSec)
+            .put(attempt)
+            .put(path.toHex())
+            .put(pathHashSize)
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("encodeDirectTextIdentityPath", args.toString())
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        o.optString("hex", "").takeIf { it.isNotEmpty() }?.hexToBytes()
+    }.getOrNull()
+
+    /**
      * Decrypts a MeshCore TXT_MSG [txtPayload] addressed to us, using our identity [seed] and the
      * sender's 32-byte Ed25519 public key [senderPub], via meshpkt's `decodeDirectTextIdentity` op.
      * Returns null when [senderPub] is not the real sender (MAC fails) or the shape is wrong.
@@ -182,6 +219,27 @@ object MeshCoreCodec {
         val args = JSONArray().put(pathPayload.toHex()).put(seed.toHex()).put(senderPub.toHex())
         val json = cz.meshcore.meshpkt.mobile.Mobile.call("decodePathIdentity", args.toString())
         parsePathAckCrcJson(json)
+    }.getOrNull()
+
+    /**
+     * Decrypts a MeshCore PATH return addressed to us. A PATH may just teach us a route back to a
+     * peer, or it may also embed an ACK in [MeshCoreReturnedPath.extraType]/[MeshCoreReturnedPath.ackCrc].
+     */
+    fun decodePathIdentity(seed: ByteArray, senderPub: ByteArray, pathPayload: ByteArray): MeshCoreReturnedPath? = runCatching {
+        val args = JSONArray().put(pathPayload.toHex()).put(seed.toHex()).put(senderPub.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("decodePathIdentity", args.toString())
+        parsePathJson(json)
+    }.getOrNull()
+
+    /**
+     * Extracts the inner ACK CRC from a MeshCore MULTIPART payload. Firmware uses MULTIPART to repeat
+     * ACKs on lossy direct paths; this is not fragment reassembly. Returns null for non-ACK inner
+     * payloads or malformed payloads.
+     */
+    fun decodeMultipartAckCrc(multipartPayload: ByteArray): Long? = runCatching {
+        val args = JSONArray().put(multipartPayload.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("decodeMultipart", args.toString())
+        parseMultipartAckCrcJson(json)
     }.getOrNull()
 
     /**
@@ -215,6 +273,32 @@ object MeshCoreCodec {
     fun parsePathAckCrcJson(json: String): Long? = runCatching {
         val o = JSONObject(json)
         if (o.has("error") || o.optInt("extraType", -1) != PAYLOAD_TYPE_ACK) return null
+        o.optLong("ackCrc", -1L).takeIf { it >= 0 }
+    }.getOrNull()
+
+    /** Pure JSON→[MeshCoreReturnedPath] mapping (host-testable). Returns null on error/bad shape. */
+    fun parsePathJson(json: String): MeshCoreReturnedPath? = runCatching {
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        val path = o.optString("path", "")
+        if (!o.has("destHash") || !o.has("srcHash")) return null
+        MeshCoreReturnedPath(
+            destHash = o.optString("destHash", ""),
+            srcHash = o.optString("srcHash", ""),
+            pathHex = path,
+            extraType = o.optInt("extraType", -1),
+            extraHex = o.optString("extra", ""),
+            ackCrc = o.optLong("ackCrc", 0L),
+        )
+    }.getOrNull()
+
+    /**
+     * Pure JSON→ack-CRC mapping for a decoded MULTIPART payload (host-testable). Returns the wrapped
+     * ACK CRC only when the inner payload type is ACK (innerTypeCode == 3), else null.
+     */
+    fun parseMultipartAckCrcJson(json: String): Long? = runCatching {
+        val o = JSONObject(json)
+        if (o.has("error") || o.optInt("innerTypeCode", -1) != PAYLOAD_TYPE_ACK) return null
         o.optLong("ackCrc", -1L).takeIf { it >= 0 }
     }.getOrNull()
 
