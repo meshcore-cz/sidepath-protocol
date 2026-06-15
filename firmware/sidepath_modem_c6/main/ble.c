@@ -43,7 +43,7 @@ static QueueHandle_t s_tx_queue;
 static SemaphoreHandle_t s_adv_done; // given on ADV_COMPLETE
 
 static uint8_t s_own_addr_type;
-static sp_phy_t s_phy = SP_PHY_1M;
+static sp_phy_t s_phy = SP_PHY_CODED;
 static sp_tx_power_t s_tx_power = SP_TX_MEDIUM;
 static bool s_scanning;
 static bool s_ext_adv = true;

@@ -20,8 +20,9 @@ between the USB serial port and the BLE radio.
   state.
 - **BLE 5 extended advertising** preferred (up to 229 bytes of opaque content
   per frame vs. 31 for legacy).
-- **LE Coded PHY / Long Range** selectable (`SET_PHY CODED`), with automatic
-  **fallback to 1M** if the controller rejects the coded configuration.
+- **LE Coded PHY / Long Range** requested by default, with automatic **fallback
+  to 1M** if the controller rejects the coded configuration. `SET_PHY 1M` and
+  `SET_PHY CODED` remain available for host-side experiments.
 - **Line-oriented USB serial protocol** — see [PROTOCOL.md](PROTOCOL.md).
 
 ## Layout
@@ -89,7 +90,7 @@ The `sp` CLI speaks this protocol directly:
 ```bash
 sp modem --port /dev/ttyACM0 ping
 sp modem --port /dev/ttyACM0 info
-sp modem --port /dev/ttyACM0 set-phy coded
+sp modem --port /dev/ttyACM0 set-phy 1m   # optional override; default is coded when available
 sp modem --port /dev/ttyACM0 send 08deadbeef
 sp modem --port /dev/ttyACM0 relay on
 sp modem --port /dev/ttyACM0 monitor      # stream RX/RELAY events
@@ -106,4 +107,5 @@ top-level project README and `sp modem --help`.
 - Extended advertising and Coded PHY require ESP-IDF's NimBLE with BLE 5 enabled
   (already set in `sdkconfig.defaults`).
 - Coded PHY roughly quadruples range at the cost of throughput; both ends must
-  use `SET_PHY CODED` to interoperate on the coded primary channels.
+  be on the same PHY to interoperate on the primary channels. The modem requests
+  Coded at boot and reports the active PHY via `INFO`.

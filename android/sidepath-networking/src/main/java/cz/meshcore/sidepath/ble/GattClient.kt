@@ -39,7 +39,7 @@ enum class LinkHealth { CONNECTING, READY, DEGRADED, CLOSED }
  */
 class SidepathGattClient(
     private val context: Context,
-    private val phyMode: PHYMode,
+    private var phyMode: PHYMode,
     private val onPhyUpdate: (txPhy: Int, rxPhy: Int) -> Unit,
     private val onFrameReceived: (ByteArray) -> Unit,
     /** Return false to abort (deterministic connection rule). [peerPubKey] is the full 32-byte key. */
@@ -119,6 +119,13 @@ class SidepathGattClient(
             drainWriteQueue()
         }
         return true
+    }
+
+    fun setPhyMode(mode: PHYMode) {
+        mainHandler.post {
+            phyMode = mode
+            gatt?.let { requestPreferredPhy(it) }
+        }
     }
 
     // ---- write queue ---------------------------------------------------------
@@ -419,12 +426,7 @@ class SidepathGattClient(
             val priorityAccepted = gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
             onLog?.invoke(addr, "requestConnectionPriority(HIGH) accepted=$priorityAccepted")
             startKeepalive()
-            val phyMask = when (phyMode) {
-                PHYMode.ONE_M           -> BluetoothDevice.PHY_LE_1M_MASK
-                PHYMode.CODED_ONLY,
-                PHYMode.CODED_PREFERRED -> BluetoothDevice.PHY_LE_CODED_MASK
-            }
-            gatt.setPreferredPhy(phyMask, phyMask, BluetoothDevice.PHY_OPTION_S8)
+            requestPreferredPhy(gatt)
         }
 
         override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
@@ -474,5 +476,14 @@ class SidepathGattClient(
             @Suppress("DEPRECATION")
             gatt.writeDescriptor(descriptor)
         }
+    }
+
+    private fun requestPreferredPhy(gatt: BluetoothGatt) {
+        val phyMask = when (phyMode) {
+            PHYMode.ONE_M           -> BluetoothDevice.PHY_LE_1M_MASK
+            PHYMode.CODED_ONLY      -> BluetoothDevice.PHY_LE_CODED_MASK
+            PHYMode.CODED_PREFERRED -> BluetoothDevice.PHY_LE_CODED_MASK or BluetoothDevice.PHY_LE_1M_MASK
+        }
+        gatt.setPreferredPhy(phyMask, phyMask, BluetoothDevice.PHY_OPTION_S8)
     }
 }

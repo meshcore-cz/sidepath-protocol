@@ -13,16 +13,16 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import cz.meshcore.sidepath.debug.core.Identity
-import cz.meshcore.sidepath.debug.core.NodeID
-import cz.meshcore.sidepath.debug.core.PHYMode
-import cz.meshcore.sidepath.debug.core.SEED_SIZE
+import cz.meshcore.sidepath.protocol.Identity
+import cz.meshcore.sidepath.protocol.NodeId
+import cz.meshcore.sidepath.protocol.Sidepath
 import cz.meshcore.sidepath.service.SidepathService
 import cz.meshcore.sidepath.service.LogEntry
 import cz.meshcore.sidepath.service.NeighborEntry
 import cz.meshcore.sidepath.service.PeerInfo
 import cz.meshcore.sidepath.service.ReceivedMessage
 import cz.meshcore.sidepath.service.TopologyEntry
+import cz.meshcore.sidepath.transport.PHYMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -36,7 +36,6 @@ import java.security.SecureRandom
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "sidepath_prefs")
 private val SEED_KEY = stringPreferencesKey("seed")
-private val PHY_MODE_KEY = stringPreferencesKey("phy_mode")
 private val ALLOWLIST_KEY = stringPreferencesKey("allowlist")
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -54,17 +53,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val allowlist: StateFlow<Set<String>> = _allowlist.asStateFlow()
 
     // Forwarded StateFlows from SidepathService (fall back to defaults when unbound)
-    val nodeId: StateFlow<NodeID> = _service.flatMapLatest {
-        it?.nodeId ?: flowOf(NodeID(ByteArray(8)))
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, NodeID(ByteArray(8)))
+    val nodeId: StateFlow<NodeId> = _service.flatMapLatest {
+        it?.nodeId ?: flowOf(NodeId.BROADCAST)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, NodeId.BROADCAST)
 
     val bleMacAddress: StateFlow<String> = _service.flatMapLatest {
         it?.bleMacAddress ?: flowOf("")
     }.stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
     val phyMode: StateFlow<PHYMode> = _service.flatMapLatest {
-        it?.phyMode ?: flowOf(PHYMode.DEBUG_1M)
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, PHYMode.DEBUG_1M)
+        it?.phyMode ?: flowOf(PHYMode.CODED_PREFERRED)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, PHYMode.CODED_PREFERRED)
 
     val codedPhySupported: StateFlow<Boolean> = _service.flatMapLatest {
         it?.codedPhySupported ?: flowOf(false)
@@ -144,26 +143,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ctx.dataStore.edit { it[SEED_KEY] = newSeed }
             newSeed
         }
-        // Default to 1M: Coded PHY (Long Range) is an opt-in extension because many
-        // devices advertise on Coded PHY but cannot scan it (despite reporting support).
-        val phyModeStr = pref[PHY_MODE_KEY] ?: PHYMode.DEBUG_1M.value
         val allowlistStr = pref[ALLOWLIST_KEY] ?: ""
         val allowlistSet = if (allowlistStr.isBlank()) emptySet()
         else allowlistStr.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
 
         _allowlist.value = allowlistSet
 
-        val seed = ByteArray(SEED_SIZE) { i -> seedHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+        val seed = ByteArray(Sidepath.SEED_BYTES) { i -> seedHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
         val identity = Identity.fromSeed(seed)
-        val phyMode = PHYMode.fromString(phyModeStr)
-
-        service.initialize(identity, phyMode, allowlistSet)
+        service.initialize(identity, PHYMode.CODED_PREFERRED, allowlistSet)
     }
 
     fun sendMessage(destination: String, message: String, ttl: Int) {
         val service = _service.value ?: return
-        val dstId = if (destination.isBlank()) NodeID(ByteArray(8))
-        else runCatching { NodeID.fromHex(destination) }.getOrElse { return }
+        val dstId = if (destination.isBlank()) NodeId.BROADCAST
+        else runCatching { NodeId.fromHex(destination) }.getOrElse { return }
         service.sendMessage(message, dstId, ttl.toByte())
     }
 
@@ -189,13 +183,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearData() {
         _service.value?.clearData()
-    }
-
-    fun setPhyMode(mode: PHYMode) {
-        viewModelScope.launch {
-            getApplication<Application>().dataStore.edit { it[PHY_MODE_KEY] = mode.value }
-            _service.value?.setPhyMode(mode)
-        }
     }
 
     fun toggleRunning(activity: MainActivity? = null) {
@@ -224,7 +211,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun generateSeedHex(): String {
-        val bytes = ByteArray(SEED_SIZE)
+        val bytes = ByteArray(Sidepath.SEED_BYTES)
         SecureRandom().nextBytes(bytes)
         return bytes.joinToString("") { "%02x".format(it) }
     }

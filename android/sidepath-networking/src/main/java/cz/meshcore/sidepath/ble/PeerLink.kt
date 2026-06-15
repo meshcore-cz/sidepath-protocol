@@ -3,6 +3,7 @@ package cz.meshcore.sidepath.ble
 import cz.meshcore.sidepath.protocol.Capabilities
 import cz.meshcore.sidepath.protocol.NodeId
 import cz.meshcore.sidepath.transport.PHY
+import cz.meshcore.sidepath.transport.PHYMode
 
 /** Abstraction over a connected outgoing peer (we are the GATT client). */
 interface PeerLinkInterface {
@@ -26,6 +27,8 @@ class BLEPeerLink(private val gattClient: SidepathGattClient) : PeerLinkInterfac
     val caps: Capabilities get() = gattClient.peerCaps
 
     override fun sendFrame(frame: ByteArray): Boolean = gattClient.sendFrame(frame)
+
+    fun setPhyMode(mode: PHYMode) = gattClient.setPhyMode(mode)
 
     fun disconnect() = gattClient.disconnect()
 }

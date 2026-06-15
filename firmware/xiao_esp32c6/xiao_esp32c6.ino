@@ -27,7 +27,7 @@ static const char* NODEINFO_UUID  = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a002";
 static const char* PACKETIN_UUID  = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a003";
 static const char* PACKETOUT_UUID = "9b7e6a10-7d91-4c19-a3b8-6e2a11f3a004";
 
-static const uint16_t RELAY_CAPS = mesh::CAP_SENDER | mesh::CAP_RECEIVER | mesh::CAP_RELAY;
+static const uint16_t RELAY_CAPS = mesh::CAP_SENDER | mesh::CAP_RECEIVER | mesh::CAP_RELAY | mesh::CAP_CODED_PHY;
 static const char* NODE_PLATFORM = "esp32-c6";
 static const char* NODE_NAME = "";
 static const char* NODE_DESCRIPTION = "";
@@ -55,6 +55,7 @@ static mesh::Reassembler g_reassembler;
 static std::mutex g_peersMu;
 static std::vector<uint16_t> g_peers;
 static std::map<uint16_t, std::array<uint8_t, mesh::NODE_ID_LEN>> g_connNode;
+static std::map<uint16_t, std::pair<uint8_t, uint8_t>> g_connPhy;
 // For peers WE dialed (central role), the conn handle maps to the peer's remote
 // PACKET_IN characteristic we write to. Inbound (server) peers are not in this
 // map and are reached via g_packetOut->indicate(). Both kinds live in g_peers.
@@ -81,6 +82,20 @@ static bool handleRemoteAdminChat(const std::vector<uint8_t>& dg, const mesh::Da
 static void loadAdmins();
 static bool handleAdminCommandExtra(const String& cmd, String& reply);
 static String adminCommandHelp();
+
+static uint8_t sidepathPhyFromBle(uint8_t phy) {
+  switch (phy) {
+    case BLE_GAP_LE_PHY_1M: return mesh::PHY_1M;
+    case BLE_GAP_LE_PHY_2M: return mesh::PHY_2M;
+    case BLE_GAP_LE_PHY_CODED: return mesh::PHY_CODED;
+    default: return mesh::PHY_UNKNOWN;
+  }
+}
+
+static void rememberConnPhy(uint16_t conn, uint8_t txPhy, uint8_t rxPhy) {
+  std::lock_guard<std::mutex> lk(g_peersMu);
+  g_connPhy[conn] = {sidepathPhyFromBle(txPhy), sidepathPhyFromBle(rxPhy)};
+}
 
 // BLE central role (ble_central.h). startCentral() begins scanning; centralTick()
 // drives the connect queue from loop(); maybeCollapseDuplicate() resolves a
@@ -526,8 +541,15 @@ static void sendAnnounce() {
     for (auto& kv : byId) {
       mesh::AnnounceNeighborInfo ni{};   // extended quality hints (transport aside) stay 0 = unknown
       std::copy(kv.first.begin(), kv.first.end(), ni.id);
-      ni.txPhy = mesh::PHY_1M;   // 1M-only radio
-      ni.rxPhy = mesh::PHY_1M;
+      ni.txPhy = mesh::PHY_UNKNOWN;
+      ni.rxPhy = mesh::PHY_UNKNOWN;
+      for (auto& cn : g_connNode) {
+        if (cn.second != kv.first) continue;
+        auto phy = g_connPhy.find(cn.first);
+        if (phy == g_connPhy.end()) continue;
+        if (phy->second.first == mesh::PHY_CODED || ni.txPhy == mesh::PHY_UNKNOWN) ni.txPhy = phy->second.first;
+        if (phy->second.second == mesh::PHY_CODED || ni.rxPhy == mesh::PHY_UNKNOWN) ni.rxPhy = phy->second.second;
+      }
       ni.transport = mesh::TRANSPORT_BLE;
       ni.dir = (kv.second.out && kv.second.in) ? mesh::CONN_DIR_BOTH
              : (kv.second.out ? mesh::CONN_DIR_OUT : mesh::CONN_DIR_IN);
@@ -570,12 +592,19 @@ static void sendAnnounce() {
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*, NimBLEConnInfo& info) override {
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
+    uint16_t conn = info.getConnHandle();
     {
       std::lock_guard<std::mutex> lk(g_peersMu);
-      g_peers.push_back(info.getConnHandle());
+      g_peers.push_back(conn);
     }
-    Serial.printf("[relay] peer connected handle=%u\n", info.getConnHandle());
+    server->updatePhy(conn,
+                      BLE_GAP_LE_PHY_CODED_MASK | BLE_GAP_LE_PHY_1M_MASK,
+                      BLE_GAP_LE_PHY_CODED_MASK | BLE_GAP_LE_PHY_1M_MASK,
+                      BLE_GAP_LE_PHY_CODED_S8);
+    uint8_t tx = 0, rx = 0;
+    if (server->getPhy(conn, &tx, &rx)) rememberConnPhy(conn, tx, rx);
+    Serial.printf("[relay] peer connected handle=%u\n", conn);
     NimBLEDevice::startAdvertising();
   }
 
@@ -585,9 +614,15 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       uint16_t h = info.getConnHandle();
       g_peers.erase(std::remove(g_peers.begin(), g_peers.end(), h), g_peers.end());
       g_connNode.erase(h);
+      g_connPhy.erase(h);
     }
     Serial.printf("[relay] peer disconnected handle=%u reason=%d\n", info.getConnHandle(), reason);
     NimBLEDevice::startAdvertising();
+  }
+
+  void onPhyUpdate(NimBLEConnInfo& info, uint8_t txPhy, uint8_t rxPhy) override {
+    rememberConnPhy(info.getConnHandle(), txPhy, rxPhy);
+    Serial.printf("[relay] phy update handle=%u tx=%u rx=%u\n", info.getConnHandle(), txPhy, rxPhy);
   }
 };
 
@@ -609,11 +644,13 @@ void setup() {
   ledSet(false);
   loadOrCreateIdentityAndEpoch();
   loadAdmins();
-  Serial.printf("\nSidepath v3 relay node=%s phy=1m epoch=%llu\n",
+  Serial.printf("\nSidepath v3 relay node=%s phy=coded-preferred epoch=%llu\n",
                 nodeIdHex().c_str(), (unsigned long long)g_epoch);
 
   NimBLEDevice::init("Sidepath");
   NimBLEDevice::setMTU(247);
+  NimBLEDevice::setDefaultPhy(BLE_GAP_LE_PHY_CODED_MASK | BLE_GAP_LE_PHY_1M_MASK,
+                              BLE_GAP_LE_PHY_CODED_MASK | BLE_GAP_LE_PHY_1M_MASK);
 
   NimBLEServer* server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());

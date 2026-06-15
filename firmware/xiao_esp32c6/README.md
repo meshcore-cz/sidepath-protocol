@@ -14,7 +14,8 @@ with integer keys.
 ## What it does
 
 - Advertises the Sidepath service UUID (primary advert) + `0xBEED` manufacturer data
-  carrying its NodeID (scan response) so any node discovers it on 1M PHY.
+  carrying its NodeID (scan response). Discovery uses legacy 1M advertising for
+  compatibility; connected links request LE Coded with 1M fallback.
 - GATT server with the three Sidepath characteristics: `NODE_INFO` (read),
   `PACKET_IN` (write), `PACKET_OUT` (notify).
 - Reassembles incoming frames, decodes the datagram, and for **flood** datagrams:
@@ -34,13 +35,12 @@ with integer keys.
 
 ## Limitations (intentional, for a "basic" relay)
 
-- **Peripheral/server role only.** It does not scan or initiate connections, so it
-  won't link two *other* relays together; it bridges the centrals (phones) that
-  connect to it. Adding the central role (scan + GATT client) is the natural next step.
-- **Peripheral/server relay only.** Source-routed datagrams are forwarded only
-  when this relay is on the selected route and the next hop is currently connected.
-- **1M PHY.** Matches the mesh default. (The C6 supports Coded PHY; enabling Long
-  Range advertising is a future extension.)
+- **Legacy discovery.** The Arduino/NimBLE build used here does not expose the
+  extended scan/connect PHY helpers, so discovery stays on 1M. After connection,
+  server and outbound central links request LE Coded while allowing 1M fallback.
+- **Currently connected next hops only.** Source-routed datagrams are forwarded
+  only when this relay is on the selected route and the next hop is currently
+  connected.
 - Default max simultaneous connections is set by NimBLE
   (`CONFIG_BT_NIMBLE_MAX_CONNECTIONS`, typically 3). Raise it to bridge more peers.
 
@@ -97,9 +97,9 @@ arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32C6 -p /dev/ttyACM0 firmware/xia
 ## Trying it
 
 1. Flash the XIAO and power it.
-2. On two Android phones (or a phone + a Mac running `sidepath-macos`), set PHY to
-   `1m` and start the service. Place them far enough apart that they don't connect
-   directly, but both in range of the XIAO.
+2. On two Android phones (or a phone + a Mac running `sidepath-macos`), start the
+   service with the default PHY policy. Place them far enough apart that they
+   don't connect directly, but both in range of the XIAO.
 3. Each connects to `Sidepath` (the relay). Send a broadcast message from one — it
    reaches the other via the relay, and the relay shows up in the Topology tab
    (with `relay` capability and a recent "last announce" time).

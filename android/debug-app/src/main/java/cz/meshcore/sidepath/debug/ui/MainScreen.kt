@@ -54,10 +54,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import cz.meshcore.sidepath.debug.core.Capability
-import cz.meshcore.sidepath.debug.core.Capabilities
-import cz.meshcore.sidepath.debug.core.PHY
-import cz.meshcore.sidepath.debug.core.PHYMode
+import cz.meshcore.sidepath.protocol.Capability
+import cz.meshcore.sidepath.protocol.Capabilities
+import cz.meshcore.sidepath.protocol.NodeId
 import cz.meshcore.sidepath.service.LogEntry
 import cz.meshcore.sidepath.service.LogTag
 import cz.meshcore.sidepath.service.NeighborEntry
@@ -65,6 +64,7 @@ import cz.meshcore.sidepath.service.PeerInfo
 import cz.meshcore.sidepath.service.RSSI_UNKNOWN
 import cz.meshcore.sidepath.service.ReceivedMessage
 import cz.meshcore.sidepath.service.TopologyEntry
+import cz.meshcore.sidepath.transport.PHY
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -138,8 +138,7 @@ fun MainScreen(viewModel: MainViewModel) {
                 0 -> OverviewTab(
                     nodeId = nodeId.toHexString(),
                     bleMacAddress = bleMacAddress,
-                    phyMode = phyMode,
-                    onPhyModeChange = viewModel::setPhyMode,
+                    phyMode = phyMode.value,
                     phyFallback = phyFallback,
                     codedPhySupported = codedPhySupported,
                     advertisingActive = advertisingActive,
@@ -180,8 +179,7 @@ fun MainScreen(viewModel: MainViewModel) {
 private fun OverviewTab(
     nodeId: String,
     bleMacAddress: String,
-    phyMode: PHYMode,
-    onPhyModeChange: (PHYMode) -> Unit,
+    phyMode: String,
     phyFallback: Boolean,
     codedPhySupported: Boolean,
     advertisingActive: Boolean,
@@ -225,30 +223,8 @@ private fun OverviewTab(
             InfoRow("Scanning", if (scanningActive) "active" else "inactive")
             Spacer(Modifier.height(8.dp))
 
-            Text(
-                "PHY Mode" + if (phyFallback) " (fallback active)" else "",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                PHYMode.entries.forEach { mode ->
-                    FilterChip(
-                        selected = phyMode == mode,
-                        onClick = { if (phyMode != mode) onPhyModeChange(mode) },
-                        label = { Text(mode.value) },
-                    )
-                }
-            }
-            Text(
-                "1m is the default. coded-only/coded-preferred enable Long Range but only " +
-                    "work on devices that can also scan Coded PHY (many can't, despite reporting support).",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp),
-            )
+            InfoRow("PHY policy", if (phyFallback) "auto (1M fallback)" else "auto ($phyMode)")
+            InfoRow("Link PHY preference", if (codedPhySupported) "prefer LE Coded, allow 1M fallback" else "1M")
             Spacer(Modifier.height(8.dp))
         }
 
@@ -256,10 +232,7 @@ private fun OverviewTab(
             SectionHeader("Capabilities")
             // Android always has these capabilities
             val caps = Capabilities(
-                cz.meshcore.sidepath.debug.core.Capability.SENDER or
-                    cz.meshcore.sidepath.debug.core.Capability.RECEIVER or
-                    cz.meshcore.sidepath.debug.core.Capability.RELAY or
-                    cz.meshcore.sidepath.debug.core.Capability.CODED_PHY
+                Capability.SENDER or Capability.RECEIVER or Capability.RELAY or Capability.CODED_PHY
             )
             CapabilityRow("Sender", caps.isSender())
             CapabilityRow("Receiver", caps.isReceiver())
@@ -591,5 +564,5 @@ private fun CapabilityRow(label: String, active: Boolean) {
     }
 }
 
-private fun cz.meshcore.sidepath.debug.core.NodeID.toHexString(): String =
+private fun NodeId.toHexString(): String =
     bytes.joinToString("") { "%02x".format(it) }

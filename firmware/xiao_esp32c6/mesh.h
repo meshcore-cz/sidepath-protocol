@@ -23,7 +23,7 @@ constexpr uint8_t NODE_INFO_VERSION = 1;
 // v3 with a neighbor_info section once we have live neighbors. Verifiers accept v1..v3.
 constexpr uint8_t ANNOUNCE_VERSION  = 3;
 
-// BLE PHY identifiers for a v3 ANNOUNCE neighbor_info entry (§8.8). This node runs 1M only.
+// BLE PHY identifiers for a v3 ANNOUNCE neighbor_info entry (§8.8).
 enum : uint8_t { PHY_UNKNOWN = 0, PHY_1M = 1, PHY_2M = 2, PHY_CODED = 3 };
 
 // Which side opened a neighbor link, for a v3 ANNOUNCE neighbor_info entry (§8.8, §4.4).

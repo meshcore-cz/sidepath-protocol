@@ -406,7 +406,7 @@ class SidepathService : Service() {
     private val _bleMacAddress = MutableStateFlow("")
     val bleMacAddress: StateFlow<String> = _bleMacAddress.asStateFlow()
 
-    private val _phyMode = MutableStateFlow(PHYMode.ONE_M)
+    private val _phyMode = MutableStateFlow(PHYMode.CODED_PREFERRED)
     val phyMode: StateFlow<PHYMode> = _phyMode.asStateFlow()
 
     private val _codedPhySupported = MutableStateFlow(false)
@@ -549,10 +549,7 @@ class SidepathService : Service() {
         _bleMacAddress.value = bleManager.adapter.address ?: ""
         log("BLE caps: codedPhy=${bleManager.isLeCodedPhySupported} extAdv=${bleManager.isLeExtendedAdvertisingSupported} multiAdv=${bleManager.isMultipleAdvertisementSupported}", LogTag.SYS)
 
-        val effectivePhy = if (!bleManager.isLeCodedPhySupported && requestedPhyMode != PHYMode.ONE_M) {
-            log("WARNING: LE Coded PHY not supported — falling back to 1m", LogTag.PHY)
-            PHYMode.ONE_M
-        } else requestedPhyMode
+        val effectivePhy = effectivePhyMode(requestedPhyMode)
         _phyMode.value = effectivePhy
         _phyFallback.value = effectivePhy != requestedPhyMode
 
@@ -1732,10 +1729,35 @@ class SidepathService : Service() {
     }
 
     fun setPhyMode(mode: PHYMode) {
-        if (_phyMode.value == mode) return
-        _phyMode.value = mode
-        log("PHY mode changed to ${mode.value}", LogTag.SYS)
-        if (_isRunning.value) { stopBLE(); startBLE() }
+        val effective = effectivePhyMode(mode)
+        if (_phyMode.value == effective) return
+        _phyMode.value = effective
+        _phyFallback.value = effective != mode
+        log("PHY mode changed to ${effective.value}", LogTag.SYS)
+        peers.values.forEach { it.setPhyMode(effective) }
+        if (_isRunning.value) {
+            bleAdvertiser?.stopAdvertising()
+            bleScanner?.stopScan()
+            val localId = _nodeId.value
+            bleAdvertiser?.startAdvertising(localId, effective) { msg -> log("advertiser: $msg", LogTag.SYS) }
+            bleScanner?.startScan(
+                phyMode = effective,
+                onFound = { device, rssi, advNodeId -> handleFoundDevice(device, rssi, advNodeId) },
+                onFailed = { errorCode -> log("scan FAILED errorCode=$errorCode", LogTag.SCAN) },
+            )
+            _advertisingActive.value = true
+            _scanningActive.value = true
+            scheduleConnectionDrain()
+        }
+    }
+
+    private fun effectivePhyMode(requested: PHYMode): PHYMode {
+        if (!::bleManager.isInitialized) return requested
+        if (!bleManager.isLeCodedPhySupported && requested != PHYMode.ONE_M) {
+            log("WARNING: LE Coded PHY not supported — falling back to 1m", LogTag.PHY)
+            return PHYMode.ONE_M
+        }
+        return requested
     }
 
     fun stopBLE() {

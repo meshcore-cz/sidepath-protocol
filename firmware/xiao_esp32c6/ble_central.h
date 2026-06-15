@@ -124,6 +124,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
       std::lock_guard<std::mutex> lk(g_peersMu);
       g_peers.erase(std::remove(g_peers.begin(), g_peers.end(), conn), g_peers.end());
       g_connNode.erase(conn);
+      g_connPhy.erase(conn);
       g_clientPacketIn.erase(conn);
       g_clientByConn.erase(conn);
       g_knownAddr.erase(addr);
@@ -186,7 +187,6 @@ static void connectToPeer(const NimBLEAddress& addr) {
     c = NimBLEDevice::createClient();
     c->setClientCallbacks(&g_clientCb, false);
   }
-
   auto giveUp = [&](const char* why) {
     Serial.printf("[central] %s addr=%s\n", why, addr.toString().c_str());
     c->disconnect();
@@ -202,6 +202,11 @@ static void connectToPeer(const NimBLEAddress& addr) {
   if (!outc->subscribe(false, clientNotifyCb)) { giveUp("subscribe failed"); return; }  // false = indications
 
   uint16_t conn = c->getConnHandle();
+  c->updatePhy(BLE_GAP_LE_PHY_CODED_MASK | BLE_GAP_LE_PHY_1M_MASK,
+               BLE_GAP_LE_PHY_CODED_MASK | BLE_GAP_LE_PHY_1M_MASK,
+               BLE_GAP_LE_PHY_CODED_S8);
+  uint8_t tx = 0, rx = 0;
+  if (c->getPhy(&tx, &rx)) rememberConnPhy(conn, tx, rx);
   {
     std::lock_guard<std::mutex> lk(g_peersMu);
     g_peers.push_back(conn);

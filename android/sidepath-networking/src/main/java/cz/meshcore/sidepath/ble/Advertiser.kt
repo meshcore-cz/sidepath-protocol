@@ -72,7 +72,8 @@ class SidepathAdvertiser(
                     onLog?.invoke("advertising started (Coded PHY) txPower=$txPower")
                 } else {
                     Log.e(TAG, "Extended advertising FAILED: status=$status")
-                    onLog?.invoke("advertising FAILED status=$status")
+                    onLog?.invoke("advertising Coded PHY failed status=$status; falling back to 1M legacy")
+                    startLegacyAdvertising(leAdvertiser, nodeId, onLog)
                 }
             }
             override fun onAdvertisingSetStopped(set: AdvertisingSet?) {
