@@ -574,6 +574,13 @@ class SidepathService : Service() {
             onDeviceUnreachable = { device, reason ->
                 removeServerPeer(device, reason)
             },
+            onLinkSample = { device, latencyMs, ok ->
+                val peer = serverPeers[device.address.replace(":", "")]
+                if (peer != null) {
+                    recordLinkDelivery(peer, ok)
+                    if (ok) recordLinkRtt(peer, latencyMs)
+                }
+            },
             onLog = { msg -> log(msg, LogTag.SERVER) },
         )
         gattServer.start()
@@ -769,6 +776,12 @@ class SidepathService : Service() {
                 }
             },
             onLog = { addr, msg -> log("gatt addr=$addr $msg", LogTag.GATT) },
+            onLinkSample = { peerId, latencyMs, ok ->
+                if (peerId != null) {
+                    recordLinkDelivery(peerId, ok)
+                    if (ok) recordLinkRtt(peerId, latencyMs)
+                }
+            },
             onNodeInfoRead = { peerId, peerPubKey, caps ->
                 // Remember which node lives at this address so a later scan that lacks the advertised
                 // NodeID can still dedup it (see knownAddrNode) — including the duplicate branches below.

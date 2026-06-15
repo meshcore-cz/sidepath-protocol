@@ -11,6 +11,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import cz.meshcore.sidepath.protocol.Capabilities
 import cz.meshcore.sidepath.protocol.NodeId
@@ -45,6 +46,11 @@ class SidepathGattClient(
     private val onNodeInfoRead: ((peerNodeId: NodeId, peerPubKey: ByteArray, peerCaps: Capabilities) -> Boolean)? = null,
     private val onDisconnected: (() -> Unit)? = null,
     val onLog: ((addr: String, msg: String) -> Unit)? = null,
+    // Per-frame link feedback: each Write Request to PACKET_IN is ATT-acknowledged, so onCharacteristicWrite
+    // tells us whether the frame reached the peer and how long the round-trip took. This is a dense,
+    // automatic link-quality signal (every frame), unlike sparse end-to-end DM ACKs. [peer] is this
+    // link's NodeId once known. Fired on the main thread.
+    private val onLinkSample: ((peer: NodeId?, latencyMs: Int, ok: Boolean) -> Unit)? = null,
     initialRssi: Int = 0,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -65,6 +71,7 @@ class SidepathGattClient(
     private var opInProgress = false
     private var writeGeneration = 0L
     private var writeRetries = 0
+    private var writeStartedAtMs: Long? = null
 
     var peerNodeId: NodeId? = null; private set
     var peerPublicKey: ByteArray = ByteArray(0); private set
@@ -151,10 +158,14 @@ class SidepathGattClient(
             return
         }
         writeRetries = 0
+        writeStartedAtMs = SystemClock.elapsedRealtime()
 
         // Missing write callbacks usually mean the controller has lost the peer.
         mainHandler.postDelayed({
-            if (opInProgress && writeGeneration == generation) failLink("write callback timeout")
+            if (opInProgress && writeGeneration == generation) {
+                recordWriteSample(ok = false)
+                failLink("write callback timeout")
+            }
         }, WRITE_TIMEOUT_MS)
     }
 
@@ -213,7 +224,15 @@ class SidepathGattClient(
         writeQueue.clear()
         opInProgress = false
         writeRetries = 0
+        writeStartedAtMs = null
         writeGeneration += 1
+    }
+
+    private fun recordWriteSample(ok: Boolean) {
+        val startedAt = writeStartedAtMs ?: return
+        writeStartedAtMs = null
+        val latencyMs = (SystemClock.elapsedRealtime() - startedAt).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+        onLinkSample?.invoke(peerNodeId, latencyMs, ok)
     }
 
     // ---- GATT callbacks ------------------------------------------------------
@@ -365,10 +384,14 @@ class SidepathGattClient(
         ) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.w(TAG, "Write failed status=$status on ${gatt.device.address}")
-                failLink("write failed status=$status")
+                mainHandler.post {
+                    recordWriteSample(ok = false)
+                    failLink("write failed status=$status")
+                }
                 return
             }
             mainHandler.post {
+                recordWriteSample(ok = true)
                 opInProgress = false
                 drainWriteQueue()
             }

@@ -53,10 +53,11 @@ class BLEManager(
         onDeviceConnected: ((android.bluetooth.BluetoothDevice) -> Unit)? = null,
         onDeviceDisconnected: ((android.bluetooth.BluetoothDevice) -> Unit)? = null,
         onDeviceUnreachable: ((android.bluetooth.BluetoothDevice, String) -> Unit)? = null,
+        onLinkSample: ((android.bluetooth.BluetoothDevice, latencyMs: Int, ok: Boolean) -> Unit)? = null,
         onLog: ((String) -> Unit)? = null,
     ): SidepathGattServer {
         return SidepathGattServer(context, pubKey, caps, onFrameReceived,
-            onDeviceConnected, onDeviceDisconnected, onDeviceUnreachable, onLog).also { gattServer = it }
+            onDeviceConnected, onDeviceDisconnected, onDeviceUnreachable, onLinkSample, onLog).also { gattServer = it }
     }
 
     fun stopAll() {

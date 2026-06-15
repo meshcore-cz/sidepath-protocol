@@ -139,9 +139,15 @@ func (h *bleHelper) start(nodeInfo []byte) {
 	}, nodeInfo)
 }
 
-func (h *bleHelper) setNodeInfo(nodeInfo []byte)  { h.send(map[string]any{"type": "set_node_info"}, nodeInfo) }
-func (h *bleHelper) connect(addr string)          { h.send(map[string]any{"type": "connect", "addr": addr}, nil) }
-func (h *bleHelper) disconnect(addr string)       { h.send(map[string]any{"type": "disconnect", "addr": addr}, nil) }
+func (h *bleHelper) setNodeInfo(nodeInfo []byte) {
+	h.send(map[string]any{"type": "set_node_info"}, nodeInfo)
+}
+func (h *bleHelper) connect(addr string) {
+	h.send(map[string]any{"type": "connect", "addr": addr}, nil)
+}
+func (h *bleHelper) disconnect(addr string) {
+	h.send(map[string]any{"type": "disconnect", "addr": addr}, nil)
+}
 
 func (h *bleHelper) sendCentral(addr string, frame []byte, reliable bool) {
 	h.send(map[string]any{"type": "send_central", "addr": addr, "reliable": reliable}, frame)
@@ -164,4 +170,11 @@ func asString(v any) string {
 		return s
 	}
 	return ""
+}
+
+func asBool(v any) bool {
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return false
 }

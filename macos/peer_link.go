@@ -26,9 +26,10 @@ func (l *MacPeerLink) TxPHY() core.PHY     { return l.txPHY }
 func (l *MacPeerLink) RxPHY() core.PHY     { return l.rxPHY }
 func (l *MacPeerLink) RSSI() int           { return l.rssi }
 
-// sendFrame writes a raw GATT frame to PACKET_IN (write without response).
+// sendFrame writes a raw GATT frame to PACKET_IN with response so CoreBluetooth reports
+// didWriteValueFor and the helper can emit a per-frame link_sample.
 func (l *MacPeerLink) sendFrame(frame []byte) error {
-	l.helper.sendCentral(l.addr, frame, false)
+	l.helper.sendCentral(l.addr, frame, true)
 	return nil
 }
 

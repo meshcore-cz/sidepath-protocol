@@ -89,6 +89,7 @@ final class Helper: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDeleg
     private var piChars: [String: CBCharacteristic] = [:] // addr -> PACKET_IN (for writes)
     private var poChars: [String: CBCharacteristic] = [:] // addr -> PACKET_OUT (for subscribe)
     private var niChars: [String: CBCharacteristic] = [:] // addr -> NODE_INFO (pending read)
+    private var pendingWriteStarts: [String: [Date]] = [:] // addr -> reliable PACKET_IN writes
 
     // Peripheral state: centrals subscribed to our PACKET_OUT.
     private var subscribers: [String: CBCentral] = [:]
@@ -193,6 +194,9 @@ final class Helper: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDeleg
 
     private func sendCentral(_ addr: String, _ data: Data, reliable: Bool) {
         guard let p = connected[addr], let ch = piChars[addr] else { return }
+        if reliable {
+            pendingWriteStarts[addr, default: []].append(Date())
+        }
         p.writeValue(data, for: ch, type: reliable ? .withResponse : .withoutResponse)
     }
 
@@ -222,6 +226,16 @@ final class Helper: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDeleg
         piChars.removeValue(forKey: addr)
         poChars.removeValue(forKey: addr)
         niChars.removeValue(forKey: addr)
+        let pending = pendingWriteStarts.removeValue(forKey: addr) ?? []
+        for startedAt in pending {
+            io.send([
+                "type": "link_sample",
+                "role": "central",
+                "addr": addr,
+                "latency_ms": elapsedMs(since: startedAt),
+                "ok": false,
+            ])
+        }
         // error is nil for a clean local disconnect; otherwise it carries the BLE reason
         // (supervision timeout, peer-initiated close, etc.) — forward it so the node can log why.
         io.send(["type": "peer_disconnected", "addr": addr, "reason": error?.localizedDescription ?? "clean"])
@@ -268,6 +282,19 @@ final class Helper: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDeleg
         } else if characteristic.uuid == packetOutUUID {
             io.send(["type": "central_frame", "addr": addr], payload: characteristic.value ?? Data())
         }
+    }
+
+    func peripheral(_ p: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard characteristic.uuid == packetInUUID else { return }
+        let addr = p.identifier.uuidString
+        let startedAt = popPendingWriteStart(for: addr) ?? Date()
+        io.send([
+            "type": "link_sample",
+            "role": "central",
+            "addr": addr,
+            "latency_ms": elapsedMs(since: startedAt),
+            "ok": error == nil,
+        ])
     }
 
     private func emitPeerConnected(_ p: CBPeripheral, nodeInfo: Data) {
@@ -345,6 +372,17 @@ final class Helper: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDeleg
                 return
             }
         }
+    }
+
+    private func elapsedMs(since startedAt: Date) -> Int {
+        max(1, min(Int(Date().timeIntervalSince(startedAt) * 1000), Int(Int32.max)))
+    }
+
+    private func popPendingWriteStart(for addr: String) -> Date? {
+        guard var starts = pendingWriteStarts[addr], !starts.isEmpty else { return nil }
+        let startedAt = starts.removeFirst()
+        pendingWriteStarts[addr] = starts.isEmpty ? nil : starts
+        return startedAt
     }
 }
 

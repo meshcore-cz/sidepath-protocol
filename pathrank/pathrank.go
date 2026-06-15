@@ -353,14 +353,64 @@ func (g *Graph) Routes(from, to core.NodeID, opt Options) []Route {
 	}
 	dfs(from, 0)
 
+	sortRoutes(routes)
+	if len(routes) > opt.MaxRoutes {
+		routes = routes[:opt.MaxRoutes]
+	}
+	return routes
+}
+
+// RoutesAll enumerates loop-free paths from `from` in a single traversal and
+// returns, for every reachable node, its candidate routes ranked cheapest-first
+// (capped to MaxRoutes each). It is the batch form of Routes: one walk answers
+// "best route to every node" instead of re-walking the graph once per
+// destination — the right call when ranking routes to many peers at once.
+func (g *Graph) RoutesAll(from core.NodeID, opt Options) map[core.NodeID][]Route {
+	if opt.MaxHops <= 0 {
+		opt.MaxHops = 6
+	}
+	if opt.MaxRoutes <= 0 {
+		opt.MaxRoutes = 8
+	}
+
+	out := make(map[core.NodeID][]Route)
+	visited := map[core.NodeID]bool{from: true}
+	var cur []Hop
+
+	var dfs func(node core.NodeID, total float64)
+	dfs = func(node core.NodeID, total float64) {
+		if len(cur) > 0 { // the current path is a candidate route to `node`
+			out[node] = append(out[node], Route{Hops: append([]Hop(nil), cur...), Total: total})
+		}
+		if len(cur) >= opt.MaxHops {
+			return
+		}
+		for _, e := range g.adj[node] {
+			if visited[e.To] {
+				continue
+			}
+			visited[e.To] = true
+			cur = append(cur, e)
+			dfs(e.To, total+e.Cost.Total)
+			cur = cur[:len(cur)-1]
+			visited[e.To] = false
+		}
+	}
+	dfs(from, 0)
+
+	for k, rs := range out {
+		sortRoutes(rs)
+		out[k] = rs[:min(len(rs), opt.MaxRoutes)]
+	}
+	return out
+}
+
+// sortRoutes ranks routes cheapest-first in place, ties broken by fewer hops.
+func sortRoutes(routes []Route) {
 	sort.SliceStable(routes, func(i, j int) bool {
 		if routes[i].Total != routes[j].Total {
 			return routes[i].Total < routes[j].Total
 		}
 		return len(routes[i].Hops) < len(routes[j].Hops)
 	})
-	if len(routes) > opt.MaxRoutes {
-		routes = routes[:opt.MaxRoutes]
-	}
-	return routes
 }

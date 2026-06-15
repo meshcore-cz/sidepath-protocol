@@ -220,6 +220,8 @@ func (n *Node) onHelperEvent(header map[string]any, payload []byte) {
 		n.logf("connect %s failed: %s", addr, asString(header["error"]))
 	case "peer_disconnected":
 		n.onPeerDisconnected(asString(header["addr"]), asString(header["reason"]))
+	case "link_sample":
+		n.onLinkSample(asString(header["addr"]), asInt(header["latency_ms"]), asBool(header["ok"]))
 	case "central_frame":
 		n.handleIncomingFrameForAddr(asString(header["addr"]), payload)
 	case "subscribed":
@@ -228,6 +230,21 @@ func (n *Node) onHelperEvent(header map[string]any, payload []byte) {
 		n.onUnsubscribed(asString(header["central_id"]))
 	case "peripheral_frame":
 		n.handleIncomingFrame(payload, nil, asString(header["central_id"]))
+	}
+}
+
+// onLinkSample folds CoreBluetooth write-with-response confirmations into the live neighbor stats.
+// These samples are ATT-level delivery signals for outgoing central-role writes to PACKET_IN.
+func (n *Node) onLinkSample(addr string, latencyMs int, ok bool) {
+	n.mu.Lock()
+	link := n.peers[addr]
+	n.mu.Unlock()
+	if link == nil {
+		return
+	}
+	n.RecordLinkDelivery(link.peerID, ok)
+	if ok && latencyMs > 0 && latencyMs <= 65535 {
+		n.RecordLinkRTT(link.peerID, uint16(latencyMs))
 	}
 }
 
@@ -1203,12 +1220,12 @@ func (n *Node) floodFrames(frames []core.Frame, exclude *core.NodeID) {
 	}
 }
 
-// sendFramesToLink writes frames to a connected peer (central role) via the helper. Multi-fragment
-// transmissions use reliable (acknowledged) writes so the receiver can always reassemble.
+// sendFramesToLink writes frames to a connected peer (central role) via acknowledged writes. The
+// helper emits one link_sample per CoreBluetooth didWriteValueFor callback so every frame feeds live
+// link delivery/latency stats, matching Android's write-request path.
 func (n *Node) sendFramesToLink(link *MacPeerLink, frames []core.Frame) {
-	reliable := len(frames) > 1
 	for _, f := range frames {
-		link.helper.sendCentral(link.addr, f.Encode(), reliable)
+		link.helper.sendCentral(link.addr, f.Encode(), true)
 	}
 	if len(frames) > 0 { // one call carries one datagram's fragments
 		n.countTX(link.peerID)

@@ -14,6 +14,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import cz.meshcore.sidepath.protocol.Capabilities
 import cz.meshcore.sidepath.protocol.NodeId
@@ -40,6 +41,7 @@ class SidepathGattServer(
     private val onDeviceConnected: ((BluetoothDevice) -> Unit)? = null,
     private val onDeviceDisconnected: ((BluetoothDevice) -> Unit)? = null,
     private val onDeviceUnreachable: ((BluetoothDevice, String) -> Unit)? = null,
+    private val onLinkSample: ((BluetoothDevice, latencyMs: Int, ok: Boolean) -> Unit)? = null,
     private val onLog: ((String) -> Unit)? = null,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -51,6 +53,7 @@ class SidepathGattServer(
     private val notifyLock = Any()
     private val notifyQueues = ConcurrentHashMap<String, ArrayDeque<ByteArray>>()
     private val notifyInFlight = ConcurrentHashMap<String, Boolean>()
+    private val notifyStartedAtMs = ConcurrentHashMap<String, Long>()
     private val notifyFailures = ConcurrentHashMap<String, Int>()
     private lateinit var packetOutChar: BluetoothGattCharacteristic
 
@@ -144,9 +147,12 @@ class SidepathGattServer(
         if (!sendNotify(server, device, frame)) {
             synchronized(notifyLock) {
                 notifyInFlight[key] = false
+                notifyStartedAtMs.remove(key)
                 notifyQueues.getOrPut(key) { ArrayDeque() }.addFirst(frame)
             }
             scheduleNotifyRetryOrFail(device, "notify busy")
+        } else {
+            notifyStartedAtMs[key] = SystemClock.elapsedRealtime()
         }
     }
 
@@ -187,6 +193,7 @@ class SidepathGattServer(
         synchronized(notifyLock) {
             notifyQueues.remove(key)
             notifyInFlight.remove(key)
+            notifyStartedAtMs.remove(key)
             notifyFailures.remove(key)
         }
     }
@@ -208,6 +215,7 @@ class SidepathGattServer(
         synchronized(notifyLock) {
             notifyQueues.clear()
             notifyInFlight.clear()
+            notifyStartedAtMs.clear()
             notifyFailures.clear()
         }
     }
@@ -220,6 +228,7 @@ class SidepathGattServer(
         synchronized(notifyLock) {
             notifyQueues.clear()
             notifyInFlight.clear()
+            notifyStartedAtMs.clear()
             notifyFailures.clear()
         }
         Log.i(TAG, "GATT server closed")
@@ -311,11 +320,19 @@ class SidepathGattServer(
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
             val key = deviceKey(device)
-            synchronized(notifyLock) { notifyInFlight[key] = false }
+            val startedAt = synchronized(notifyLock) {
+                notifyInFlight[key] = false
+                notifyStartedAtMs.remove(key)
+            }
+            val latencyMs = startedAt
+                ?.let { (SystemClock.elapsedRealtime() - it).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt() }
+                ?: 1
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 notifyFailures.remove(key)
+                onLinkSample?.invoke(device, latencyMs, true)
                 drainNotifyQueue(device)
             } else {
+                onLinkSample?.invoke(device, latencyMs, false)
                 scheduleNotifyRetryOrFail(device, "notification failed status=$status")
             }
         }

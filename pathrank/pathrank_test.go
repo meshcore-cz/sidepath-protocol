@@ -147,6 +147,36 @@ func TestStaleLinkCostsMore(t *testing.T) {
 	}
 }
 
+// RoutesAll is the batch form of Routes: for any destination it must yield the
+// same ranked routes a per-destination Routes call would, in one traversal.
+func TestRoutesAllMatchesRoutes(t *testing.T) {
+	g := New(DefaultWeights())
+	g.AddLink(self, dest, strong())
+	g.AddLink(self, relayA, strong())
+	g.AddLink(relayA, dest, strong())
+	g.AddLink(relayA, relayB, strong())
+	g.AddLink(relayB, dest, strong())
+
+	all := g.RoutesAll(self, Options{})
+	for _, target := range []core.NodeID{dest, relayA, relayB} {
+		want := g.Routes(self, target, Options{})
+		got := all[target]
+		if len(got) != len(want) {
+			t.Fatalf("%v: RoutesAll has %d routes, Routes has %d", target, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Total != want[i].Total || len(got[i].Hops) != len(want[i].Hops) {
+				t.Fatalf("%v route #%d differs: all=%v/%dh want=%v/%dh", target, i,
+					got[i].Total, len(got[i].Hops), want[i].Total, len(want[i].Hops))
+			}
+		}
+	}
+	// An unreachable node has no entry.
+	if _, ok := all[nid(42)]; ok {
+		t.Fatal("unreachable node should not appear in RoutesAll")
+	}
+}
+
 func TestNoRouteReturnsEmpty(t *testing.T) {
 	g := New(DefaultWeights())
 	g.AddLink(self, relayA, strong()) // dead end, never reaches dest

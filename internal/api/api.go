@@ -118,6 +118,12 @@ type Peer struct {
 	// TxPHY/RxPHY are the BLE PHY of the live link (e.g. "1M", "LE Coded").
 	TxPHY string `json:"tx_phy,omitempty"`
 	RxPHY string `json:"rx_phy,omitempty"`
+	// Live link quality this node observes for a connected peer (0 = unknown):
+	// Quality is a 0..255 delivery-reliability score, RTTms a smoothed round-trip
+	// latency, RSSIEWMA a smoothed RSSI in dBm.
+	Quality  uint8  `json:"quality,omitempty"`
+	RTTms    uint16 `json:"rtt_ms,omitempty"`
+	RSSIEWMA int    `json:"rssi_ewma,omitempty"`
 	// RxPackets/TxPackets count Sidepath packets (datagrams) received from / sent to
 	// this peer over the life of its link. Only populated for a connected peer.
 	RxPackets uint64 `json:"rx_packets,omitempty"`

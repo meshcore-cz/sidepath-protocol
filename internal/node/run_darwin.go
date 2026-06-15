@@ -272,6 +272,9 @@ func (r *darwinRuntime) Peers() []api.Peer {
 			if nb, ok := nbr[id]; ok {
 				p.TxPHY = nb.TxPHY.String()
 				p.RxPHY = nb.RxPHY.String()
+				p.Quality = nb.QualityQ8
+				p.RTTms = nb.RTTms
+				p.RSSIEWMA = nb.RSSIEWMA
 			}
 			p.RxPackets, p.TxPackets, p.LastRxS = packetStats(r.node, id)
 		}
@@ -464,6 +467,9 @@ func (r *darwinRuntime) Peer(idHex string) (*api.PeerDetail, error) {
 		if nb != nil {
 			p.TxPHY = nb.TxPHY.String()
 			p.RxPHY = nb.RxPHY.String()
+			p.Quality = nb.QualityQ8
+			p.RTTms = nb.RTTms
+			p.RSSIEWMA = nb.RSSIEWMA
 		}
 		p.RxPackets, p.TxPackets, p.LastRxS = packetStats(r.node, id)
 	}
