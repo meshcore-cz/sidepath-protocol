@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -33,6 +34,11 @@ Wait for delivery acknowledgement (direct messages only):
   sp send --ack 1a2b3c... "did you get this?"
   sp send --wait 5s 1a2b3c... "..."
 
+Pin an explicit source route instead of letting the node pick one, and print the
+routing details (-v shows them for any send):
+  sp send --path 1111116e82f1a143...,111111fe43731387... 1a2b3c... "via these relays"
+  sp send -v 1a2b3c... "how did this go out?"
+
 The message is the remaining arguments joined with spaces, so quoting is optional.
 send requires a running daemon.`,
 	Args: cobra.MinimumNArgs(1),
@@ -43,6 +49,8 @@ send requires a running daemon.`,
 		channel, _ := cmd.Flags().GetString("channel")
 		ack, _ := cmd.Flags().GetBool("ack")
 		wait, _ := cmd.Flags().GetDuration("wait")
+		path, _ := cmd.Flags().GetStringSlice("path")
+		verbose, _ := cmd.Flags().GetBool("verbose")
 		wantAck := ack || wait > 0
 		ackWait := wait
 		if ackWait <= 0 {
@@ -56,6 +64,9 @@ send requires a running daemon.`,
 		if channel != "" {
 			if wantAck {
 				return fmt.Errorf("--ack/--wait is only supported for direct messages")
+			}
+			if len(path) > 0 {
+				return fmt.Errorf("--path is only supported for direct messages")
 			}
 			text := strings.Join(args, " ")
 			if strings.TrimSpace(text) == "" {
@@ -77,22 +88,25 @@ send requires a running daemon.`,
 		}
 		dest := args[0]
 		text := strings.Join(args[1:], " ")
+		// Show the routing detail block whenever the user asked for it or pinned a path.
+		detail := verbose || len(path) > 0
 
 		if !wantAck {
-			if err := client.SendDirect(dest, text); err != nil {
+			res, err := client.SendDirect(dest, text, path)
+			if err != nil {
 				return fmt.Errorf("send failed: %w", err)
 			}
 			if cfg.JSON {
-				return json.NewEncoder(out).Encode(map[string]any{"sent": true, "dest": dest, "text": text})
+				return json.NewEncoder(out).Encode(map[string]any{"sent": true, "dest": dest, "text": text, "send": res})
 			}
-			fmt.Fprintf(out, "sent to %s\n", dest)
+			printSent(out, dest, res, detail)
 			return nil
 		}
 
 		// Wait for the ACK.
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		res, err := client.SendDirectAck(ctx, dest, text, ackWait)
+		res, err := client.SendDirectAck(ctx, dest, text, path, ackWait)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -102,18 +116,53 @@ send requires a running daemon.`,
 		if cfg.JSON {
 			return json.NewEncoder(out).Encode(map[string]any{"sent": true, "dest": dest, "text": text, "ack": res})
 		}
+		printSent(out, dest, res, detail)
 		if res.Acked {
-			fmt.Fprintf(out, "sent to %s — ACK from %s in %dms\n", dest, res.From, res.RTTMs)
+			fmt.Fprintf(out, "ACK from %s in %dms\n", res.From, res.RTTMs)
 		} else {
-			fmt.Fprintf(out, "sent to %s — no ACK within %s\n", dest, ackWait)
+			fmt.Fprintf(out, "no ACK within %s\n", ackWait)
 		}
 		return nil
 	},
+}
+
+// printSent reports a direct send. With detail it adds the datagram id and the
+// route the daemon actually used (explicit path, auto-selected source route, or flood).
+func printSent(out io.Writer, dest string, res *api.SendResult, detail bool) {
+	fmt.Fprintf(out, "sent to %s\n", dest)
+	if !detail || res == nil {
+		return
+	}
+	if res.DatagramID != "" {
+		fmt.Fprintf(out, "  datagram: %s\n", res.DatagramID)
+	}
+	fmt.Fprintf(out, "  route:    %s\n", routeSummary(res))
+}
+
+// routeSummary renders how a direct send was routed: a flood fallback, a direct
+// hop, or the ordered source route (each hop abbreviated, ending at the destination).
+func routeSummary(res *api.SendResult) string {
+	if res == nil {
+		return "unknown"
+	}
+	if res.Flooded {
+		return "flood (no route known)"
+	}
+	if len(res.Route) <= 1 {
+		return "direct"
+	}
+	hops := make([]string, len(res.Route))
+	for i, h := range res.Route {
+		hops[i] = shortID(h)
+	}
+	return strings.Join(hops, " -> ")
 }
 
 func init() {
 	sendCmd.Flags().StringP("channel", "c", "", "broadcast on this channel instead of a direct message")
 	sendCmd.Flags().BoolP("ack", "a", false, "wait for a delivery ACK (direct messages only)")
 	sendCmd.Flags().Duration("wait", 0, "wait up to this long for an ACK (implies --ack)")
+	sendCmd.Flags().StringSlice("path", nil, "explicit source route: comma-separated relay NodeIDs to reach the destination (direct messages only)")
+	sendCmd.Flags().BoolP("verbose", "v", false, "print routing details (datagram id and the route used)")
 	rootCmd.AddCommand(sendCmd)
 }

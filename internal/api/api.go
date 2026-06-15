@@ -65,11 +65,17 @@ type ModemResult struct {
 	Lines []string `json:"lines"`
 }
 
-// SendResult reports the outcome of a direct send when an ACK was awaited.
+// SendResult reports the outcome of a direct send: how it was routed (always) and,
+// when an ACK was awaited, whether one arrived and the round-trip time.
 type SendResult struct {
 	Acked bool   `json:"acked"`
 	From  string `json:"from,omitempty"`
 	RTTMs int64  `json:"rtt_ms,omitempty"`
+	// Routing details, populated on every direct send (verbose output uses these).
+	Dest       string   `json:"dest,omitempty"`
+	DatagramID string   `json:"datagram_id,omitempty"`
+	Route      []string `json:"route,omitempty"`   // source route hops incl. dest; empty when flooded
+	Flooded    bool     `json:"flooded,omitempty"` // true when no route was known and we flooded
 }
 
 // TraceResult is the outcome of a trace to a destination node.
@@ -253,17 +259,26 @@ func (c *Client) Trace(ctx context.Context, dest string, route []string) (*Trace
 	return resp.Trace, nil
 }
 
-// SendDirect sends an encrypted direct message to dest (hex NodeID).
-func (c *Client) SendDirect(dest, text string) error {
-	_, err := c.call(Request{Method: MethodSend, Dest: dest, Text: text})
-	return err
+// SendDirect sends an encrypted direct message to dest (hex NodeID). An optional
+// route (relay hops, hex NodeIDs) forces an explicit source route instead of the
+// auto-selected one. It returns the routing details the daemon reported.
+func (c *Client) SendDirect(dest, text string, route []string) (*SendResult, error) {
+	resp, err := c.call(Request{Method: MethodSend, Dest: dest, Text: text, Route: route})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Send == nil {
+		return &SendResult{}, nil
+	}
+	return resp.Send, nil
 }
 
-// SendDirectAck sends a direct message and waits up to wait for an ACK. The
-// result reports whether the ACK arrived (Acked) and, if so, the round-trip
-// time. It aborts promptly if ctx is cancelled.
-func (c *Client) SendDirectAck(ctx context.Context, dest, text string, wait time.Duration) (*SendResult, error) {
-	req := Request{Method: MethodSend, Dest: dest, Text: text, AckWaitMs: wait.Milliseconds()}
+// SendDirectAck sends a direct message (optionally over an explicit route) and
+// waits up to wait for an ACK. The result reports the routing details plus whether
+// the ACK arrived (Acked) and, if so, the round-trip time. It aborts promptly if
+// ctx is cancelled.
+func (c *Client) SendDirectAck(ctx context.Context, dest, text string, route []string, wait time.Duration) (*SendResult, error) {
+	req := Request{Method: MethodSend, Dest: dest, Text: text, Route: route, AckWaitMs: wait.Milliseconds()}
 	resp, err := c.callCtx(ctx, req, wait+5*time.Second)
 	if err != nil {
 		return nil, err

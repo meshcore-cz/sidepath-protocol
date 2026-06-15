@@ -160,29 +160,67 @@ func (b *Bridge) logf(format string, args ...any) {
 	}
 }
 
+// maxReconnectDelay caps the exponential backoff used while the backend keeps
+// rejecting the subscription (e.g. its radio is unplugged), so a persistent
+// failure settles into an occasional retry instead of hammering every 2s.
+const maxReconnectDelay = 30 * time.Second
+
 // Run streams packets from the backend, invoking forward for each new packet,
 // until ctx is cancelled. It reconnects automatically when the daemon is
 // unavailable or the stream drops. Run only returns when ctx is done.
+//
+// A failing backend would otherwise log the identical error every ReconnectDelay
+// forever; instead the delay backs off exponentially up to maxReconnectDelay, the
+// first occurrence of each distinct error is logged, and a persistent identical
+// error is summarised only occasionally. A successful subscription resets both.
 func (b *Bridge) Run(ctx context.Context, forward func(Packet)) error {
+	delay := b.cfg.ReconnectDelay
+	var lastErr string
+	var repeats int
 	for {
-		if err := b.stream(ctx, forward); err != nil && ctx.Err() == nil {
-			b.logf("meshcore bridge: %v (retrying in %s)", err, b.cfg.ReconnectDelay)
+		connected, err := b.stream(ctx, forward)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if connected {
+			// We held a live subscription; reset backoff and error de-dup so the
+			// next failure backs off from scratch and is reported immediately.
+			delay = b.cfg.ReconnectDelay
+			lastErr, repeats = "", 0
+		}
+		if err != nil {
+			if msg := err.Error(); msg != lastErr {
+				b.logf("meshcore bridge: %v (retrying in %s)", err, delay)
+				lastErr, repeats = msg, 1
+			} else {
+				repeats++
+				// Remind occasionally so a stuck backend isn't silent forever.
+				if repeats%30 == 0 {
+					b.logf("meshcore bridge: still failing after %d attempts: %v (retrying in %s)", repeats, err, delay)
+				}
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(b.cfg.ReconnectDelay):
+		case <-time.After(delay):
+		}
+		if !connected {
+			if delay *= 2; delay > maxReconnectDelay {
+				delay = maxReconnectDelay
+			}
 		}
 	}
 }
 
 // stream opens one watch_rf subscription and pumps frames until it errors or
-// ctx is cancelled.
-func (b *Bridge) stream(ctx context.Context, forward func(Packet)) error {
+// ctx is cancelled. The bool reports whether the subscription was established
+// (the ack came back ok) before the error, so the caller can reset its backoff.
+func (b *Bridge) stream(ctx context.Context, forward func(Packet)) (bool, error) {
 	d := net.Dialer{Timeout: 250 * time.Millisecond}
 	conn, err := d.DialContext(ctx, "unix", b.cfg.Socket)
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", b.cfg.Socket, err)
+		return false, fmt.Errorf("dial %s: %w", b.cfg.Socket, err)
 	}
 	defer conn.Close()
 
@@ -195,7 +233,7 @@ func (b *Bridge) stream(ctx context.Context, forward func(Packet)) error {
 
 	req := request{ID: 1, Device: b.cfg.Device, Method: "watch_rf"}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("send watch_rf: %w", err)
+		return false, fmt.Errorf("send watch_rf: %w", err)
 	}
 
 	dec := json.NewDecoder(bufio.NewReader(conn))
@@ -203,24 +241,25 @@ func (b *Bridge) stream(ctx context.Context, forward func(Packet)) error {
 	// First message is the stream-open ack (response{ok}).
 	var ack response
 	if err := dec.Decode(&ack); err != nil {
-		return fmt.Errorf("read ack: %w", err)
+		return false, fmt.Errorf("read ack: %w", err)
 	}
 	if !ack.OK {
 		if ack.Error == "" {
 			ack.Error = "unknown backend error"
 		}
-		return fmt.Errorf("watch_rf rejected: %s", ack.Error)
+		return false, fmt.Errorf("watch_rf rejected: %s", ack.Error)
 	}
 	b.logf("meshcore bridge: connected to %s, watching RF packets", b.cfg.Socket)
 
-	// Subsequent messages are bare rfPacket frames.
+	// Subsequent messages are bare rfPacket frames. From here on the subscription
+	// was live, so a later error is a dropped stream (return connected=true).
 	for {
 		var pkt rfPacket
 		if err := dec.Decode(&pkt); err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return true, ctx.Err()
 			}
-			return fmt.Errorf("stream closed: %w", err)
+			return true, fmt.Errorf("stream closed: %w", err)
 		}
 		if len(pkt.Bytes) == 0 {
 			continue

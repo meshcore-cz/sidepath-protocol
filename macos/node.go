@@ -887,6 +887,56 @@ func (n *Node) SendChat(dst core.NodeID, text string) error {
 	return err
 }
 
+// SendChatRouted sends an encrypted DM to dst and reports how it was routed: the sent datagram's ID,
+// the source route it took (relay hops then dst; empty when flooded), and whether it fell back to a
+// flood. When route is non-empty it is used verbatim as an explicit source route (dst is appended if
+// the caller omitted it) instead of the auto-selected route — this is what `sp send --path` uses.
+func (n *Node) SendChatRouted(dst core.NodeID, text string, route []core.NodeID) (core.DatagramID, []core.NodeID, bool, error) {
+	pub := n.router.PublicKeyFor(dst)
+	if pub == nil {
+		return core.DatagramID{}, nil, false, fmt.Errorf("no public key known for %s (not in topology yet)", dst)
+	}
+	ctx := core.ChatContext{DatagramID: core.NewDatagramID(), Source: n.nodeID, Destination: dst}
+	env, err := core.SealDirectText(n.identity, pub, ctx, text, time.Now().Unix())
+	if err != nil {
+		return core.DatagramID{}, nil, false, err
+	}
+
+	var dg core.Datagram
+	if len(route) > 0 {
+		full := append([]core.NodeID(nil), route...)
+		if full[len(full)-1] != dst {
+			full = append(full, dst)
+		}
+		dg = core.Datagram{Version: core.DatagramVersion, ID: ctx.DatagramID, Source: n.nodeID,
+			Destination: dst, TTL: uint8(len(full)), Route: full, Protocol: core.ProtocolSidepathChat,
+			Flags: uint16(core.FlagAckRequested), Payload: env}
+		n.router.MarkOriginated(dg.ID)
+	} else {
+		var ok bool
+		dg, ok = n.router.NewUnicast(dst, core.ProtocolSidepathChat, env, uint16(core.FlagAckRequested), 4, false)
+		if !ok {
+			return core.DatagramID{}, nil, false, fmt.Errorf("no route to %s", dst)
+		}
+		dg.ID = ctx.DatagramID
+	}
+	// A source-routed datagram must go targeted to its first hop. Flooding it would also broadcast to
+	// the destination if it happens to be a direct neighbor; that copy is dropped as "not next hop" but
+	// still enters the dedup cache, so the correctly-relayed copy then dies as a duplicate. The flood
+	// fallback (no route known) is the only case we actually broadcast.
+	flooded := len(dg.Route) == 0
+	var err2 error
+	if flooded {
+		err2 = n.transmit(dg)
+	} else {
+		err2 = n.transmitToRoute(dg)
+	}
+	if err2 != nil {
+		return core.DatagramID{}, nil, false, err2
+	}
+	return dg.ID, dg.Route, flooded, nil
+}
+
 // SendChatWithID is SendChat but returns the sent datagram's ID for ACK
 // correlation.
 func (n *Node) SendChatWithID(dst core.NodeID, text string) (core.DatagramID, error) {

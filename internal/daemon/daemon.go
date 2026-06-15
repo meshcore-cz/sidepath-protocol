@@ -67,10 +67,11 @@ type Topologer interface {
 	Topology() api.TopologyResult
 }
 
-// Sender is an attached node that can send chat messages. SendDirect waits for
-// an ACK (until ctx is done) when wantAck is set.
+// Sender is an attached node that can send chat messages. SendDirect routes over
+// the explicit source route in route (relay hops) when it is non-empty, else the
+// auto-selected route; it waits for an ACK (until ctx is done) when wantAck is set.
 type Sender interface {
-	SendDirect(ctx context.Context, dest, text string, wantAck bool) (api.SendResult, error)
+	SendDirect(ctx context.Context, dest, text string, route []string, wantAck bool) (api.SendResult, error)
 	SendChannel(channel, text string) error
 }
 
@@ -217,7 +218,7 @@ func (d *Daemon) send(conn net.Conn, req api.Request) api.Response {
 	}
 	defer cancel()
 
-	res, err := s.SendDirect(ctx, req.Dest, req.Text, wantAck)
+	res, err := s.SendDirect(ctx, req.Dest, req.Text, req.Route, wantAck)
 	if err != nil {
 		return api.Response{OK: false, Error: err.Error()}
 	}

@@ -604,19 +604,32 @@ func directionString(d core.ConnDirection) string {
 // key is resolved from the topology (learned via signed ANNOUNCE). When wantAck
 // is set it waits for the ACK until ctx is cancelled, reporting the round-trip
 // time; a timeout returns Acked=false (the message was still sent).
-func (r *darwinRuntime) SendDirect(ctx context.Context, dest, text string, wantAck bool) (api.SendResult, error) {
+func (r *darwinRuntime) SendDirect(ctx context.Context, dest, text string, route []string, wantAck bool) (api.SendResult, error) {
 	id, err := core.ParseNodeID(dest)
 	if err != nil {
 		return api.SendResult{}, fmt.Errorf("invalid destination %q: %w", dest, err)
 	}
-	if !wantAck {
-		return api.SendResult{}, r.node.SendChat(id, text)
+	hops := make([]core.NodeID, 0, len(route))
+	for _, h := range route {
+		hop, err := core.ParseNodeID(h)
+		if err != nil {
+			return api.SendResult{}, fmt.Errorf("invalid path hop %q: %w", h, err)
+		}
+		hops = append(hops, hop)
 	}
 
-	dgID, err := r.node.SendChatWithID(id, text)
+	dgID, used, flooded, err := r.node.SendChatRouted(id, text, hops)
 	if err != nil {
 		return api.SendResult{}, err
 	}
+	res := api.SendResult{Dest: id.String(), DatagramID: hex.EncodeToString(dgID[:]), Flooded: flooded}
+	for _, h := range used {
+		res.Route = append(res.Route, h.String())
+	}
+	if !wantAck {
+		return res, nil
+	}
+
 	start := time.Now()
 	ch := make(chan core.NodeID, 1)
 	r.mu.Lock()
@@ -630,9 +643,12 @@ func (r *darwinRuntime) SendDirect(ctx context.Context, dest, text string, wantA
 
 	select {
 	case <-ctx.Done():
-		return api.SendResult{Acked: false}, nil
+		return res, nil
 	case from := <-ch:
-		return api.SendResult{Acked: true, From: from.String(), RTTMs: time.Since(start).Milliseconds()}, nil
+		res.Acked = true
+		res.From = from.String()
+		res.RTTMs = time.Since(start).Milliseconds()
+		return res, nil
 	}
 }
 
