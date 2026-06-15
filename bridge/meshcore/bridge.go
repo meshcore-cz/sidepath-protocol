@@ -309,6 +309,12 @@ func classify(raw []byte) (meshpkt.Packet, ForwardMode, []byte, string, error) {
 	case meshpkt.RouteDirect, meshpkt.RouteTransportDirect:
 		target := directTargetHash(pkt)
 		if len(target) == 0 {
+			// MeshCore ACKs do not carry the original sender's public-key hash. If a companion has
+			// learned a path, it can return DIRECT ACK or DIRECT MULTIPART(ACK); fan those tiny packets
+			// back through Sidepath and let recipients match by pending ACK CRC.
+			if ackLikePacket(pkt) {
+				return pkt, ForwardFlood, nil, "", nil
+			}
 			return pkt, 0, nil, "direct packet has no routable target hash", nil
 		}
 		return pkt, ForwardDirect, target, "", nil
@@ -337,6 +343,17 @@ func directTargetHash(pkt meshpkt.Packet) []byte {
 		return cloneBytes(hops[0])
 	}
 	return nil
+}
+
+func ackLikePacket(pkt meshpkt.Packet) bool {
+	if pkt.Type == meshpkt.PayloadAck {
+		return true
+	}
+	if pkt.Type != meshpkt.PayloadMultipart {
+		return false
+	}
+	mp, err := meshpkt.DecodeMultipartPayload(pkt.Payload)
+	return err == nil && mp.InnerType == meshpkt.PayloadAck && len(mp.InnerPayload) >= 4
 }
 
 func payloadCarriesDestHash(t meshpkt.PayloadType) bool {

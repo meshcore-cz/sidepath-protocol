@@ -1,6 +1,6 @@
 // Minimal Sidepath bot SDK for the Bun runtime.
 //
-// The Go node (sidepath-macos --bot <script>) launches this script with `bun run`
+// The Go node (`sp daemon run --bot <script>`) launches this script with `bun run`
 // and talks to it over newline-delimited JSON on stdin/stdout. This module hides
 // that wire protocol: you register handlers and call helpers, it does the framing.
 //

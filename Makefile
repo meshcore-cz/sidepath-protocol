@@ -1,4 +1,4 @@
-.PHONY: help build test android-aar copy-meshpkt-aar test-go build-macos build-macos-helper bot clean sp sp-install build-esp32 install-esp32 build-modem flash-modem monitor-modem test-modem
+.PHONY: help build test android-aar copy-meshpkt-aar test-go build-macos-helper bot clean sp sp-install build-esp32 install-esp32 build-modem flash-modem monitor-modem test-modem
 
 .DEFAULT_GOAL := help
 
@@ -40,9 +40,6 @@ sp-install: ## Install the sp CLI via 'go install' (to $GOBIN / $GOPATH/bin)
 build-macos-helper: ## Build the native CoreBluetooth helper (Swift)
 	swiftc -O macos-ble-helper/*.swift -o bin/sidepath-macos-ble-helper -framework CoreBluetooth -framework Foundation
 
-build-macos: build-macos-helper ## Build the macOS Sidepath node
-	go build -o bin/sidepath-macos ./cmd/sidepath-macos
-
 ESP32_ADMIN_PUBKEY ?=
 # Optional fixed identity for a built ESP32 node: a 64-hex-char (32-byte) Ed25519 seed.
 # Empty (default) = the node generates and persists its own seed in NVS on first boot.
@@ -58,8 +55,8 @@ ESP32_BUILD_PROPERTIES := --build-property 'compiler.cpp.extra_flags=$(ESP32_EXT
 # Run the macOS node as a bot driven by a Bun script, e.g.:
 #   make bot SCRIPT=bots/time-bot.ts
 SCRIPT ?= bots/echo-bot.ts
-bot: build-macos ## Run the macOS node as a Bun-driven bot (SCRIPT=...)
-	./bin/sidepath-macos --bot $(SCRIPT) --verbose --channels "Public,test,dev"
+bot: build-macos-helper ## Run the daemon node as a Bun-driven bot (SCRIPT=...)
+	go run ./cmd/sp daemon run --bot $(SCRIPT) --channels "Public,test,dev"
 
 build-esp32: ## Compile the XIAO ESP32-C6 firmware
 	arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 $(ESP32_BUILD_PROPERTIES) firmware/xiao_esp32c6

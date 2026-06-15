@@ -120,7 +120,7 @@ func TestClassifyDirectPacketWithPayloadDestHash(t *testing.T) {
 func TestClassifyDirectPacketWithoutTargetHash(t *testing.T) {
 	raw, err := meshpkt.EncodePacket(meshpkt.Packet{
 		Route:        meshpkt.RouteDirect,
-		Type:         meshpkt.PayloadAck,
+		Type:         meshpkt.PayloadControl,
 		PathHashSize: 2,
 		Payload:      []byte{1, 2, 3, 4},
 	})
@@ -133,6 +133,35 @@ func TestClassifyDirectPacketWithoutTargetHash(t *testing.T) {
 	}
 	if mode != 0 || len(target) != 0 || reason == "" {
 		t.Fatalf("classify direct got mode=%v target=%x reason=%q", mode, target, reason)
+	}
+}
+
+func TestClassifyDirectAckWithoutTargetIsFlooded(t *testing.T) {
+	raw, err := meshpkt.AckPacket(0x01020304)
+	if err != nil {
+		t.Fatalf("AckPacket: %v", err)
+	}
+	raw[0] = byte(meshpkt.RouteDirect) | byte(meshpkt.PayloadAck)<<2
+	_, mode, target, reason, err := classify(raw)
+	if err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	if mode != ForwardFlood || len(target) != 0 || reason != "" {
+		t.Fatalf("classify direct ACK got mode=%v target=%x reason=%q, want flood", mode, target, reason)
+	}
+}
+
+func TestClassifyDirectMultipartAckWithoutTargetIsFlooded(t *testing.T) {
+	raw, err := meshpkt.MultipartAckPacket(0, 0x01020304)
+	if err != nil {
+		t.Fatalf("MultipartAckPacket: %v", err)
+	}
+	_, mode, target, reason, err := classify(raw)
+	if err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	if mode != ForwardFlood || len(target) != 0 || reason != "" {
+		t.Fatalf("classify direct MULTIPART ACK got mode=%v target=%x reason=%q, want flood", mode, target, reason)
 	}
 }
 

@@ -7,7 +7,7 @@ messages and decides what to send back.
 ```
                  newline-delimited JSON (stdin/stdout)
   ┌───────────────┐   events  ───────────►   ┌──────────────┐
-  │ sidepath-macos │                           │  bun <script> │
+  │   sp daemon    │                           │  bun <script> │
   │   (Go node)   │   ◄───────  commands      │  (your bot)   │
   └───────────────┘                           └──────────────┘
 ```
@@ -15,14 +15,14 @@ messages and decides what to send back.
 ## Run
 
 ```sh
-# build the node (macOS)
-make build-macos        # or: go build -o bin/sidepath-macos ./cmd/sidepath-macos
+# build the CLI and helper (macOS)
+make sp build-macos-helper
 
 # run it as a bot
-./bin/sidepath-macos --bot bots/time-bot.ts
+./sp daemon run --bot bots/time-bot.ts
 # custom bun path: --bun /opt/homebrew/bin/bun
 # listen on one or more channels (default: Public)
-./bin/sidepath-macos --bot bots/echo-bot.ts --channels "Public,dev"
+./sp daemon run --bot bots/echo-bot.ts --channels "Public,dev"
 ```
 
 The node runs headless and forwards every chat message to the script. By default

@@ -7,7 +7,7 @@ connected peers, applying the same routing rules as the rest of the mesh
 (dedup, TTL, loop/path checks, flood/source-route). Two nodes that can't reach each other directly can
 talk through the ESP32.
 
-It is wire-compatible with the Go (`core/`, `linux/`, `macos/`) and Android nodes:
+It is wire-compatible with the Go (`core/`, `macos/`) and Android nodes:
 same GATT UUIDs, v2 23-byte frame fragmentation + CRC32, and v3 CBOR datagrams
 with integer keys.
 
@@ -97,7 +97,7 @@ arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32C6 -p /dev/ttyACM0 firmware/xia
 ## Trying it
 
 1. Flash the XIAO and power it.
-2. On two Android phones (or a phone + a Mac running `sidepath-macos`), start the
+2. On two Android phones (or a phone + a Mac running `sp daemon run`), start the
    service with the default PHY policy. Place them far enough apart that they
    don't connect directly, but both in range of the XIAO.
 3. Each connects to `Sidepath` (the relay). Send a broadcast message from one — it

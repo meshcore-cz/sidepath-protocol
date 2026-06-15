@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meshcore-cz/meshpkt"
 	mcbridge "github.com/meshcore-cz/sidepath-protocol/bridge/meshcore"
 	"github.com/meshcore-cz/sidepath-protocol/core"
 	"github.com/meshcore-cz/sidepath-protocol/internal/api"
@@ -25,8 +26,7 @@ import (
 
 // Start brings up the macOS node: BLE transport, the optional MeshCore bridge,
 // and the optional Bun bot. It runs the node in the background and returns a
-// Runtime handle plus a channel that delivers the node's terminal error. This
-// is the headless port of cmd/sidepath-macos (no interactive TUI).
+// Runtime handle plus a channel that delivers the node's terminal error.
 func Start(ctx context.Context, id *core.Identity, cfg *config.Config, nc config.NodeConfig, logf LogFunc) (Runtime, <-chan error, error) {
 	nc = nc.Defaulted()
 
@@ -60,8 +60,7 @@ func Start(ctx context.Context, id *core.Identity, cfg *config.Config, nc config
 
 	bridgeLog := func(s string) { logf("%s", s) }
 
-	// br and theBot are assigned below but referenced from OnMessage, which only
-	// fires once the node is running by which point both are set (as in sidepath-macos).
+	// br and theBot are assigned below but referenced from OnMessage, which only fires once the node is running.
 	var br *mcbridge.Bridge
 	var node *blenode.Node
 	var theBot *bot
@@ -819,7 +818,7 @@ func traceMetricName(m core.TraceMetric) string {
 	}
 }
 
-// --- bot (ported headless from cmd/sidepath-macos) -------------------------
+// --- bot ---------------------------------------------------------------
 
 // lineWriter forwards a subprocess's output to a per-line sink (Bun's stderr).
 type lineWriter struct{ emit func(string) }
@@ -841,6 +840,8 @@ type bot struct {
 	stdin     io.Writer
 	logf      func(string)
 	pubByNode map[core.NodeID][]byte
+	meshPub   map[core.NodeID][]byte
+	meshName  map[core.NodeID]string
 	channels  []*blenode.Channel
 }
 
@@ -859,7 +860,12 @@ func startBot(ctx context.Context, node *blenode.Node, bunPath, script string, c
 		return nil, fmt.Errorf("start bun (%s): %w", bunPath, err)
 	}
 
-	b := &bot{node: node, stdin: stdin, logf: logf, pubByNode: make(map[core.NodeID][]byte)}
+	b := &bot{
+		node: node, stdin: stdin, logf: logf,
+		pubByNode: make(map[core.NodeID][]byte),
+		meshPub:   make(map[core.NodeID][]byte),
+		meshName:  make(map[core.NodeID]string),
+	}
 	for _, name := range channelNames {
 		if name == "Public" {
 			b.channels = append(b.channels, node.JoinPublicChannel())
@@ -926,6 +932,9 @@ func (b *bot) onIncoming(dg core.Datagram) {
 		"ts":   time.Now().UnixMilli(),
 	}
 	if dg.Protocol != core.ProtocolSidepathChat {
+		if dg.Protocol == core.ProtocolMeshCorePacket {
+			b.onMeshCoreIncoming(dg, msg)
+		}
 		return
 	}
 	if in, ok := b.node.DecodeChannel(dg.Payload); ok {
@@ -968,6 +977,96 @@ func (b *bot) onIncoming(dg core.Datagram) {
 	b.send(msg)
 }
 
+func (b *bot) onMeshCoreIncoming(dg core.Datagram, msg map[string]any) {
+	_, raw := core.UnframeMeshCorePacket(dg.Payload)
+	pkt, err := meshpkt.DecodePacket(raw)
+	if err != nil {
+		return
+	}
+	if pkt.Type == meshpkt.PayloadAdvert {
+		adv, err := meshpkt.DecodeAdvertPayload(pkt.Payload)
+		if err == nil && len(adv.PublicKey) == 32 {
+			id := core.NodeIDFromPubKey(adv.PublicKey)
+			b.mu.Lock()
+			b.meshPub[id] = append([]byte(nil), adv.PublicKey...)
+			if adv.Name != "" {
+				b.meshName[id] = adv.Name
+			}
+			b.mu.Unlock()
+		}
+		return
+	}
+	if pkt.Type == meshpkt.PayloadGrpTxt {
+		if in, ok := b.node.DecodeChannel(pkt.Payload); ok {
+			msg["text"] = in.Text
+			msg["channel"] = true
+			msg["channelName"] = in.Channel
+			msg["sender"] = in.Sender
+			msg["meshCore"] = true
+			b.send(msg)
+		}
+		return
+	}
+	if pkt.Type != meshpkt.PayloadTxtMsg || len(pkt.Payload) < 4 {
+		return
+	}
+	self := b.node.Identity()
+	if self == nil || pkt.Payload[0] != self.Pub[0] {
+		return
+	}
+	srcHash := pkt.Payload[1]
+	b.mu.Lock()
+	candidates := make([][]byte, 0, len(b.meshPub))
+	for _, pub := range b.meshPub {
+		if len(pub) == 32 && pub[0] == srcHash {
+			candidates = append(candidates, append([]byte(nil), pub...))
+		}
+	}
+	b.mu.Unlock()
+	seedHex := hex.EncodeToString(self.Seed[:])
+	for _, pub := range candidates {
+		dm, err := meshpkt.DecodeDirectTextPayloadFromIdentity(pkt.Payload, seedHex, hex.EncodeToString(pub))
+		if err != nil {
+			continue
+		}
+		id := core.NodeIDFromPubKey(pub)
+		b.mu.Lock()
+		b.meshPub[id] = append([]byte(nil), pub...)
+		name := b.meshName[id]
+		b.mu.Unlock()
+		msg["from"] = id.String()
+		msg["name"] = name
+		msg["text"] = dm.Text
+		msg["channel"] = false
+		msg["meshCore"] = true
+		b.sendMeshCoreAck(pkt, pub, dm)
+		b.send(msg)
+		return
+	}
+}
+
+func (b *bot) sendMeshCoreAck(pkt meshpkt.Packet, senderPub []byte, dm meshpkt.DirectText) {
+	var peer [32]byte
+	copy(peer[:], senderPub)
+	self := b.node.Identity()
+	if self == nil {
+		return
+	}
+	var raw []byte
+	var err error
+	if pkt.Route == meshpkt.RouteFlood || pkt.Route == meshpkt.RouteTransportFlood {
+		raw, err = meshpkt.PathTextAckReturnPacketFromIdentity(
+			self.Seed, peer, uint32(dm.Timestamp.Unix()), dm.Attempt, dm.Text,
+			pkt.Path, meshpkt.WithPathHashSize(pkt.PathHashSize),
+		)
+	} else {
+		raw, err = meshpkt.TextAckPacket(uint32(dm.Timestamp.Unix()), dm.Attempt, dm.Text, senderPub)
+	}
+	if err == nil {
+		_ = b.node.SendMeshCoreRaw(raw)
+	}
+}
+
 type botCommand struct {
 	Type    string `json:"type"`
 	To      string `json:"to"`
@@ -997,8 +1096,27 @@ func (b *bot) readLoop(r io.Reader) {
 				continue
 			}
 			b.mu.Lock()
+			meshPub := b.meshPub[id]
 			pub := b.pubByNode[id]
 			b.mu.Unlock()
+			if len(meshPub) == 32 {
+				self := b.node.Identity()
+				if self == nil {
+					b.logf("bot MeshCore reply: local identity unavailable")
+					continue
+				}
+				var peer [32]byte
+				copy(peer[:], meshPub)
+				raw, err := meshpkt.DirectTextPacketFromIdentity(self.Seed, peer, c.Text, time.Now(), 0)
+				if err != nil {
+					b.logf(fmt.Sprintf("bot MeshCore reply encode: %v", err))
+					continue
+				}
+				if err := b.node.SendMeshCoreRaw(raw); err != nil {
+					b.logf(fmt.Sprintf("bot MeshCore reply send: %v", err))
+				}
+				continue
+			}
 			if len(pub) != 32 {
 				pub = b.node.PublicKeyFor(id)
 			}
@@ -1046,7 +1164,7 @@ func (b *bot) readLoop(r io.Reader) {
 	}
 }
 
-// --- bridge logging helpers (ported from cmd/sidepath-macos) ---------------
+// --- bridge logging helpers ------------------------------------------------
 
 func formatRoute(route []core.NodeID) string {
 	parts := make([]string, len(route))

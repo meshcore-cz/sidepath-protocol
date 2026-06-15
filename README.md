@@ -154,11 +154,9 @@ Sidepath does not partially reimplement MeshCore or modify its inner packet sema
 | [`docs/CHAT_PROTOCOL.md`](docs/CHAT_PROTOCOL.md)   | Native chat payload specification          |
 | [`bridge/meshcore/`](bridge/meshcore/)             | MeshCore packet bridge                     |
 | [`android/`](android/)                             | Kotlin protocol, chat, MeshCore, and networking libraries |
-| [`linux/`](linux/)                                 | Linux BLE node using BlueZ                 |
-| [`macos/`](macos/)                                 | macOS development node                     |
+| [`macos/`](macos/)                                 | macOS transport used by `sp daemon run`    |
 | [`firmware/xiao_esp32c6/`](firmware/xiao_esp32c6/) | ESP32-C6 relay firmware                    |
 | [`bots/`](bots/)                                   | JavaScript and TypeScript bot examples     |
-| [`cmd/sidepath-simulate`](cmd/sidepath-simulate/)  | In-memory simulator                        |
 
 The default transport uses the broadly compatible BLE **1M PHY**.
 
@@ -179,13 +177,7 @@ BLE Coded PHY can be enabled experimentally on supported hardware for longer-ran
 
 ---
 
-## Try the simulator
-
-Explore the [routing engine](core/) without Bluetooth hardware:
-
-```bash
-go run ./cmd/sidepath-simulate
-```
+## Test
 
 Run the Go test suite:
 
@@ -215,7 +207,7 @@ Sidepath Protocol
 ├── Bluetooth Low Energy transport
 ├── native chat payloads
 ├── MeshCore packet bridging
-├── Android, Linux, and macOS nodes
+├── Android and macOS nodes
 └── ESP32-C6 relay firmware
 ```
 
