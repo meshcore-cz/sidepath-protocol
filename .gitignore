@@ -2,6 +2,7 @@
 /sidepath-macos
 /sidepath-listen
 /sidepath-simulate
+/sp
 
 # Go build/test artifacts
 *.test

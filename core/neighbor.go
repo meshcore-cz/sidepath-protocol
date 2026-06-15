@@ -55,6 +55,18 @@ func (t *NeighborTable) Upsert(n Neighbor) {
 	t.neighbors[n.ID] = &n
 }
 
+// SetRSSI refreshes an existing neighbor's signal strength in place (and its
+// LastSeen, since hearing an advertisement is a sign of liveness). It is a no-op
+// if the neighbor isn't in the table.
+func (t *NeighborTable) SetRSSI(id NodeID, rssi int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n, ok := t.neighbors[id]; ok {
+		n.RSSI = rssi
+		n.LastSeen = time.Now()
+	}
+}
+
 func (t *NeighborTable) Get(id NodeID) (*Neighbor, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

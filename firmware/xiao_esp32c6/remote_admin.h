@@ -622,6 +622,48 @@ static void buildChatEnvelopeAdmin(const uint8_t senderPub[mesh::PUBKEY_LEN],
   cborEmitUintAdmin(payload, 3); payload.insert(payload.end(), body.begin(), body.end());
 }
 
+static void appendLE64Admin(std::vector<uint8_t>& out, uint64_t v) {
+  for (int i = 0; i < 8; i++) out.push_back((uint8_t)(v >> (8 * i)));
+}
+
+static void typingSignedBytesAdmin(const uint8_t datagramId[mesh::DATAGRAM_ID_LEN],
+                                   const uint8_t source[mesh::NODE_ID_LEN],
+                                   const uint8_t dest[mesh::NODE_ID_LEN],
+                                   const uint8_t senderPub[mesh::PUBKEY_LEN],
+                                   int64_t sentAt,
+                                   std::vector<uint8_t>& out) {
+  out.clear();
+  const char prefix[] = "SIDEPATH-CHAT-TYPING-V1";
+  out.insert(out.end(), prefix, prefix + sizeof(prefix));
+  out.insert(out.end(), datagramId, datagramId + mesh::DATAGRAM_ID_LEN);
+  out.insert(out.end(), source, source + mesh::NODE_ID_LEN);
+  out.insert(out.end(), dest, dest + mesh::NODE_ID_LEN);
+  out.insert(out.end(), senderPub, senderPub + mesh::PUBKEY_LEN);
+  appendLE64Admin(out, (uint64_t)sentAt);
+}
+
+static void buildTypingEnvelopeAdmin(const uint8_t datagramId[mesh::DATAGRAM_ID_LEN],
+                                     const uint8_t destNode[mesh::NODE_ID_LEN],
+                                     std::vector<uint8_t>& payload) {
+  int64_t sentAt = internalUnixTime();
+  std::vector<uint8_t> signedMsg;
+  typingSignedBytesAdmin(datagramId, g_nodeId, destNode, g_pubKey, sentAt, signedMsg);
+  uint8_t sig[mesh::SIG_LEN];
+  ed25519_sign(sig, signedMsg.data(), signedMsg.size(), g_pubKey, g_privKey);
+
+  std::vector<uint8_t> body;
+  body.push_back(0xa3);
+  cborEmitUintAdmin(body, 1); cborEmitBstrAdmin(body, g_pubKey, mesh::PUBKEY_LEN);
+  cborEmitUintAdmin(body, 2); cborEmitIntAdmin(body, sentAt);
+  cborEmitUintAdmin(body, 3); cborEmitBstrAdmin(body, sig, mesh::SIG_LEN);
+
+  payload.clear();
+  payload.push_back(0xa3);
+  cborEmitUintAdmin(payload, 1); cborEmitUintAdmin(payload, 1);
+  cborEmitUintAdmin(payload, 2); cborEmitUintAdmin(payload, 3);
+  cborEmitUintAdmin(payload, 3); payload.insert(payload.end(), body.begin(), body.end());
+}
+
 static bool sealDirectTextAdmin(const uint8_t datagramId[mesh::DATAGRAM_ID_LEN],
                                 const uint8_t destNode[mesh::NODE_ID_LEN],
                                 const uint8_t recipientPub[mesh::PUBKEY_LEN],
@@ -689,6 +731,18 @@ static void sendEncryptedAdminReply(uint16_t conn, const uint8_t destNode[mesh::
   sendAdminDatagramRoute(dg, route, conn);
 }
 
+static void sendTypingAdmin(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN],
+                            const AdminRoute& route) {
+  uint8_t id[mesh::DATAGRAM_ID_LEN];
+  esp_fill_random(id, sizeof(id));
+  std::vector<uint8_t> payload;
+  buildTypingEnvelopeAdmin(id, destNode, payload);
+  std::vector<uint8_t> dg;
+  buildChatDatagramAdmin(id, destNode, 0, route, payload, dg);
+  g_dedup.seenOrAdd(id);
+  sendAdminDatagramRoute(dg, route, conn);
+}
+
 static void sendAckAdmin(uint16_t conn, const uint8_t destNode[mesh::NODE_ID_LEN],
                          const AdminRoute& route,
                          const uint8_t ackedId[mesh::DATAGRAM_ID_LEN]) {
@@ -726,6 +780,7 @@ static bool handleRemoteAdminChat(const std::vector<uint8_t>& dg, const mesh::Da
   if (!parseDirectChatPayload(h.payload, h.payloadLen, parsed)) return false;
   AdminRoute returnRoute = buildReturnRouteAdmin(dg, h.source);
   if (h.flags & mesh::FLAG_ACK_REQUESTED) sendAckAdmin(sender, h.source, returnRoute, h.id);
+  sendTypingAdmin(sender, h.source, returnRoute);
 
   std::array<uint8_t, mesh::PUBKEY_LEN> senderPub{};
   String cmd;

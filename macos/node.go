@@ -50,6 +50,10 @@ type Node struct {
 	// scan addr → NodeID learned from its NODE_INFO, so onScan can dedup an already-connected peer
 	// by identity even though the advertisement carries only an address
 	addrNode map[string]core.NodeID
+	// scan addr → last advertisement RSSI. Scans are keyed by BLE address (identity isn't known
+	// until NODE_INFO is read post-connect), so RSSI is stashed here and carried onto the NodeID
+	// once it resolves; from the neighbor table onward everything is NodeID-keyed.
+	addrRSSI map[string]int
 
 	// joined channels keyed by lowercase PSK hex (see channels.go)
 	channels map[string]*Channel
@@ -59,6 +63,7 @@ type Node struct {
 	onPeerConnect    func(core.NodeID)
 	onPeerDisconnect func(core.NodeID)
 	onTrace          func(core.TraceResponseBody, time.Duration)
+	onAck            func(ackedID core.DatagramID, from core.NodeID)
 
 	// traceStarts records the send time of each trace we originated, keyed by tag, so a response
 	// can be matched back to compute round-trip time. Guarded by traceMu.
@@ -92,6 +97,9 @@ type Config struct {
 	// OnTrace is called when a response arrives for a trace this node originated, with the round-trip
 	// time measured from SendTrace. Responses with no matching pending request are ignored.
 	OnTrace func(resp core.TraceResponseBody, rtt time.Duration)
+	// OnAck is called when an ACK is delivered to this node for a datagram it sent (e.g. a direct
+	// chat sent with FlagAckRequested), carrying the acked datagram's ID and the acking node.
+	OnAck func(ackedID core.DatagramID, from core.NodeID)
 }
 
 // New creates a Node. Call Run to start it.
@@ -128,6 +136,7 @@ func New(cfg Config) *Node {
 		subscribers:   make(map[string]bool),
 		serverPeerIDs: make(map[string]core.NodeID),
 		addrNode:      make(map[string]core.NodeID),
+		addrRSSI:      make(map[string]int),
 		channels:      make(map[string]*Channel),
 		traceStarts:   make(map[uint32]time.Time),
 		logFn:         cfg.LogFn,
@@ -143,6 +152,7 @@ func New(cfg Config) *Node {
 	n.onPeerConnect = cfg.OnPeerConnect
 	n.onPeerDisconnect = cfg.OnPeerDisconnect
 	n.onTrace = cfg.OnTrace
+	n.onAck = cfg.OnAck
 	for _, id := range cfg.Allowlist {
 		n.allowlist[id] = true
 		n.router.Allowlist[id] = true
@@ -214,17 +224,21 @@ func (n *Node) onScan(addr string, rssi int) {
 		return
 	}
 	n.mu.Lock()
+	// Stash the advertisement RSSI for this address; it's carried onto the NodeID at connect time
+	// (onPeerConnected) and refreshed live below once the address→NodeID mapping is known.
+	n.addrRSSI[addr] = rssi
+	id, known := n.addrNode[addr]
 	_, connected := n.peers[addr]
-	if connected || n.connecting[addr] {
-		n.mu.Unlock()
-		return
-	}
 	// Dedup by NodeID, not just address: if we already learned which node lives at this address
 	// (from a prior NODE_INFO read) and we already hold a link to it in either direction, don't
 	// re-dial. Otherwise we'd reconnect every scan and the collapse rule would drop it again — a
 	// busy loop against an already-connected peer.
-	if id, ok := n.addrNode[addr]; ok && n.haveLinkToNodeLocked(id) {
+	linked := known && n.haveLinkToNodeLocked(id)
+	if connected || n.connecting[addr] || linked {
 		n.mu.Unlock()
+		if known {
+			n.router.Neighbors.SetRSSI(id, rssi) // keep a known neighbor's RSSI fresh
+		}
 		return
 	}
 	n.connecting[addr] = true
@@ -281,6 +295,7 @@ func (n *Node) onPeerConnected(addr string, mtu int, nodeInfo []byte) {
 	// Remember which node lives at this address so onScan can dedup it later without re-dialing,
 	// even on the collapse/duplicate paths below that don't keep the link.
 	n.addrNode[addr] = peerID
+	rssi := n.addrRSSI[addr] // advertisement RSSI stashed by onScan (0 if this peer was never scanned)
 	dup := false
 	for a, l := range n.peers {
 		if l.peerID == peerID && a != addr {
@@ -317,6 +332,7 @@ func (n *Node) onPeerConnected(addr string, mtu int, nodeInfo []byte) {
 		mtu:         mtu,
 		txPHY:       core.PHY1M,
 		rxPHY:       core.PHY1M,
+		rssi:        rssi,
 		connectedAt: time.Now(),
 	}
 	n.peers[addr] = link
@@ -329,7 +345,7 @@ func (n *Node) onPeerConnected(addr string, mtu int, nodeInfo []byte) {
 		n.onPeerConnect(peerID)
 	}
 	n.router.Neighbors.Upsert(core.Neighbor{
-		ID: peerID, Direction: core.DirectionOutgoing, TxPHY: core.PHY1M, RxPHY: core.PHY1M, PublicKey: peerPub,
+		ID: peerID, Direction: core.DirectionOutgoing, TxPHY: core.PHY1M, RxPHY: core.PHY1M, PublicKey: peerPub, RSSI: rssi,
 	})
 	n.requestAnnounce()
 }
@@ -520,6 +536,12 @@ func (n *Node) selectTraceRoute(dst core.NodeID) ([]core.NodeID, bool) {
 	return path, true
 }
 
+// RSSIFor returns the best known signal strength (dBm) for id from the neighbor
+// table or its live link, or 0 when no sample is available. RSSI is only ever
+// sampled from BLE advertisement scans, so a dialed peer with no recent scan
+// reports 0 (unknown).
+func (n *Node) RSSIFor(id core.NodeID) int { return n.rssiForPeer(&id) }
+
 func (n *Node) rssiForPeer(id *core.NodeID) int {
 	if id == nil {
 		return 0
@@ -578,6 +600,12 @@ func (n *Node) deliverLocal(dg core.Datagram) {
 			switch ctrl.Kind {
 			case core.ControlAck:
 				n.logf("ack received from=%s", dg.Source)
+				if n.onAck != nil {
+					var ack core.AckBody
+					if err := cbor.Unmarshal(ctrl.Body, &ack); err == nil {
+						n.onAck(ack.AckedID, dg.Source)
+					}
+				}
 			case core.ControlAnnounce:
 				return
 			case core.ControlTraceRequest:
@@ -827,28 +855,45 @@ func (n *Node) SendTyping(dst core.NodeID) error {
 // recipientPub (the recipient's 32-byte Ed25519 public key). For replies the
 // public key is the one carried in the inbound envelope.
 func (n *Node) SendChatTo(dst core.NodeID, recipientPub []byte, text string) error {
+	_, err := n.SendChatToWithID(dst, recipientPub, text)
+	return err
+}
+
+// SendChatToWithID is SendChatTo but returns the sent datagram's ID, so callers
+// can correlate the ACK (the message is sent with FlagAckRequested).
+func (n *Node) SendChatToWithID(dst core.NodeID, recipientPub []byte, text string) (core.DatagramID, error) {
 	ctx := core.ChatContext{DatagramID: core.NewDatagramID(), Source: n.nodeID, Destination: dst}
 	env, err := core.SealDirectText(n.identity, recipientPub, ctx, text, time.Now().Unix())
 	if err != nil {
-		return err
+		return core.DatagramID{}, err
 	}
 	dg, ok := n.router.NewUnicast(dst, core.ProtocolSidepathChat, env, uint16(core.FlagAckRequested), 4, false)
 	if !ok {
-		return fmt.Errorf("no route to %s", dst)
+		return core.DatagramID{}, fmt.Errorf("no route to %s", dst)
 	}
 	dg.ID = ctx.DatagramID
-	return n.transmit(dg)
+	if err := n.transmit(dg); err != nil {
+		return core.DatagramID{}, err
+	}
+	return dg.ID, nil
 }
 
 // SendChat sends an encrypted DM to dst, resolving its public key from the
 // topology (learned via the node's signed ANNOUNCE). Returns an error if dst's
 // key isn't known yet.
 func (n *Node) SendChat(dst core.NodeID, text string) error {
+	_, err := n.SendChatWithID(dst, text)
+	return err
+}
+
+// SendChatWithID is SendChat but returns the sent datagram's ID for ACK
+// correlation.
+func (n *Node) SendChatWithID(dst core.NodeID, text string) (core.DatagramID, error) {
 	pub := n.router.PublicKeyFor(dst)
 	if pub == nil {
-		return fmt.Errorf("no public key known for %s (not in topology yet)", dst)
+		return core.DatagramID{}, fmt.Errorf("no public key known for %s (not in topology yet)", dst)
 	}
-	return n.SendChatTo(dst, pub, text)
+	return n.SendChatToWithID(dst, pub, text)
 }
 
 // RouteTo returns the currently selected source route to dst. A nil route with
