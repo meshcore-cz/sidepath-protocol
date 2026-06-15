@@ -1,4 +1,4 @@
-.PHONY: help build test test-go build-macos build-macos-helper bot clean sp sp-install build-esp32 install-esp32 build-modem flash-modem monitor-modem test-modem
+.PHONY: help build test android-aar copy-meshpkt-aar test-go build-macos build-macos-helper bot clean sp sp-install build-esp32 install-esp32 build-modem flash-modem monitor-modem test-modem
 
 .DEFAULT_GOAL := help
 
@@ -8,6 +8,17 @@ help: ## List available targets
 
 build: ## Build the Android modules (gradle)
 	cd android && ./gradlew :sidepath-protocol:build :sidepath-chat:build :sidepath-meshcore:assembleDebug :sidepath-networking:assembleDebug
+
+MESHPKT_DIR ?= ../meshpkt
+MESHPKT_AAR := $(MESHPKT_DIR)/dist/android/meshpkt.aar
+SIDEPATH_MESHPKT_AAR := android/sidepath-meshcore/libs/meshpkt.aar
+
+android-aar: ## Rebuild meshpkt AAR and copy it into the Android meshcore module
+	$(MAKE) -C $(MESHPKT_DIR) android-aar
+	$(MAKE) copy-meshpkt-aar
+
+copy-meshpkt-aar: ## Copy an already-built meshpkt AAR into the Android meshcore module
+	cp $(MESHPKT_AAR) $(SIDEPATH_MESHPKT_AAR)
 
 test: ## Run the Android unit tests (gradle)
 	cd android && ./gradlew :sidepath-protocol:test :sidepath-chat:test :sidepath-meshcore:testDebugUnitTest :sidepath-networking:testDebugUnitTest

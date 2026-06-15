@@ -446,9 +446,17 @@ The body `channel_payload` MUST have this exact byte layout:
 ```text
 channel_payload = channel_hash[1] || mac[2] || ciphertext[N]
 channel_hash    = SHA-256(secret)[0]
-mac_key         = secret[16] || zero[16]
+mac_key         = secret padded/truncated to 32 bytes   (here: secret[16] || zero[16])
 mac             = HMAC-SHA256(mac_key, ciphertext)[0:2]
 ```
+
+> **MAC key length.** The firmware (`Utils::encryptThenMAC`) always keys the
+> AES-128 cipher from the first 16 bytes of the secret but computes the HMAC over
+> the **full 32-byte `PUB_KEY_SIZE` secret buffer**. For a 16-byte channel PSK
+> that buffer is the PSK followed by 16 zero bytes, which is why `secret[16] ||
+> zero[16]` is correct here. Implementations MUST NOT hard-code the zero padding:
+> see §7.8 for MeshCore **direct messages**, whose 32-byte pairwise secret fills
+> the whole buffer and must be HMAC'd in full.
 
 The encrypted plaintext is:
 
@@ -529,6 +537,44 @@ Complete opaque MeshCore packet tunneling remains separate:
 protocol = MESHCORE_PACKET
 payload  = complete encoded MeshCore packet
 ```
+
+### 7.8 MeshCore direct-message (`TXT_MSG`) compatibility
+
+To exchange direct messages with a real MeshCore node, a node MAY encode and
+decode MeshCore **direct messages** (`TXT_MSG`, route `DIRECT`/`FLOOD`). This
+reuses the same `mac[2] || ciphertext` envelope and AES-128-ECB cipher as §7.4,
+but the secret is a **pairwise** value rather than a shared channel PSK:
+
+```text
+txt_payload = dest_hash[1] || src_hash[1] || mac[2] || ciphertext[N*16]
+secret      = X25519(SHA-512(our_seed)[0:32] clamped, ed→Montgomery(sender_pub))   (32 bytes)
+aes_key     = secret[0:16]
+mac         = HMAC-SHA256(secret[0:32], ciphertext)[0:2]
+```
+
+`secret` is the firmware `Identity::calcSharedSecret` output (full 32 bytes).
+`dest_hash`/`src_hash` are the first bytes of the recipient's and sender's
+Ed25519 public keys; `sender_pub` is the sender's full 32-byte Ed25519 key (from
+their `ADVERT`), **not** the recipient's own key.
+
+> **Do not truncate the HMAC key.** The AES key is `secret[0:16]`, but the HMAC
+> key is the **full 32-byte** `secret` (§7.4). Keying the HMAC with `secret[0:16]
+> || zero[16]` — correct only for 16-byte channel PSKs — makes every real
+> MeshCore DM fail MAC verification.
+
+A node SHOULD use this format **only** when the destination is a MeshCore node
+(e.g. its `ADVERT` identifies it as a MeshCore chat node and it is reachable over
+a MeshCore radio). For Sidepath peers, send native `DIRECT_TEXT` (§5,
+AES-256-GCM) instead — MeshCore `TXT_MSG` is a deliberate crypto downgrade
+(AES-128-ECB, 2-byte MAC, no forward secrecy, deterministic per timestamp) that
+exists purely for MeshCore interop. The sender MUST encode it itself: a relay or
+gateway is not a party to the pairwise secret and cannot translate a native
+`DIRECT_TEXT` into a MeshCore `TXT_MSG`.
+
+A MeshCore recipient acknowledges a `TXT_MSG` with an `ACK` carrying
+`CRC = SHA-256(ts[4 LE] || (attempt & 3) || utf8(text) || sender_pub[32])[0:4]`
+as a little-endian uint32; a sender matching ACKs to sent messages computes the
+same value.
 
 ---
 

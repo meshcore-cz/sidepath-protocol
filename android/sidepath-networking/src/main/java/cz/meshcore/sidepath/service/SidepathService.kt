@@ -29,7 +29,6 @@ import cz.meshcore.sidepath.chat.ChatPublicText
 import cz.meshcore.sidepath.chat.ChatTyping
 import cz.meshcore.sidepath.meshcore.MeshCoreAdvert
 import cz.meshcore.sidepath.meshcore.MeshCoreCodec
-import cz.meshcore.sidepath.meshcore.MeshCoreDirect
 import cz.meshcore.sidepath.meshcore.MeshCoreCarrier
 import cz.meshcore.sidepath.meshcore.MeshCorePacket
 import cz.meshcore.sidepath.meshcore.MeshCoreType
@@ -1086,8 +1085,10 @@ class SidepathService : Service() {
                 _meshCoreAdverts.value.mapNotNull { runCatching { it.publicKeyHex.hexToByteArray() }.getOrNull() })
                 .filter { it.size == 32 && (it[0].toInt() and 0xFF) == srcHash }
                 .distinctBy { it.toHex() }
+            var decoded = false
             for (senderPub in candidates) {
-                val dm = MeshCoreDirect.decode(self, senderPub, env.payload) ?: continue
+                val dm = MeshCoreCodec.decodeDirectTextIdentity(self.seed, senderPub, env.payload) ?: continue
+                decoded = true
                 val transport = if (env.isTransport && env.transportCodes != null)
                     " transport %04x/%04x".format(env.transportCodes!![0], env.transportCodes!![1]) else ""
                 appendMessage(
@@ -1122,21 +1123,42 @@ class SidepathService : Service() {
                 }
                 break
             }
+            // Addressed to us but no key decrypted it — the sender's full public key isn't known (not a
+            // saved contact and no recent advert), so the DM can't be surfaced. Log it so the silent
+            // drop is diagnosable instead of vanishing.
+            if (!decoded) {
+                log(
+                    "meshcore DM rx for-us content=$contentId src-hash=%02x undecryptable: ".format(srcHash) +
+                        "${candidates.size} candidate key(s) tried — sender's public key unknown",
+                    LogTag.MSG,
+                )
+            }
         }
 
         // MeshCore ACK: a recipient acked one of our outgoing MeshCore DMs. Match its crc against the
         // pending map and mark the message delivered via the client app's normal ACK path.
         if (env != null && env.type == MeshCoreType.ACK && env.payload.size >= 4) {
-            val crc = leUint32(env.payload)
-            pendingMeshCoreAck.remove(crc)?.let { dgId ->
-                log("meshcore ACK crc=%08x -> dg=${dgId.take(4).toHex()} delivered".format(crc), LogTag.MSG)
-                appendMessage(
-                    ReceivedMessage(
-                        fromNodeId = dg.source, datagramId = dg.id, protocol = dg.protocol,
-                        isAck = true, ackedId = dgId, path = dg.path, raw = dg.encode(),
-                        fromMeshCore = true, rssi = rssi,
-                    )
-                )
+            deliverMeshCoreAck(leUint32(env.payload), dg, rssi)
+        }
+
+        // MeshCore PATH return: a FLOOD-routed TXT_MSG is acked by the recipient with a PATH return
+        // that EMBEDS the ACK (firmware BaseChatMesh::onPeerDataRecv → createPathReturn), not a
+        // standalone ACK packet. If it's addressed to us, decrypt it with each candidate contact key
+        // and, if it carries an embedded ACK, match its crc just like a plain ACK.
+        if (env != null && env.type == MeshCoreType.PATH && self != null &&
+            env.payload.size >= 4 && (env.payload[0].toInt() and 0xFF) == (self.publicKey[0].toInt() and 0xFF)
+        ) {
+            val srcHash = env.payload[1].toInt() and 0xFF
+            val candidates = (meshCoreContactKeys +
+                _meshCoreAdverts.value.mapNotNull { runCatching { it.publicKeyHex.hexToByteArray() }.getOrNull() })
+                .filter { it.size == 32 && (it[0].toInt() and 0xFF) == srcHash }
+                .distinctBy { it.toHex() }
+            for (senderPub in candidates) {
+                val ackCrc = MeshCoreCodec.decodePathAckCrc(self.seed, senderPub, env.payload) ?: continue
+                if (deliverMeshCoreAck(ackCrc, dg, rssi)) {
+                    log("meshcore PATH-embedded ACK from=${senderPub.copyOf(2).toHex()} content=$contentId", LogTag.MSG)
+                }
+                break
             }
         }
 
@@ -1154,6 +1176,24 @@ class SidepathService : Service() {
             (listOf(packet) + packets.filterNot { it.contentId == contentId }).take(maxRxPackets)
         }
         _meshCoreTotal.update { it + 1 }
+    }
+
+    /**
+     * Matches [crc] (the 4-byte ack CRC, little-endian) against a pending outgoing MeshCore DM and,
+     * if found, surfaces a delivery ACK through the client app's normal ACK path. Returns true when a
+     * pending message was matched. Shared by the standalone-ACK and PATH-embedded-ACK receive paths.
+     */
+    private fun deliverMeshCoreAck(crc: Long, dg: Datagram, rssi: Int): Boolean {
+        val dgId = pendingMeshCoreAck.remove(crc) ?: return false
+        log("meshcore ACK crc=%08x -> dg=${dgId.take(4).toHex()} delivered".format(crc), LogTag.MSG)
+        appendMessage(
+            ReceivedMessage(
+                fromNodeId = dg.source, datagramId = dg.id, protocol = dg.protocol,
+                isAck = true, ackedId = dgId, path = dg.path, raw = dg.encode(),
+                fromMeshCore = true, rssi = rssi,
+            )
+        )
+        return true
     }
 
     private fun sha256(bytes: ByteArray): ByteArray =
@@ -1201,7 +1241,7 @@ class SidepathService : Service() {
         val dgId = sendMeshCoreRaw(raw) ?: return null
         // The recipient's ACK carries crc = SHA256(ts|attempt&3|text|OUR pubkey)[:4]; map it back to
         // this message so the inbound-ACK branch can mark it delivered.
-        val crc = MeshCoreDirect.ackCrc(ts, 0, text, id.publicKey)
+        val crc = MeshCoreCodec.textAckCrc(ts, 0, text, id.publicKey) ?: return null
         if (pendingMeshCoreAck.size > 200) pendingMeshCoreAck.keys.take(80).forEach { pendingMeshCoreAck.remove(it) }
         pendingMeshCoreAck[crc] = dgId
         log("meshcore DM tx to=${recipientPub.copyOf(2).toHex()} crc=%08x dg=${dgId.take(4).toHex()}".format(crc), LogTag.MSG)

@@ -81,4 +81,30 @@ class MeshCoreCodecTest {
         assertNull(MeshCoreCodec.parseAdvertJson("""{"error":"too short"}"""))
         assertNull(MeshCoreCodec.parseAdvertJson("nonsense"))
     }
+
+    @Test
+    fun parsesDirectText() {
+        val directTextJson = """{"attempt":1,"text":"bridged dm test","timestamp":1700000000}"""
+        val dm = MeshCoreCodec.parseDirectTextJson(directTextJson)
+        assertNotNull(dm)
+        dm!!
+        assertEquals("bridged dm test", dm.text)
+        assertEquals(1700000000L, dm.timestampSec)
+        assertEquals(1, dm.attempt)
+    }
+
+    @Test
+    fun directTextErrorReturnsNull() {
+        assertNull(MeshCoreCodec.parseDirectTextJson("""{"error":"mac failed"}"""))
+        assertNull(MeshCoreCodec.parseDirectTextJson("""{"timestamp":1700000000}"""))
+        assertNull(MeshCoreCodec.parseDirectTextJson("nonsense"))
+    }
+
+    @Test
+    fun parsesPathAckCrcOnlyForAckExtra() {
+        assertEquals(0xd8779aeaL, MeshCoreCodec.parsePathAckCrcJson("""{"ackCrc":3631717098,"extraType":3}"""))
+        assertNull(MeshCoreCodec.parsePathAckCrcJson("""{"ackCrc":3631717098,"extraType":5}"""))
+        assertNull(MeshCoreCodec.parsePathAckCrcJson("""{"error":"no ack"}"""))
+        assertNull(MeshCoreCodec.parsePathAckCrcJson("nonsense"))
+    }
 }

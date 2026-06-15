@@ -64,6 +64,13 @@ data class MeshCoreAdvert(
     val networkCode: String = "",
 )
 
+/** Decoded MeshCore direct text payload, as returned by meshpkt's direct TXT_MSG ops. */
+data class MeshCoreDirectText(
+    val timestampSec: Long,
+    val attempt: Int,
+    val text: String,
+)
+
 /**
  * A MeshCore packet observed on the Sidepath mesh, captured for the MeshCore Rx Log.
  * Combines the decoded MeshCore [envelope] with the Sidepath carrier metadata (who
@@ -154,6 +161,64 @@ object MeshCoreCodec {
         if (o.has("error")) return null
         o.optString("hex", "").takeIf { it.isNotEmpty() }?.hexToBytes()
     }.getOrNull()
+
+    /**
+     * Decrypts a MeshCore TXT_MSG [txtPayload] addressed to us, using our identity [seed] and the
+     * sender's 32-byte Ed25519 public key [senderPub], via meshpkt's `decodeDirectTextIdentity` op.
+     * Returns null when [senderPub] is not the real sender (MAC fails) or the shape is wrong.
+     */
+    fun decodeDirectTextIdentity(seed: ByteArray, senderPub: ByteArray, txtPayload: ByteArray): MeshCoreDirectText? = runCatching {
+        val args = JSONArray().put(txtPayload.toHex()).put(seed.toHex()).put(senderPub.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("decodeDirectTextIdentity", args.toString())
+        parseDirectTextJson(json)
+    }.getOrNull()
+
+    /**
+     * Extracts the embedded ACK CRC from a MeshCore PATH return [pathPayload] addressed to us, sent
+     * by [senderPub] in reply to a FLOOD-routed TXT_MSG we sent (meshpkt's `decodePathIdentity` op).
+     * Returns the 4-byte ack CRC (little-endian, as a Long) when the PATH carries an ACK, else null.
+     */
+    fun decodePathAckCrc(seed: ByteArray, senderPub: ByteArray, pathPayload: ByteArray): Long? = runCatching {
+        val args = JSONArray().put(pathPayload.toHex()).put(seed.toHex()).put(senderPub.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("decodePathIdentity", args.toString())
+        parsePathAckCrcJson(json)
+    }.getOrNull()
+
+    /**
+     * Computes the ACK CRC a recipient returns for a TXT_MSG we send (meshpkt's `textAckCrc` op:
+     * SHA-256(ts|attempt&3|text|senderPub)[:4] as a little-endian uint32). [senderPub] is OUR public
+     * key (we are the sender). Used to correlate the returning ACK with the sent message.
+     */
+    fun textAckCrc(timestampSec: Long, attempt: Int, text: String, senderPub: ByteArray): Long? = runCatching {
+        val args = JSONArray().put(timestampSec).put(attempt).put(text).put(senderPub.toHex())
+        val json = cz.meshcore.meshpkt.mobile.Mobile.call("textAckCrc", args.toString())
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        o.optLong("crc", -1L).takeIf { it >= 0 }
+    }.getOrNull()
+
+    /** Pure JSON→[MeshCoreDirectText] mapping (host-testable). Returns null on error/bad shape. */
+    fun parseDirectTextJson(json: String): MeshCoreDirectText? = runCatching {
+        val o = JSONObject(json)
+        if (o.has("error") || !o.has("text")) return null
+        MeshCoreDirectText(
+            timestampSec = o.optLong("timestamp", 0L),
+            attempt = o.optInt("attempt", 0),
+            text = o.optString("text", ""),
+        )
+    }.getOrNull()
+
+    /**
+     * Pure JSON→ack-CRC mapping for a decoded PATH return (host-testable). Returns the embedded ACK
+     * CRC only when the PATH's extra payload is a MeshCore ACK (extraType == 3), else null.
+     */
+    fun parsePathAckCrcJson(json: String): Long? = runCatching {
+        val o = JSONObject(json)
+        if (o.has("error") || o.optInt("extraType", -1) != PAYLOAD_TYPE_ACK) return null
+        o.optLong("ackCrc", -1L).takeIf { it >= 0 }
+    }.getOrNull()
+
+    private const val PAYLOAD_TYPE_ACK = 3 // MeshCore PAYLOAD_TYPE_ACK, used as a PATH-return extra_type
 
     /** Pure JSON→[MeshCoreAdvert] mapping (host-testable). Returns null on error/bad shape. */
     fun parseAdvertJson(json: String): MeshCoreAdvert? = runCatching {
