@@ -399,6 +399,14 @@ class SidepathService : Service() {
     var meshCoreRadioSink: ((ByteArray) -> Unit)? = null
 
     /**
+     * Master switch for the MeshCore subsystem. When false, inbound MeshCore-carrying datagrams are
+     * neither decoded/ingested nor bridged to a local radio, and [injectMeshCoreFromRadio] is a no-op
+     * — the device behaves as a plain Sidepath node. Set by the app; defaults on.
+     */
+    @Volatile
+    var meshCoreEnabled: Boolean = true
+
+    /**
      * The external MeshCore networks this node currently bridges via locally-attached radios,
      * advertised in our v2 ANNOUNCE `bridges` (§8.3) so peers can attribute bridged packets and find
      * gateways. Empty when no companion bridge is active. Set by the app's companion manager via
@@ -919,7 +927,7 @@ class SidepathService : Service() {
 
         // MeshCore subsystem: record every MeshCore-carrying datagram we see. Side effects such
         // as chat/discovery ingestion are deduped inside handleMeshCorePacket.
-        if (dg.protocol == PayloadProtocol.MESHCORE_PACKET) {
+        if (dg.protocol == PayloadProtocol.MESHCORE_PACKET && meshCoreEnabled) {
             handleMeshCorePacket(dg, addrHex, data)
             // Local-radio bridge: put genuinely new mesh-sourced MeshCore packets on our own attached
             // radio. Skip anything the router dropped (duplicate/loop/ttl) so an injected packet
@@ -1316,6 +1324,7 @@ class SidepathService : Service() {
      * re-emitting it to the same radio would loop. No-op until the service has an identity/router.
      */
     fun injectMeshCoreFromRadio(raw: ByteArray, networkCode: String) {
+        if (!meshCoreEnabled) return
         if (raw.isEmpty()) return
         val id = identity ?: return
         if (!::router.isInitialized) return
