@@ -386,6 +386,41 @@ class SidepathService : Service() {
     // inner payload to ingest chat/discovery once while still counting every RX log sighting.
     private val meshCoreContentSeen = ContentDedupCache()
 
+    /**
+     * Optional sink for putting MeshCore packets on a *locally-attached* radio (e.g. a BLE companion
+     * managed by the app). When set, the service invokes it with the inner raw OTA packet for every
+     * MeshCore packet that should be transmitted: ones we originate (DMs/channel msgs) and new ones
+     * relayed from the nearby mesh. This turns the phone itself into a MeshCore bridge/gateway. Stays
+     * singular — a multi-radio manager fans out internally. Packets injected via
+     * [injectMeshCoreFromRadio] never reach this sink (they came *from* a radio), so there is no
+     * radio→mesh→sink→radio loop.
+     */
+    @Volatile
+    var meshCoreRadioSink: ((ByteArray) -> Unit)? = null
+
+    /**
+     * The external MeshCore networks this node currently bridges via locally-attached radios,
+     * advertised in our v2 ANNOUNCE `bridges` (§8.3) so peers can attribute bridged packets and find
+     * gateways. Empty when no companion bridge is active. Set by the app's companion manager via
+     * [setBridgedNetworks]; read by [sendAnnounce].
+     */
+    @Volatile
+    private var bridgedNetworks: List<BridgeAd> = emptyList()
+
+    /**
+     * Update the set of bridged networks advertised in ANNOUNCE. When the set actually changes, an
+     * announce is sent promptly so peers learn (or forget) the gateway without waiting for the next
+     * scheduled announce.
+     */
+    fun setBridgedNetworks(networks: List<BridgeAd>) {
+        val valid = networks.filter { it.isValid() }.take(Sidepath.MAX_BRIDGES)
+        if (valid == bridgedNetworks) return
+        bridgedNetworks = valid
+        if (_isRunning.value && ::router.isInitialized && identity != null) {
+            scope.launch { sendAnnounce() }
+        }
+    }
+
     private val originatedFloodIds = ConcurrentHashMap<String, Long>()
     private val _floodRepeats = MutableStateFlow<Map<String, List<RepeatSample>>>(emptyMap())
     val floodRepeats: StateFlow<Map<String, List<RepeatSample>>> = _floodRepeats.asStateFlow()
@@ -886,6 +921,12 @@ class SidepathService : Service() {
         // as chat/discovery ingestion are deduped inside handleMeshCorePacket.
         if (dg.protocol == PayloadProtocol.MESHCORE_PACKET) {
             handleMeshCorePacket(dg, addrHex, data)
+            // Local-radio bridge: put genuinely new mesh-sourced MeshCore packets on our own attached
+            // radio. Skip anything the router dropped (duplicate/loop/ttl) so an injected packet
+            // echoing back through the mesh — or a packet we originated — isn't re-transmitted.
+            if (actions.none { it.type == ActionType.DROP }) {
+                meshCoreRadioSink?.invoke(MeshCoreCarrier.unframe(dg.payload).raw)
+            }
         }
 
         _stats.update { s ->
@@ -1260,7 +1301,32 @@ class SidepathService : Service() {
         )
         router.markOriginated(dg.id)
         transmit(dg)
+        // Also put it on a locally-attached radio, if any (the inner raw OTA packet).
+        meshCoreRadioSink?.invoke(MeshCoreCarrier.unframe(bytes).raw)
         return dg.id
+    }
+
+    /**
+     * Local-bridge inbound path: a [raw] MeshCore OTA packet just heard on a locally-attached radio
+     * (e.g. a BLE companion). Frames it with [networkCode] (when known) via [MeshCoreCarrier], floods
+     * it onto the nearby Sidepath mesh as a broadcast MESHCORE_PACKET so other phones receive it, and
+     * ingests it locally so adverts/messages/ACKs surface exactly as if a remote gateway bridged it.
+     *
+     * Deliberately does *not* go through [meshCoreRadioSink]: this packet came from a radio, so
+     * re-emitting it to the same radio would loop. No-op until the service has an identity/router.
+     */
+    fun injectMeshCoreFromRadio(raw: ByteArray, networkCode: String) {
+        if (raw.isEmpty()) return
+        val id = identity ?: return
+        if (!::router.isInitialized) return
+        val payload = if (networkCode.isNotBlank()) MeshCoreCarrier.frame(networkCode, raw) else raw
+        val dg = Datagram(
+            id = Datagram.newDatagramId(), source = id.nodeId, destination = NodeId.BROADCAST,
+            ttl = Sidepath.DEFAULT_FLOOD_TTL, protocol = PayloadProtocol.MESHCORE_PACKET, payload = payload,
+        )
+        router.markOriginated(dg.id)
+        transmit(dg)
+        handleMeshCorePacket(dg, "", dg.encode())
     }
 
     /**
@@ -1578,9 +1644,10 @@ class SidepathService : Service() {
         val body = router.buildAnnounceBody(
             caps = ANDROID_CAPABILITIES, epoch = epoch, seq = announceSeq,
             name = nodeName, description = nodeDescription, platform = nodePlatform,
+            bridges = bridgedNetworks,
         )
         val dg = router.newBroadcast(PayloadProtocol.SIDEPATH_CONTROL, body.toControl().encode(), Sidepath.ANNOUNCE_TTL)
-        log("ANNOUNCE epoch=$epoch seq=$announceSeq neighbors=${router.neighbors.ids().size}", LogTag.ROUTER)
+        log("ANNOUNCE epoch=$epoch seq=$announceSeq neighbors=${router.neighbors.ids().size} bridges=${bridgedNetworks.map { it.code }}", LogTag.ROUTER)
         sendFramesToAll(framesFor(dg))
     }
 

@@ -91,8 +91,8 @@ final class Helper: NSObject, CBCentralManagerDelegate, CBPeripheralManagerDeleg
     private var niChars: [String: CBCharacteristic] = [:] // addr -> NODE_INFO (pending read)
     private var pendingWriteStarts: [String: [Date]] = [:] // addr -> reliable PACKET_IN writes
 
-    private let maxCentralConnections = 6
-    private let connectTimeout: TimeInterval = 12
+    private let maxCentralConnections = 8
+    private let connectTimeout: TimeInterval = 24
     private let connectBackoff: TimeInterval = 30
     private var connecting: Set<String> = []
     private var connectStartedAt: [String: Date] = [:]
